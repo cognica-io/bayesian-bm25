@@ -13,6 +13,9 @@ dependencies = [
     "numpy>=1.21",
 ]
 
+[project.urls]
+Repository = "https://github.com/cognica-io/bayesian-bm25"
+
 [project.optional-dependencies]
 scorer = ["bm25s>=0.2.0"]
 dev = [
