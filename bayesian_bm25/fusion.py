@@ -60,20 +60,26 @@ def log_odds_conjunction(
     probs: np.ndarray,
     alpha: float = 0.5,
 ) -> np.ndarray | float:
-    """Log-odds conjunction with agreement bonus (Paper 2, Section 4).
+    """Log-odds conjunction with multiplicative confidence scaling (Paper 2, Section 4).
 
     Resolves the shrinkage problem of naive probabilistic AND by:
-      1. Computing the geometric mean in probability space (Eq. 20)
-      2. Converting to log-odds and adding an agreement bonus (Eq. 21)
-      3. Converting back to probability (Eq. 24)
+      1. Computing the mean log-odds (Eq. 20)
+      2. Multiplicative confidence scaling by n^alpha (Eq. 23)
+      3. Converting back to probability via sigmoid (Eq. 26)
+
+    The multiplicative formulation (rather than additive) preserves the
+    sign of evidence (Theorem 4.2.2), preventing accidental inversion
+    of irrelevance signals (Remark 4.2.4).  Working directly in log-odds
+    space avoids the nonlinear residual introduced by geometric-mean
+    aggregation in probability space (Remark 4.1.3).
 
     Parameters
     ----------
     probs : array of shape (..., n)
         Probability values to combine.  The last axis is reduced.
     alpha : float
-        Agreement bonus scaling factor.  Higher values give more weight
-        to the number of agreeing signals.
+        Confidence scaling exponent.  Higher values amplify the effect
+        of multiple agreeing signals.
 
     Returns
     -------
@@ -82,12 +88,12 @@ def log_odds_conjunction(
     probs = _clamp_probability(np.asarray(probs, dtype=np.float64))
     n = probs.shape[-1]
 
-    # Step 1: geometric mean -- exp(mean(log(p_i)))
-    geometric_mean = np.exp(np.mean(np.log(probs), axis=-1))
+    # Step 1: mean log-odds (Eq. 20)
+    l_bar = np.mean(logit(probs), axis=-1)
 
-    # Step 2: log-odds with agreement bonus
-    log_odds = logit(geometric_mean) + alpha * np.log(n)
+    # Step 2: multiplicative confidence scaling (Eq. 23)
+    l_adjusted = l_bar * (n ** alpha)
 
-    # Step 3: back to probability
-    result = sigmoid(log_odds)
+    # Step 3: back to probability (Eq. 26)
+    result = sigmoid(l_adjusted)
     return float(result) if np.ndim(result) == 0 else result

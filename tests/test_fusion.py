@@ -78,37 +78,51 @@ class TestLogOddsConjunction:
     def test_agreement_amplification(self):
         """Two agreeing high probabilities should amplify above the input.
 
-        With alpha=0.5: geometric_mean=0.9, logit(0.9)=2.197,
-        bonus=0.5*ln(2)=0.347, sigmoid(2.544)=0.927.
+        With alpha=0.5: l_bar=logit(0.9)=2.197,
+        l_adjusted=2.197*sqrt(2)=3.107, sigmoid(3.107)=0.957.
         """
         result = log_odds_conjunction(np.array([0.9, 0.9]))
-        assert result == pytest.approx(0.927, abs=0.01)
+        assert result == pytest.approx(0.957, abs=0.01)
         assert result > 0.9  # Amplification, not shrinkage
 
     def test_moderate_agreement(self):
-        """(0.7, 0.7) -> ~0.77."""
+        """(0.7, 0.7) -> ~0.77.
+
+        l_bar=logit(0.7)=0.847, l_adjusted=0.847*sqrt(2)=1.198,
+        sigmoid(1.198)=0.768.
+        """
         result = log_odds_conjunction(np.array([0.7, 0.7]))
-        assert result == pytest.approx(0.77, abs=0.03)
+        assert result == pytest.approx(0.77, abs=0.02)
         assert result > 0.7  # Still amplified
 
     def test_disagreement_moderation(self):
-        """(0.7, 0.3) -> ~0.54, near 0.5 (uncertain)."""
+        """(0.7, 0.3) -> exactly 0.5 (symmetric logits cancel).
+
+        logit(0.7)=0.847, logit(0.3)=-0.847, l_bar=0, sigmoid(0)=0.5.
+        """
         result = log_odds_conjunction(np.array([0.7, 0.3]))
-        assert result == pytest.approx(0.54, abs=0.05)
-        # Should be close to 0.5 (maximum uncertainty)
-        assert 0.45 < result < 0.65
+        assert result == pytest.approx(0.5, abs=0.01)
+        # Symmetric logits cancel to exact uncertainty
+        assert 0.49 < result < 0.51
 
     def test_agreement_low(self):
-        """(0.3, 0.3) -> ~0.38, moderated rather than shrunk to 0.09."""
+        """(0.3, 0.3) -> ~0.23, moderated rather than shrunk to 0.09.
+
+        l_bar=logit(0.3)=-0.847, l_adjusted=-0.847*sqrt(2)=-1.198,
+        sigmoid(-1.198)=0.232.
+        """
         result = log_odds_conjunction(np.array([0.3, 0.3]))
-        assert result == pytest.approx(0.38, abs=0.05)
+        assert result == pytest.approx(0.23, abs=0.02)
         # Should be higher than naive AND (0.09)
         assert result > prob_and(np.array([0.3, 0.3]))
 
     def test_irrelevance_preservation(self):
-        """(0.5, 0.5) should stay near 0.5."""
+        """(0.5, 0.5) should stay exactly 0.5.
+
+        logit(0.5)=0, l_bar=0, l_adjusted=0, sigmoid(0)=0.5.
+        """
         result = log_odds_conjunction(np.array([0.5, 0.5]))
-        assert result == pytest.approx(0.5, abs=0.1)
+        assert result == pytest.approx(0.5, abs=0.01)
 
     def test_single_signal_identity(self):
         """With n=1 and alpha=0, a single signal should pass through."""
