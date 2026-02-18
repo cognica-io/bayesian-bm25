@@ -200,6 +200,116 @@ class TestFit:
         assert predicted[0] < predicted[4]
 
 
+class TestBaseRate:
+    def test_none_preserves_current_behavior(self):
+        """base_rate=None produces identical output to the old code."""
+        t_none = BayesianProbabilityTransform(alpha=1.0, beta=0.5, base_rate=None)
+        t_old = BayesianProbabilityTransform(alpha=1.0, beta=0.5)
+        scores = np.array([0.5, 1.0, 2.0, 3.0])
+        for score in scores:
+            p_none = t_none.score_to_probability(score, tf=5, doc_len_ratio=0.5)
+            p_old = t_old.score_to_probability(score, tf=5, doc_len_ratio=0.5)
+            assert p_none == pytest.approx(p_old)
+
+    def test_base_rate_half_is_neutral(self):
+        """base_rate=0.5 is neutral (logit(0.5)=0), same as no base rate."""
+        t_half = BayesianProbabilityTransform(alpha=1.0, beta=0.5, base_rate=0.5)
+        t_none = BayesianProbabilityTransform(alpha=1.0, beta=0.5, base_rate=None)
+        scores = np.array([0.2, 0.5, 1.0, 2.0, 5.0])
+        for score in scores:
+            p_half = t_half.score_to_probability(score, tf=5, doc_len_ratio=0.5)
+            p_none = t_none.score_to_probability(score, tf=5, doc_len_ratio=0.5)
+            assert p_half == pytest.approx(p_none, abs=1e-8)
+
+    def test_low_base_rate_reduces_probabilities(self):
+        """base_rate=0.01 pulls probabilities down compared to no base rate."""
+        t_low = BayesianProbabilityTransform(alpha=1.0, beta=0.5, base_rate=0.01)
+        t_none = BayesianProbabilityTransform(alpha=1.0, beta=0.5)
+        scores = np.array([0.5, 1.0, 2.0, 3.0])
+        for score in scores:
+            p_low = t_low.score_to_probability(score, tf=5, doc_len_ratio=0.5)
+            p_none = t_none.score_to_probability(score, tf=5, doc_len_ratio=0.5)
+            assert p_low < p_none, (
+                f"score={score}: base_rate=0.01 gave {p_low}, no base_rate gave {p_none}"
+            )
+
+    def test_high_base_rate_increases_probabilities(self):
+        """base_rate=0.9 pushes probabilities up compared to no base rate."""
+        t_high = BayesianProbabilityTransform(alpha=1.0, beta=0.5, base_rate=0.9)
+        t_none = BayesianProbabilityTransform(alpha=1.0, beta=0.5)
+        scores = np.array([0.5, 1.0, 2.0, 3.0])
+        for score in scores:
+            p_high = t_high.score_to_probability(score, tf=5, doc_len_ratio=0.5)
+            p_none = t_none.score_to_probability(score, tf=5, doc_len_ratio=0.5)
+            assert p_high > p_none, (
+                f"score={score}: base_rate=0.9 gave {p_high}, no base_rate gave {p_none}"
+            )
+
+    def test_numerical_example(self):
+        """Verify: L=0.7, prior=0.5, base_rate=0.01 -> ~0.023.
+
+        logit(0.7) = 0.8473, logit(0.5) = 0, logit(0.01) = -4.5951
+        sum = 0.8473 + (-4.5951) + 0 = -3.7478
+        sigmoid(-3.7478) ~ 0.0231
+        """
+        result = BayesianProbabilityTransform.posterior(0.7, 0.5, base_rate=0.01)
+        assert result == pytest.approx(0.023, abs=0.005)
+
+    def test_monotonicity_preserved(self):
+        """Score ordering is preserved with any base_rate."""
+        for br in [0.001, 0.01, 0.1, 0.5, 0.9, 0.999]:
+            t = BayesianProbabilityTransform(alpha=1.0, beta=0.5, base_rate=br)
+            scores = np.sort(np.array([0.2, 0.5, 1.0, 2.0, 5.0]))
+            probs = t.score_to_probability(scores, tf=5, doc_len_ratio=0.5)
+            assert np.all(np.diff(probs) > 0), (
+                f"Monotonicity violated for base_rate={br}: {probs}"
+            )
+
+    def test_output_range(self):
+        """All P in (0, 1) for various base_rates."""
+        rng = np.random.default_rng(42)
+        for br in [0.001, 0.01, 0.1, 0.5, 0.9, 0.999]:
+            t = BayesianProbabilityTransform(alpha=1.0, beta=0.5, base_rate=br)
+            scores = rng.uniform(-5, 10, size=100)
+            tf = rng.uniform(0, 20, size=100)
+            ratio = rng.uniform(0.1, 3.0, size=100)
+            probs = t.score_to_probability(scores, tf, ratio)
+            assert np.all(probs > 0), f"base_rate={br}: some P <= 0"
+            assert np.all(probs < 1), f"base_rate={br}: some P >= 1"
+
+    def test_invalid_base_rate_raises(self):
+        """ValueError for 0, 1, negative, >1."""
+        for invalid in [0.0, 1.0, -0.1, 1.5]:
+            with pytest.raises(ValueError, match="base_rate must be in"):
+                BayesianProbabilityTransform(base_rate=invalid)
+
+    def test_fit_preserves_base_rate(self):
+        """fit() learns alpha/beta but does not modify base_rate."""
+        t = BayesianProbabilityTransform(alpha=1.0, beta=0.0, base_rate=0.01)
+        scores = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+        labels = np.array([0.0, 0.0, 0.5, 1.0, 1.0])
+        t.fit(scores, labels, learning_rate=0.01, max_iterations=100)
+        assert t.base_rate == 0.01
+        assert t._logit_base_rate == pytest.approx(logit(0.01))
+
+    def test_update_preserves_base_rate(self):
+        """update() learns alpha/beta but does not modify base_rate."""
+        t = BayesianProbabilityTransform(alpha=1.0, beta=0.0, base_rate=0.05)
+        for _ in range(20):
+            t.update(2.0, 1.0, learning_rate=0.1)
+            t.update(-1.0, 0.0, learning_rate=0.1)
+        assert t.base_rate == 0.05
+        assert t._logit_base_rate == pytest.approx(logit(0.05))
+
+    def test_posterior_static_with_base_rate(self):
+        """posterior(L, p, base_rate) shifts probabilities downward."""
+        L = 0.8
+        p = 0.6
+        p_no_br = BayesianProbabilityTransform.posterior(L, p)
+        p_with_br = BayesianProbabilityTransform.posterior(L, p, base_rate=0.01)
+        assert p_with_br < p_no_br
+
+
 class TestOnlineUpdate:
     def test_converges_to_batch(self):
         """Online updates should converge to similar parameters as batch fit."""

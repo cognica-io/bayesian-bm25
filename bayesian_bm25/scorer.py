@@ -45,6 +45,13 @@ class BayesianBM25Scorer:
     beta : float or None
         Sigmoid midpoint.  If None, auto-estimated from corpus statistics
         during indexing.
+    base_rate : float, str, or None
+        Corpus-level base rate of relevance.
+
+        - None (default): no base rate correction.
+        - "auto": auto-estimate from corpus score distribution during
+          indexing by counting documents above the 95th percentile.
+        - float in (0, 1): explicit base rate.
     """
 
     def __init__(
@@ -54,10 +61,12 @@ class BayesianBM25Scorer:
         method: str = "robertson",
         alpha: float | None = None,
         beta: float | None = None,
+        base_rate: float | str | None = None,
     ) -> None:
         self._bm25 = bm25s.BM25(k1=k1, b=b, method=method)
         self._user_alpha = alpha
         self._user_beta = beta
+        self._user_base_rate = base_rate
         self._transform: BayesianProbabilityTransform | None = None
         self._doc_lengths: np.ndarray | None = None
         self._avgdl: float | None = None
@@ -82,6 +91,13 @@ class BayesianBM25Scorer:
             raise RuntimeError("Call index() before accessing avgdl.")
         return self._avgdl
 
+    @property
+    def base_rate(self) -> float | None:
+        """Corpus-level base rate of relevance, or None if not set."""
+        if self._transform is None:
+            return None
+        return self._transform.base_rate
+
     def index(self, corpus_tokens: list[list[str]], show_progress: bool = True) -> None:
         """Build the BM25 index and compute document statistics.
 
@@ -101,7 +117,43 @@ class BayesianBM25Scorer:
         self._avgdl = float(np.mean(self._doc_lengths))
 
         alpha, beta = self._estimate_parameters(corpus_tokens)
-        self._transform = BayesianProbabilityTransform(alpha=alpha, beta=beta)
+
+        # Resolve base_rate
+        base_rate: float | None = None
+        if self._user_base_rate == "auto":
+            base_rate = self._estimate_base_rate(corpus_tokens)
+        elif isinstance(self._user_base_rate, (int, float)):
+            base_rate = float(self._user_base_rate)
+
+        self._transform = BayesianProbabilityTransform(
+            alpha=alpha, beta=beta, base_rate=base_rate
+        )
+
+    def _sample_pseudo_query_scores(
+        self, corpus_tokens: list[list[str]]
+    ) -> list[np.ndarray]:
+        """Sample documents as pseudo-queries and return per-query nonzero scores.
+
+        Returns a list of 1-D arrays, one per pseudo-query, containing only
+        the nonzero BM25 scores for that query.
+        """
+        n = len(corpus_tokens)
+        sample_size = min(n, 50)
+        rng = np.random.default_rng(42)
+        sample_indices = rng.choice(n, size=sample_size, replace=False)
+
+        per_query_scores: list[np.ndarray] = []
+        for idx in sample_indices:
+            query_tokens = corpus_tokens[idx]
+            if not query_tokens:
+                continue
+            query = query_tokens[:5]
+            scores = self._bm25.get_scores(query)
+            nonzero = scores[scores > 0]
+            if len(nonzero) > 0:
+                per_query_scores.append(nonzero)
+
+        return per_query_scores
 
     def _estimate_parameters(
         self, corpus_tokens: list[list[str]]
@@ -118,33 +170,43 @@ class BayesianBM25Scorer:
         if self._user_alpha is not None and self._user_beta is not None:
             return self._user_alpha, self._user_beta
 
-        n = len(corpus_tokens)
-        sample_size = min(n, 50)
-        rng = np.random.default_rng(42)
-        sample_indices = rng.choice(n, size=sample_size, replace=False)
+        per_query_scores = self._sample_pseudo_query_scores(corpus_tokens)
 
-        all_scores: list[float] = []
-        for idx in sample_indices:
-            query_tokens = corpus_tokens[idx]
-            if not query_tokens:
-                continue
-            query = query_tokens[:5]
-            scores = self._bm25.get_scores(query)
-            nonzero = scores[scores > 0]
-            if len(nonzero) > 0:
-                all_scores.extend(nonzero.tolist())
-
-        if not all_scores:
+        if not per_query_scores:
             return (self._user_alpha or 1.0, self._user_beta or 0.0)
 
-        score_array = np.array(all_scores)
-        estimated_beta = float(np.median(score_array))
-        score_std = float(np.std(score_array))
+        all_scores = np.concatenate(per_query_scores)
+        estimated_beta = float(np.median(all_scores))
+        score_std = float(np.std(all_scores))
         estimated_alpha = 1.0 / score_std if score_std > 0 else 1.0
 
         alpha = self._user_alpha if self._user_alpha is not None else estimated_alpha
         beta = self._user_beta if self._user_beta is not None else estimated_beta
         return alpha, beta
+
+    def _estimate_base_rate(
+        self, corpus_tokens: list[list[str]]
+    ) -> float:
+        """Auto-estimate the corpus-level base rate of relevance.
+
+        For each pseudo-query, counts documents scoring above the 95th
+        percentile of non-zero scores.  The average count divided by
+        corpus size gives the base rate estimate, clamped to [1e-6, 0.5].
+        """
+        per_query_scores = self._sample_pseudo_query_scores(corpus_tokens)
+        n_docs = len(corpus_tokens)
+
+        if not per_query_scores:
+            return 1e-6
+
+        high_count_ratios: list[float] = []
+        for scores in per_query_scores:
+            threshold = float(np.percentile(scores, 95))
+            n_above = int(np.sum(scores >= threshold))
+            high_count_ratios.append(n_above / n_docs)
+
+        base_rate = float(np.mean(high_count_ratios))
+        return float(np.clip(base_rate, 1e-6, 0.5))
 
     def retrieve(
         self,

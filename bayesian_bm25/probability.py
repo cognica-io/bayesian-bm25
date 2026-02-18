@@ -57,11 +57,31 @@ class BayesianProbabilityTransform:
         Steepness of the sigmoid likelihood function.
     beta : float
         Midpoint (shift) of the sigmoid likelihood function.
+    base_rate : float or None
+        Corpus-level base rate of relevance, in (0, 1).  When set,
+        the posterior is computed in log-odds space as
+        sigmoid(logit(L) + logit(base_rate) + logit(prior)).
+        None (default) disables base rate correction for backward
+        compatibility.  base_rate=0.5 is neutral (logit(0.5) = 0).
     """
 
-    def __init__(self, alpha: float = 1.0, beta: float = 0.0) -> None:
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        base_rate: float | None = None,
+    ) -> None:
+        if base_rate is not None:
+            if not (0.0 < base_rate < 1.0):
+                raise ValueError(
+                    f"base_rate must be in (0, 1), got {base_rate}"
+                )
         self.alpha = alpha
         self.beta = beta
+        self.base_rate = base_rate
+        self._logit_base_rate: float | None = (
+            float(logit(base_rate)) if base_rate is not None else None
+        )
         self._n_updates: int = 0
         self._grad_alpha_ema: float = 0.0
         self._grad_beta_ema: float = 0.0
@@ -118,13 +138,22 @@ class BayesianProbabilityTransform:
     def posterior(
         likelihood_val: np.ndarray | float,
         prior: np.ndarray | float,
+        base_rate: float | None = None,
     ) -> np.ndarray | float:
-        """Bayesian posterior: L*p / (L*p + (1-L)*(1-p))  (Eq. 22)."""
+        """Bayesian posterior (Eq. 22).
+
+        Without base_rate: L*p / (L*p + (1-L)*(1-p))
+        With base_rate:    sigmoid(logit(L) + logit(base_rate) + logit(prior))
+        """
         l_val = np.asarray(likelihood_val, dtype=np.float64)
         p = np.asarray(prior, dtype=np.float64)
-        numerator = l_val * p
-        denominator = numerator + (1.0 - l_val) * (1.0 - p)
-        result = _clamp_probability(numerator / denominator)
+        if base_rate is not None:
+            logit_sum = logit(l_val) + logit(base_rate) + logit(p)
+            result = _clamp_probability(sigmoid(logit_sum))
+        else:
+            numerator = l_val * p
+            denominator = numerator + (1.0 - l_val) * (1.0 - p)
+            result = _clamp_probability(numerator / denominator)
         return float(result) if np.ndim(result) == 0 else result
 
     def score_to_probability(
@@ -137,9 +166,21 @@ class BayesianProbabilityTransform:
 
         Computes likelihood from the score, composite prior from tf and
         doc_len_ratio, then applies the Bayesian posterior formula.
+        When base_rate is set, uses the three-term log-odds formulation.
         """
         l_val = self.likelihood(score)
         prior = self.composite_prior(tf, doc_len_ratio)
+        if self.base_rate is not None:
+            # Two-step: compute two-term posterior via direct formula,
+            # then apply base_rate as one more Bayes update.
+            # Equivalent to sigmoid(logit(L) + logit(br) + logit(prior))
+            # but avoids expensive log/exp operations.
+            p2 = self.posterior(l_val, prior)
+            br = self.base_rate
+            numerator = p2 * br
+            denominator = numerator + (1.0 - p2) * (1.0 - br)
+            result = _clamp_probability(numerator / denominator)
+            return float(result) if np.ndim(result) == 0 else result
         return self.posterior(l_val, prior)
 
     def fit(

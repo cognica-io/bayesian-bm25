@@ -202,6 +202,50 @@ class TestPriorBounds:
         assert np.all(p <= 0.9)
 
 
+class TestBaseRateLogOdds:
+    """Verify the three-term log-odds formulation with base rate."""
+
+    def test_three_term_log_odds_equivalence(self):
+        """posterior(L, p, br) == sigmoid(logit(L) + logit(br) + logit(p))."""
+        rng = np.random.default_rng(42)
+        L = rng.uniform(0.01, 0.99, size=10000)
+        p = rng.uniform(0.01, 0.99, size=10000)
+
+        for br in [0.001, 0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 0.999]:
+            direct = BayesianProbabilityTransform.posterior(L, p, base_rate=br)
+            log_odds_path = sigmoid(logit(L) + logit(br) + logit(p))
+            np.testing.assert_allclose(direct, log_odds_path, atol=1e-9)
+
+    def test_base_rate_half_reduces_to_two_term(self):
+        """Three-term with br=0.5 equals two-term (logit(0.5) = 0)."""
+        rng = np.random.default_rng(42)
+        L = rng.uniform(0.01, 0.99, size=10000)
+        p = rng.uniform(0.01, 0.99, size=10000)
+
+        two_term = BayesianProbabilityTransform.posterior(L, p)
+        three_term = BayesianProbabilityTransform.posterior(L, p, base_rate=0.5)
+        np.testing.assert_allclose(three_term, two_term, atol=1e-9)
+
+    def test_monotonicity_with_base_rate(self):
+        """Theorem 4.3.1 holds for any base_rate: higher score -> higher posterior."""
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            alpha = rng.uniform(0.1, 5.0)
+            beta = rng.uniform(-2.0, 5.0)
+            prior = rng.uniform(0.1, 0.9)
+            br = rng.uniform(0.001, 0.999)
+
+            t = BayesianProbabilityTransform(alpha=alpha, beta=beta, base_rate=br)
+            scores = np.sort(rng.uniform(-5, 10, size=50))
+            probs = t.score_to_probability(scores, prior, prior)
+
+            diffs = np.diff(probs)
+            assert np.all(diffs >= 0), (
+                f"Monotonicity violated with base_rate={br:.4f}: "
+                f"alpha={alpha:.3f}, beta={beta:.3f}, min_diff={diffs.min():.2e}"
+            )
+
+
 class TestPaperValues:
     """Verify Section 11.1 from Paper 1.
 

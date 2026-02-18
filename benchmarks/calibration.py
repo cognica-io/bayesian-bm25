@@ -238,6 +238,9 @@ def run_verification(dataset_name: str) -> None:
     scorer = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene")
     scorer.index(corpus_tokens, show_progress=False)
 
+    scorer_br = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene", base_rate="auto")
+    scorer_br.index(corpus_tokens, show_progress=False)
+
     # Collect data
     train_scores, train_labels = collect_scores_and_labels(
         bm25_model, train_qids, qid_to_tokens, doc_ids, qrels
@@ -270,6 +273,23 @@ def run_verification(dataset_name: str) -> None:
     print(f"    Brier = {bayesian_brier:.4f}")
     print(f"\n    {'Predicted':>10}  {'Actual':>8}  {'Count':>7}  {'Gap':>8}")
     for pred, actual, count in bayesian_bins:
+        gap = pred - actual
+        bar = "+" * int(abs(gap) * 100) if gap > 0 else "-" * int(abs(gap) * 100)
+        print(f"    {pred:10.4f}  {actual:8.4f}  {count:7d}  {gap:+8.4f}  {bar}")
+
+    # --- Bayesian BM25 (auto + base_rate) ---
+    br_probs, br_labels = collect_probabilities_and_labels(
+        scorer_br, test_qids, qid_to_tokens, doc_ids, qrels
+    )
+    br_ece = expected_calibration_error(br_probs, br_labels)
+    br_brier = brier_score(br_probs, br_labels)
+    br_bins = reliability_diagram(br_probs, br_labels)
+
+    print(f"\n  Bayesian BM25 (auto + base_rate={scorer_br.base_rate:.6f}):")
+    print(f"    ECE   = {br_ece:.4f}")
+    print(f"    Brier = {br_brier:.4f}")
+    print(f"\n    {'Predicted':>10}  {'Actual':>8}  {'Count':>7}  {'Gap':>8}")
+    for pred, actual, count in br_bins:
         gap = pred - actual
         bar = "+" * int(abs(gap) * 100) if gap > 0 else "-" * int(abs(gap) * 100)
         print(f"    {pred:10.4f}  {actual:8.4f}  {count:7d}  {gap:+8.4f}  {bar}")
@@ -369,6 +389,14 @@ def run_verification(dataset_name: str) -> None:
     _, _, bay_test_f1 = threshold_f1(test_probs, test_prob_labels, bay_t)
     methods.append(("Bayesian (auto)", bay_t, bay_train_f1, bay_test_f1))
 
+    # Bayesian (auto + base_rate)
+    br_train_probs, br_train_labels = collect_probabilities_and_labels(
+        scorer_br, train_qids, qid_to_tokens, doc_ids, qrels
+    )
+    br_t, br_train_f1 = find_best_threshold(br_train_probs, br_train_labels)
+    _, _, br_test_f1 = threshold_f1(br_probs, br_labels, br_t)
+    methods.append(("Bayesian (auto+br)", br_t, br_train_f1, br_test_f1))
+
     # Bayesian (fit)
     fit_train_probs, fit_train_labels = collect_probabilities_and_labels(
         scorer_fit, train_qids, qid_to_tokens, doc_ids, qrels
@@ -396,6 +424,7 @@ def run_verification(dataset_name: str) -> None:
         ("Min-max norm", minmax_ece, minmax_brier, minmax_train_f1 - minmax_test_f1),
         ("Platt scaling", platt_ece, platt_brier, platt_train_f1 - platt_test_f1),
         ("Bayesian (auto)", bayesian_ece, bayesian_brier, bay_train_f1 - bay_test_f1),
+        ("Bayesian (auto+br)", br_ece, br_brier, br_train_f1 - br_test_f1),
         ("Bayesian (fit)", fit_ece, fit_brier, fit_train_f1 - fit_test_f1_result),
     ]
     for name, ece, brier, thr_gap in summaries:

@@ -122,6 +122,53 @@ class TestGetProbabilities:
         assert probs[3] == 0.0
 
 
+class TestBaseRateScorer:
+    def test_default_no_base_rate(self, scorer):
+        """Default scorer has base_rate=None."""
+        assert scorer.base_rate is None
+
+    def test_explicit_base_rate(self, small_corpus):
+        """base_rate=0.01 is stored and used."""
+        s = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene", base_rate=0.01)
+        s.index(small_corpus, show_progress=False)
+        assert s.base_rate == pytest.approx(0.01)
+
+    def test_auto_base_rate(self, small_corpus):
+        """base_rate="auto" produces a float in (0, 1)."""
+        s = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene", base_rate="auto")
+        s.index(small_corpus, show_progress=False)
+        assert s.base_rate is not None
+        assert 0.0 < s.base_rate < 1.0
+
+    def test_base_rate_reduces_probabilities(self, small_corpus):
+        """Nonzero probs are lower with base_rate=0.01 vs no base rate."""
+        s_none = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene")
+        s_none.index(small_corpus, show_progress=False)
+
+        s_low = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene", base_rate=0.01)
+        s_low.index(small_corpus, show_progress=False)
+
+        probs_none = s_none.get_probabilities(["cat"])
+        probs_low = s_low.get_probabilities(["cat"])
+
+        nonzero = probs_none > 0
+        assert np.any(nonzero), "Expected some nonzero probabilities"
+        assert np.all(probs_low[nonzero] < probs_none[nonzero])
+
+    def test_ranking_preserved(self, small_corpus):
+        """base_rate does not change document ranking order."""
+        s = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene", base_rate=0.01)
+        s.index(small_corpus, show_progress=False)
+
+        doc_ids, probs = s.retrieve([["cat"]], k=6)
+        nonzero_mask = probs[0] > 0
+        nonzero_probs = probs[0][nonzero_mask]
+        if len(nonzero_probs) > 1:
+            assert np.all(np.diff(nonzero_probs) <= 0), (
+                f"Ranking not preserved with base_rate: {nonzero_probs}"
+            )
+
+
 class TestNoIndexError:
     def test_retrieve_before_index(self):
         s = BayesianBM25Scorer()
