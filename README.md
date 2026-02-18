@@ -6,11 +6,12 @@ A probabilistic framework that converts raw BM25 retrieval scores into calibrate
 
 ## Overview
 
-Standard BM25 produces unbounded scores that lack consistent meaning across queries, making threshold-based filtering and multi-signal fusion unreliable. Bayesian BM25 addresses this by applying a sigmoid likelihood model with a composite prior (term frequency + document length normalization) and computing Bayesian posteriors that output well-calibrated probabilities in [0, 1].
+Standard BM25 produces unbounded scores that lack consistent meaning across queries, making threshold-based filtering and multi-signal fusion unreliable. Bayesian BM25 addresses this by applying a sigmoid likelihood model with a composite prior (term frequency + document length normalization) and computing Bayesian posteriors that output well-calibrated probabilities in [0, 1]. A corpus-level base rate prior further improves calibration by 68--77% without requiring relevance labels.
 
 Key capabilities:
 
 - **Score-to-probability transform** -- convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
+- **Base rate calibration** -- corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68--77% without relevance labels
 - **Parameter learning** -- batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging
 - **Probabilistic fusion** -- combine multiple probability signals using log-odds conjunction, which resolves the shrinkage problem of naive probabilistic AND
 - **Search integration** -- drop-in scorer wrapping [bm25s](https://github.com/xhluca/bm25s) that returns probabilities instead of raw scores
@@ -35,7 +36,7 @@ pip install bayesian-bm25[scorer]
 import numpy as np
 from bayesian_bm25 import BayesianProbabilityTransform
 
-transform = BayesianProbabilityTransform(alpha=1.5, beta=1.0)
+transform = BayesianProbabilityTransform(alpha=1.5, beta=1.0, base_rate=0.01)
 
 scores = np.array([0.5, 1.0, 1.5, 2.0, 3.0])
 tfs = np.array([1, 2, 3, 5, 8])
@@ -55,7 +56,7 @@ corpus_tokens = [
     ["data", "visualization", "tools"],
 ]
 
-scorer = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene")
+scorer = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene", base_rate="auto")
 scorer.index(corpus_tokens, show_progress=False)
 
 doc_ids, probabilities = scorer.retrieve([["machine", "learning"]], k=3)
