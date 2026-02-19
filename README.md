@@ -16,6 +16,11 @@ Key capabilities:
 - **Probabilistic fusion** -- combine multiple probability signals using log-odds conjunction, which resolves the shrinkage problem of naive probabilistic AND
 - **Search integration** -- drop-in scorer wrapping [bm25s](https://github.com/xhluca/bm25s) that returns probabilities instead of raw scores
 
+## Adoption
+
+- [MTEB](https://github.com/embeddings-benchmark/mteb) -- included as a baseline retrieval model (`bb25`) for the Massive Text Embedding Benchmark
+- [txtai](https://github.com/neuml/txtai) -- used for BM25 score normalization in hybrid search (`normalize="bayesian-bm25"`)
+
 ## Installation
 
 ```bash
@@ -92,6 +97,46 @@ for score, label in feedback_stream:
 alpha = transform.averaged_alpha
 beta = transform.averaged_beta
 ```
+
+## Benchmarks
+
+Evaluated on [BEIR](https://github.com/beir-cellar/beir) datasets (NFCorpus, SciFact) with k1=1.2, b=0.75, Lucene BM25. Queries are split 50/50 for training and evaluation. "Batch fit" uses gradient descent on training labels; all other Bayesian methods are unsupervised.
+
+### Ranking Quality
+
+Base rate prior is a monotonic transform -- it does not change document ordering.
+
+| Method | NFCorpus NDCG@10 | NFCorpus MAP | SciFact NDCG@10 | SciFact MAP |
+|---|---|---|---|---|
+| Raw BM25 | 0.5023 | 0.4395 | 0.5900 | 0.5426 |
+| Bayesian (auto) | 0.5050 | 0.4403 | 0.5791 | 0.5283 |
+| Bayesian (auto) + base rate | 0.5050 | 0.4403 | 0.5791 | 0.5283 |
+| Bayesian (batch fit) | 0.5041 | 0.4400 | 0.5826 | 0.5305 |
+| Bayesian (batch fit) + base rate | 0.5041 | 0.4400 | 0.5826 | 0.5305 |
+
+### Probability Calibration
+
+Expected Calibration Error (ECE) and Brier score. Lower is better.
+
+| Method | NFCorpus ECE | NFCorpus Brier | SciFact ECE | SciFact Brier |
+|---|---|---|---|---|
+| Bayesian (no base rate) | 0.6519 | 0.4667 | 0.7989 | 0.6635 |
+| Bayesian (base_rate=auto) | 0.1461 (-77.6%) | 0.0619 | 0.2577 (-67.7%) | 0.1308 |
+| Bayesian (base_rate=0.001) | 0.0081 (-98.8%) | 0.0114 | 0.0354 (-95.6%) | 0.0157 |
+| Batch fit (no base rate) | 0.0093 (-98.6%) | 0.0114 | 0.0103 (-98.7%) | 0.0051 |
+| Batch fit + base_rate=auto | 0.0085 (-98.7%) | 0.0096 | 0.0021 (-99.7%) | 0.0013 |
+
+### Threshold Transfer
+
+F1 scores using the best threshold found on training queries, applied to evaluation queries. Smaller gap indicates better generalization.
+
+| Method | NFCorpus Train F1 | NFCorpus Test F1 | SciFact Train F1 | SciFact Test F1 |
+|---|---|---|---|---|
+| Bayesian (no base rate) | 0.1607 | 0.1511 | 0.3374 | 0.2800 |
+| Batch fit (no base rate) | 0.1577 | 0.1405 | 0.2358 | 0.2294 |
+| Batch fit + base_rate=auto | 0.1559 | 0.1403 | 0.3316 | 0.3341 |
+
+Reproduce with `python benchmarks/base_rate.py` (requires `pip install ir_datasets`).
 
 ## Citation
 
