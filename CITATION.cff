@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+title: "Bayesian BM25"
+message: "If you use this software, please cite the following papers."
+type: software
+version: 0.2.0
+license: Apache-2.0
+repository-code: "https://github.com/cognica-io/bayesian-bm25"
+authors:
+  - family-names: Jeong
+    given-names: Jaepil
+preferred-citation:
+  type: article
+  title: "Bayesian BM25: A Probabilistic Framework for Hybrid Text and Vector Search"
+  authors:
+    - family-names: Jeong
+      given-names: Jaepil
+  year: 2026
+  publisher:
+    name: Zenodo
+  doi: "10.5281/zenodo.18414940"
+  url: "https://doi.org/10.5281/zenodo.18414940"
+references:
+  - type: article
+    title: "From Bayesian Inference to Neural Computation: The Analytical Emergence of Neural Network Structure from Probabilistic Relevance Estimation"
+    authors:
+      - family-names: Jeong
+        given-names: Jaepil
+    year: 2026
+    publisher:
+      name: Zenodo
+    doi: "10.5281/zenodo.18512411"
+    url: "https://doi.org/10.5281/zenodo.18512411"
