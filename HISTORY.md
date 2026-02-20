@@ -26,7 +26,7 @@
   - `BayesianBM25Scorer` accepts `base_rate` parameter (`None`, `"auto"`, or float)
   - Three-term log-odds posterior: `sigmoid(logit(L) + logit(b_r) + logit(p))`
   - Auto-estimation via 95th percentile pseudo-query heuristic
-  - Reduces expected calibration error by 68--77% on BEIR datasets without relevance labels
+  - Reduces expected calibration error by 68–77% on BEIR datasets without relevance labels
 - Add calibration verification benchmark (`benchmarks/calibration.py`)
 - Add theorem verification tests for both papers
 

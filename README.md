@@ -1,27 +1,27 @@
 # Bayesian BM25
 
-[[Blog](https://www.cognica.io/en/blog/posts/2026-02-01-bayesian-bm25-hybrid-search)] [[Papers](docs/papers)]  
+[[Blog](https://www.cognica.io/en/blog/posts/2026-02-01-bayesian-bm25-hybrid-search)] [[Papers](docs/papers)]
 
 A probabilistic framework that converts raw BM25 retrieval scores into calibrated relevance probabilities using Bayesian inference.
 
 ## Overview
 
-Standard BM25 produces unbounded scores that lack consistent meaning across queries, making threshold-based filtering and multi-signal fusion unreliable. Bayesian BM25 addresses this by applying a sigmoid likelihood model with a composite prior (term frequency + document length normalization) and computing Bayesian posteriors that output well-calibrated probabilities in [0, 1]. A corpus-level base rate prior further improves calibration by 68--77% without requiring relevance labels.
+Standard BM25 produces unbounded scores that lack consistent meaning across queries, making threshold-based filtering and multi-signal fusion unreliable. Bayesian BM25 addresses this by applying a sigmoid likelihood model with a composite prior (term frequency + document length normalization) and computing Bayesian posteriors that output well-calibrated probabilities in [0, 1]. A corpus-level base rate prior further improves calibration by 68–77% without requiring relevance labels.
 
 Key capabilities:
 
-- **Score-to-probability transform** -- convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
-- **Base rate calibration** -- corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68--77% without relevance labels
-- **Parameter learning** -- batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
-- **Probabilistic fusion** -- combine multiple probability signals using log-odds conjunction with optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
-- **Hybrid search** -- `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
-- **WAND pruning** -- `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
-- **Search integration** -- drop-in scorer wrapping [bm25s](https://github.com/xhluca/bm25s) that returns probabilities instead of raw scores
+- **Score-to-probability transform** — convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
+- **Base rate calibration** — corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68–77% without relevance labels
+- **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
+- **Probabilistic fusion** — combine multiple probability signals using log-odds conjunction with optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
+- **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
+- **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
+- **Search integration** — drop-in scorer wrapping [bm25s](https://github.com/xhluca/bm25s) that returns probabilities instead of raw scores
 
 ## Adoption
 
-- [MTEB](https://github.com/embeddings-benchmark/mteb) -- included as a baseline retrieval model (`bb25`) for the Massive Text Embedding Benchmark
-- [txtai](https://github.com/neuml/txtai) -- used for BM25 score normalization in hybrid search (`normalize="bayesian-bm25"`)
+- [MTEB](https://github.com/embeddings-benchmark/mteb) — included as a baseline retrieval model (`bb25`) for the Massive Text Embedding Benchmark
+- [txtai](https://github.com/neuml/txtai) — used for BM25 score normalization in hybrid search (`normalize="bayesian-bm25"`)
 
 ## Installation
 
@@ -156,7 +156,7 @@ Evaluated on [BEIR](https://github.com/beir-cellar/beir) datasets (NFCorpus, Sci
 
 ### Ranking Quality
 
-Base rate prior is a monotonic transform -- it does not change document ordering.
+Base rate prior is a monotonic transform — it does not change document ordering.
 
 | Method | NFCorpus NDCG@10 | NFCorpus MAP | SciFact NDCG@10 | SciFact MAP |
 |---|---|---|---|---|
@@ -165,6 +165,10 @@ Base rate prior is a monotonic transform -- it does not change document ordering
 | Bayesian (auto) + base rate | 0.5050 | 0.4403 | 0.5791 | 0.5283 |
 | Bayesian (batch fit) | 0.5041 | 0.4400 | 0.5826 | 0.5305 |
 | Bayesian (batch fit) + base rate | 0.5041 | 0.4400 | 0.5826 | 0.5305 |
+| Platt scaling | 0.0229 | 0.0165 | 0.0000 | 0.0000 |
+| Min-max normalization | 0.5023 | 0.4395 | 0.5900 | 0.5426 |
+| Batch fit (prior-aware, C2) | 0.5066 | 0.4424 | 0.5776 | 0.5236 |
+| Batch fit (prior-free, C3) | 0.5023 | 0.4395 | 0.5880 | 0.5389 |
 
 ### Probability Calibration
 
@@ -177,6 +181,10 @@ Expected Calibration Error (ECE) and Brier score. Lower is better.
 | Bayesian (base_rate=0.001) | 0.0081 (-98.8%) | 0.0114 | 0.0354 (-95.6%) | 0.0157 |
 | Batch fit (no base rate) | 0.0093 (-98.6%) | 0.0114 | 0.0103 (-98.7%) | 0.0051 |
 | Batch fit + base_rate=auto | 0.0085 (-98.7%) | 0.0096 | 0.0021 (-99.7%) | 0.0013 |
+| Platt scaling | 0.0186 (-97.1%) | 0.0101 | 0.0188 (-97.7%) | 0.0007 |
+| Min-max normalization | 0.0189 (-97.1%) | 0.0105 | 0.0156 (-98.0%) | 0.0009 |
+| Batch fit (prior-aware, C2) | 0.0892 (-86.3%) | 0.0439 | 0.1427 (-82.1%) | 0.0802 |
+| Batch fit (prior-free, C3) | 0.0029 (-99.6%) | 0.0099 | 0.0058 (-99.3%) | 0.0030 |
 
 ### Threshold Transfer
 
@@ -187,13 +195,17 @@ F1 scores using the best threshold found on training queries, applied to evaluat
 | Bayesian (no base rate) | 0.1607 | 0.1511 | 0.3374 | 0.2800 |
 | Batch fit (no base rate) | 0.1577 | 0.1405 | 0.2358 | 0.2294 |
 | Batch fit + base_rate=auto | 0.1559 | 0.1403 | 0.3316 | 0.3341 |
+| Platt scaling | 0.0219 | 0.0193 | 0.0005 | 0.0005 |
+| Min-max normalization | 0.1796 | 0.1751 | 0.3526 | 0.3486 |
+| Batch fit (prior-aware, C2) | 0.1657 | 0.1539 | 0.3370 | 0.3275 |
+| Batch fit (prior-free, C3) | 0.1808 | 0.1758 | 0.2836 | 0.2852 |
 
 Reproduce with `python benchmarks/base_rate.py` (requires `pip install ir_datasets`). The base rate benchmark also includes Platt scaling, min-max normalization, and prior-aware/prior-free training mode comparisons.
 
 Additional benchmarks (no external datasets required):
 
-- `python benchmarks/weighted_fusion.py` -- weighted vs uniform log-odds fusion across noise scenarios
-- `python benchmarks/wand_upper_bound.py` -- WAND upper bound tightness and skip rate analysis
+- `python benchmarks/weighted_fusion.py` — weighted vs uniform log-odds fusion across noise scenarios
+- `python benchmarks/wand_upper_bound.py` — WAND upper bound tightness and skip rate analysis
 
 ## Citation
 
