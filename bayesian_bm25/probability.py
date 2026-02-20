@@ -65,6 +65,8 @@ class BayesianProbabilityTransform:
         compatibility.  base_rate=0.5 is neutral (logit(0.5) = 0).
     """
 
+    _VALID_MODES = ("balanced", "prior_aware", "prior_free")
+
     def __init__(
         self,
         alpha: float = 1.0,
@@ -82,6 +84,7 @@ class BayesianProbabilityTransform:
         self._logit_base_rate: float | None = (
             float(logit(base_rate)) if base_rate is not None else None
         )
+        self._training_mode: str = "balanced"
         self._n_updates: int = 0
         self._grad_alpha_ema: float = 0.0
         self._grad_beta_ema: float = 0.0
@@ -167,9 +170,17 @@ class BayesianProbabilityTransform:
         Computes likelihood from the score, composite prior from tf and
         doc_len_ratio, then applies the Bayesian posterior formula.
         When base_rate is set, uses the three-term log-odds formulation.
+
+        In prior_free mode (C3), uses prior=0.5 so the posterior equals the
+        likelihood, ignoring the composite prior at inference time.
         """
         l_val = self.likelihood(score)
-        prior = self.composite_prior(tf, doc_len_ratio)
+
+        if self._training_mode == "prior_free":
+            prior = np.float64(0.5)
+        else:
+            prior = self.composite_prior(tf, doc_len_ratio)
+
         if self.base_rate is not None:
             # Two-step: compute two-term posterior via direct formula,
             # then apply base_rate as one more Bayes update.
@@ -183,6 +194,39 @@ class BayesianProbabilityTransform:
             return float(result) if np.ndim(result) == 0 else result
         return self.posterior(l_val, prior)
 
+    def wand_upper_bound(
+        self,
+        bm25_upper_bound: np.ndarray | float,
+        p_max: float = 0.9,
+    ) -> np.ndarray | float:
+        """Compute the Bayesian WAND upper bound for safe document pruning (Theorem 6.1.2).
+
+        Given a standard BM25 upper bound per term, computes the tightest
+        safe Bayesian probability upper bound by assuming the maximum
+        possible prior (p_max from Theorem 4.2.4).
+
+        The upper bound is:
+            L_max = sigmoid(alpha * (bm25_upper_bound - beta))
+            P_max = posterior(L_max, p_max [, base_rate])
+
+        Any document's actual Bayesian probability is guaranteed to be
+        at most this value, making it safe for WAND-style pruning.
+
+        Parameters
+        ----------
+        bm25_upper_bound : float or array
+            Standard BM25 upper bound score(s) per term.
+        p_max : float
+            Global prior upper bound from composite_prior clamp (default 0.9,
+            which is the maximum of Eq. 27).
+
+        Returns
+        -------
+        Bayesian probability upper bound(s) for safe pruning.
+        """
+        l_max = self.likelihood(bm25_upper_bound)
+        return self.posterior(l_max, p_max, base_rate=self.base_rate)
+
     def fit(
         self,
         scores: np.ndarray,
@@ -191,11 +235,24 @@ class BayesianProbabilityTransform:
         learning_rate: float = 0.01,
         max_iterations: int = 1000,
         tolerance: float = 1e-6,
+        mode: str = "balanced",
+        tfs: np.ndarray | None = None,
+        doc_len_ratios: np.ndarray | None = None,
     ) -> None:
         """Learn alpha and beta via gradient descent (Algorithm 8.3.1).
 
-        Minimises binary cross-entropy between sigmoid(alpha*(s-beta)) and
-        binary relevance labels using simple gradient descent.
+        Minimises binary cross-entropy using simple gradient descent.
+        Three training modes are supported (C1/C2/C3 conditions):
+
+        - ``"balanced"`` (C1, default): trains on the sigmoid likelihood
+          pred = sigmoid(alpha*(s-beta)).
+        - ``"prior_aware"`` (C2): trains on the full Bayesian posterior
+          pred = L*p / (L*p + (1-L)*(1-p)) where L is the sigmoid
+          likelihood and p is the composite prior.  Requires ``tfs``
+          and ``doc_len_ratios``.
+        - ``"prior_free"`` (C3): same training as balanced, but at
+          inference time ``score_to_probability`` uses prior=0.5
+          (posterior = likelihood).
 
         Parameters
         ----------
@@ -204,21 +261,64 @@ class BayesianProbabilityTransform:
         learning_rate : step size for gradient updates
         max_iterations : maximum number of gradient descent steps
         tolerance : convergence threshold on parameter change
+        mode : str
+            Training mode: "balanced", "prior_aware", or "prior_free".
+        tfs : array or None
+            Term frequencies per sample.  Required when mode="prior_aware".
+        doc_len_ratios : array or None
+            Document length ratios (doc_len / avgdl) per sample.
+            Required when mode="prior_aware".
         """
+        if mode not in self._VALID_MODES:
+            raise ValueError(
+                f"mode must be one of {self._VALID_MODES}, got {mode!r}"
+            )
+        if mode == "prior_aware":
+            if tfs is None or doc_len_ratios is None:
+                raise ValueError(
+                    "tfs and doc_len_ratios are required when mode='prior_aware'"
+                )
+
         scores = np.asarray(scores, dtype=np.float64)
         labels = np.asarray(labels, dtype=np.float64)
+
+        priors: np.ndarray | None = None
+        if mode == "prior_aware":
+            tfs_arr = np.asarray(tfs, dtype=np.float64)
+            dlr_arr = np.asarray(doc_len_ratios, dtype=np.float64)
+            priors = np.asarray(
+                self.composite_prior(tfs_arr, dlr_arr), dtype=np.float64
+            )
 
         alpha = self.alpha
         beta = self.beta
 
         for _ in range(max_iterations):
-            predicted = sigmoid(alpha * (scores - beta))
-            predicted = _clamp_probability(predicted)
+            L = _clamp_probability(sigmoid(alpha * (scores - beta)))
 
-            # Gradient of BCE loss w.r.t. alpha and beta
-            error = predicted - labels
-            grad_alpha = np.mean(error * (scores - beta))
-            grad_beta = np.mean(error * (-alpha))
+            if mode == "prior_aware":
+                # Posterior: P = L*p / (L*p + (1-L)*(1-p))
+                p = priors
+                denom = L * p + (1.0 - L) * (1.0 - p)
+                predicted = _clamp_probability(L * p / denom)
+
+                # Chain rule: dBCE/dalpha = (P - y) * dP/dL * dL/dalpha
+                # dP/dL = p*(1-p) / denom^2
+                # dL/dalpha = L*(1-L)*(s-beta)
+                # dL/dbeta  = -L*(1-L)*alpha
+                dP_dL = p * (1.0 - p) / (denom ** 2)
+                dL_dalpha = L * (1.0 - L) * (scores - beta)
+                dL_dbeta = -L * (1.0 - L) * alpha
+
+                error = predicted - labels
+                grad_alpha = np.mean(error * dP_dL * dL_dalpha)
+                grad_beta = np.mean(error * dP_dL * dL_dbeta)
+            else:
+                # balanced or prior_free: train on sigmoid likelihood
+                predicted = L
+                error = predicted - labels
+                grad_alpha = np.mean(error * (scores - beta))
+                grad_beta = np.mean(error * (-alpha))
 
             new_alpha = alpha - learning_rate * grad_alpha
             new_beta = beta - learning_rate * grad_beta
@@ -233,6 +333,7 @@ class BayesianProbabilityTransform:
 
         self.alpha = alpha
         self.beta = beta
+        self._training_mode = mode
         self._n_updates = 0
         self._grad_alpha_ema = 0.0
         self._grad_beta_ema = 0.0
@@ -249,6 +350,9 @@ class BayesianProbabilityTransform:
         decay_tau: float = 1000.0,
         max_grad_norm: float = 1.0,
         avg_decay: float = 0.995,
+        mode: str | None = None,
+        tf: float | np.ndarray | None = None,
+        doc_len_ratio: float | np.ndarray | None = None,
     ) -> None:
         """Online update of alpha and beta from a single observation or mini-batch.
 
@@ -284,15 +388,52 @@ class BayesianProbabilityTransform:
             Decay factor for Polyak parameter averaging.  The averaged
             parameters are updated as avg = decay * avg + (1-decay) * raw.
             Higher values (closer to 1) produce smoother averages.
+        mode : str or None
+            Training mode override.  If None, uses the mode set by the
+            last call to ``fit()``, defaulting to ``"balanced"``.
+        tf : float, array, or None
+            Term frequency(ies).  Required when mode="prior_aware".
+        doc_len_ratio : float, array, or None
+            Document length ratio(s).  Required when mode="prior_aware".
         """
+        effective_mode = mode if mode is not None else self._training_mode
+        if effective_mode not in self._VALID_MODES:
+            raise ValueError(
+                f"mode must be one of {self._VALID_MODES}, got {effective_mode!r}"
+            )
+        if effective_mode == "prior_aware":
+            if tf is None or doc_len_ratio is None:
+                raise ValueError(
+                    "tf and doc_len_ratio are required when mode='prior_aware'"
+                )
+
         score = np.atleast_1d(np.asarray(score, dtype=np.float64))
         label = np.atleast_1d(np.asarray(label, dtype=np.float64))
 
-        predicted = _clamp_probability(sigmoid(self.alpha * (score - self.beta)))
-        error = predicted - label
+        L = _clamp_probability(sigmoid(self.alpha * (score - self.beta)))
 
-        grad_alpha = float(np.mean(error * (score - self.beta)))
-        grad_beta = float(np.mean(error * (-self.alpha)))
+        if effective_mode == "prior_aware":
+            tf_arr = np.atleast_1d(np.asarray(tf, dtype=np.float64))
+            dlr_arr = np.atleast_1d(np.asarray(doc_len_ratio, dtype=np.float64))
+            p = np.asarray(self.composite_prior(tf_arr, dlr_arr), dtype=np.float64)
+            denom = L * p + (1.0 - L) * (1.0 - p)
+            predicted = _clamp_probability(L * p / denom)
+
+            dP_dL = p * (1.0 - p) / (denom ** 2)
+            dL_dalpha = L * (1.0 - L) * (score - self.beta)
+            dL_dbeta = -L * (1.0 - L) * self.alpha
+
+            error = predicted - label
+            grad_alpha = float(np.mean(error * dP_dL * dL_dalpha))
+            grad_beta = float(np.mean(error * dP_dL * dL_dbeta))
+        else:
+            predicted = L
+            error = predicted - label
+            grad_alpha = float(np.mean(error * (score - self.beta)))
+            grad_beta = float(np.mean(error * (-self.alpha)))
+
+        if mode is not None:
+            self._training_mode = effective_mode
 
         # EMA smoothing of gradients
         self._grad_alpha_ema = momentum * self._grad_alpha_ema + (1 - momentum) * grad_alpha

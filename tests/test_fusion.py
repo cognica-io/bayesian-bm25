@@ -9,7 +9,48 @@
 import numpy as np
 import pytest
 
-from bayesian_bm25.fusion import log_odds_conjunction, prob_and, prob_or
+from bayesian_bm25.fusion import (
+    cosine_to_probability,
+    log_odds_conjunction,
+    prob_and,
+    prob_or,
+)
+
+
+class TestCosineToProbability:
+    def test_max_similarity(self):
+        """score=1.0 -> ~1.0 (clamped to 1-epsilon)."""
+        result = cosine_to_probability(1.0)
+        assert result == pytest.approx(1.0, abs=1e-5)
+
+    def test_min_similarity(self):
+        """score=-1.0 -> ~0.0 (clamped to epsilon)."""
+        result = cosine_to_probability(-1.0)
+        assert result == pytest.approx(0.0, abs=1e-5)
+
+    def test_zero_similarity(self):
+        """score=0.0 -> 0.5."""
+        result = cosine_to_probability(0.0)
+        assert result == pytest.approx(0.5)
+
+    def test_bounds(self):
+        """Output is always in (0, 1) with clamping."""
+        for score in [-1.0, -0.5, 0.0, 0.5, 1.0]:
+            result = cosine_to_probability(score)
+            assert 0 < result < 1, f"Out of bounds for score={score}: {result}"
+
+    def test_array_input(self):
+        scores = np.array([-1.0, -0.5, 0.0, 0.5, 1.0])
+        result = cosine_to_probability(scores)
+        assert result.shape == (5,)
+        np.testing.assert_allclose(
+            result, [0.0, 0.25, 0.5, 0.75, 1.0], atol=1e-5
+        )
+
+    def test_monotonicity(self):
+        scores = np.linspace(-1.0, 1.0, 20)
+        result = cosine_to_probability(scores)
+        assert np.all(np.diff(result) > 0)
 
 
 class TestProbAnd:
@@ -160,3 +201,70 @@ class TestLogOddsConjunction:
         assert result.shape == (2,)
         assert result[0] > 0.9  # High agreement amplified
         assert result[1] < 0.5  # Low agreement stays low
+
+
+class TestWeightedLogOddsConjunction:
+    """Verify weighted Log-OP from Paper 2, Theorem 8.3 / Remark 8.4."""
+
+    def test_uniform_weights_match_unweighted_alpha_zero(self):
+        """Uniform weights should produce same result as unweighted alpha=0.
+
+        With alpha=0 unweighted: l_adjusted = l_bar * 1 = mean(logit(P_i)).
+        With uniform weights w_i=1/n: sum(w_i * logit(P_i)) = mean(logit(P_i)).
+        """
+        probs = np.array([0.7, 0.8])
+        uniform_w = np.array([0.5, 0.5])
+        weighted = log_odds_conjunction(probs, weights=uniform_w)
+        unweighted_alpha0 = log_odds_conjunction(probs, alpha=0.0)
+        assert weighted == pytest.approx(unweighted_alpha0, abs=1e-10)
+
+    def test_higher_weight_on_high_probability(self):
+        """Weighting the high-probability signal more should increase result."""
+        probs = np.array([0.9, 0.3])
+        w_high_first = np.array([0.8, 0.2])
+        w_high_second = np.array([0.2, 0.8])
+        result_high_first = log_odds_conjunction(probs, weights=w_high_first)
+        result_high_second = log_odds_conjunction(probs, weights=w_high_second)
+        assert result_high_first > result_high_second
+
+    def test_higher_weight_on_low_probability(self):
+        """Weighting the low-probability signal more should decrease result."""
+        probs = np.array([0.9, 0.2])
+        w_equal = np.array([0.5, 0.5])
+        w_low_heavy = np.array([0.2, 0.8])
+        result_equal = log_odds_conjunction(probs, weights=w_equal)
+        result_low = log_odds_conjunction(probs, weights=w_low_heavy)
+        assert result_low < result_equal
+
+    def test_weights_must_sum_to_one(self):
+        probs = np.array([0.5, 0.5])
+        with pytest.raises(ValueError, match="weights must sum to 1"):
+            log_odds_conjunction(probs, weights=np.array([0.3, 0.3]))
+
+    def test_weights_must_be_nonnegative(self):
+        probs = np.array([0.5, 0.5])
+        with pytest.raises(ValueError, match="weights must be non-negative"):
+            log_odds_conjunction(probs, weights=np.array([-0.5, 1.5]))
+
+    def test_batched_with_weights(self):
+        probs = np.array([[0.9, 0.1], [0.8, 0.8]])
+        weights = np.array([0.7, 0.3])
+        result = log_odds_conjunction(probs, weights=weights)
+        assert result.shape == (2,)
+        # First batch: high-prob signal weighted heavily -> > 0.5
+        assert result[0] > 0.5
+        # Second batch: both signals agree at 0.8 -> > 0.5
+        assert result[1] > 0.5
+
+    def test_single_signal_full_weight(self):
+        """A single signal with weight=1 should pass through."""
+        result = log_odds_conjunction(np.array([0.8]), weights=np.array([1.0]))
+        assert result == pytest.approx(0.8, abs=1e-6)
+
+    def test_three_signals(self):
+        """Three signals with non-uniform weights."""
+        probs = np.array([0.9, 0.9, 0.1])
+        w = np.array([0.4, 0.4, 0.2])
+        result = log_odds_conjunction(probs, weights=w)
+        # Two high signals dominate -> result > 0.5
+        assert result > 0.5

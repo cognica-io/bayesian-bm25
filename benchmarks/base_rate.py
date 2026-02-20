@@ -32,7 +32,9 @@ import numpy as np
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
+from bayesian_bm25.probability import sigmoid
 from bayesian_bm25.scorer import BayesianBM25Scorer
+from benchmarks.calibration import minmax_normalize, platt_scaling_fit
 from benchmarks.metrics import (
     average_precision,
     brier_score,
@@ -422,6 +424,146 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> None:
     results.append((f"Batch fit (base_rate={br_actual:.4f})", r))
     tr_f1, te_f1, gap = evaluate_threshold_transfer(scorer_fit_actual, dataset, train_qids, eval_qids)
     threshold_results.append((f"Batch fit (base_rate={br_actual:.4f})", tr_f1, te_f1, gap))
+
+    # 8. Platt scaling baseline
+    print("8. Platt scaling (baseline)")
+    platt_A, platt_B = platt_scaling_fit(train_scores, train_labels)
+    print(f"   Platt A={platt_A:.4f}, B={platt_B:.4f}")
+
+    platt_all_probs, platt_all_labels = [], []
+    platt_ndcgs, platt_aps, platt_precisions = [], [], []
+    for qid, qtokens in eval_dataset.queries:
+        qrel = dataset.qrels[qid]
+        scores = bm25_model.get_scores(qtokens)
+        platt_probs = np.array(sigmoid(platt_A * scores + platt_B))
+        top_k_idx = np.argsort(-platt_probs)[:k]
+        ranked_dids = [dataset.doc_ids[i] for i in top_k_idx]
+        graded = get_graded_relevance_vector(ranked_dids, qrel)
+        binary = get_relevance_vector(ranked_dids, qrel)
+        platt_ndcgs.append(ndcg_at_k(graded, k))
+        platt_aps.append(average_precision(binary))
+        platt_precisions.append(precision_at_k(binary, k))
+        nonzero = scores > 0
+        if np.any(nonzero):
+            nz_dids = [dataset.doc_ids[i] for i, nz in enumerate(nonzero) if nz]
+            nz_labels = [float(qrel.get(did, 0) >= 1) for did in nz_dids]
+            platt_all_probs.extend(platt_probs[nonzero].tolist())
+            platt_all_labels.extend(nz_labels)
+
+    platt_p_arr = np.array(platt_all_probs) if platt_all_probs else np.array([])
+    platt_l_arr = np.array(platt_all_labels) if platt_all_labels else np.array([])
+    platt_ece = expected_calibration_error(platt_p_arr, platt_l_arr) if len(platt_p_arr) > 0 else 1.0
+    platt_brier = brier_score(platt_p_arr, platt_l_arr) if len(platt_p_arr) > 0 else 1.0
+    r_platt = {
+        f"NDCG@{k}": float(np.mean(platt_ndcgs)),
+        f"P@{k}": float(np.mean(platt_precisions)),
+        "MAP": float(np.mean(platt_aps)),
+        "ECE": platt_ece,
+        "Brier": platt_brier,
+    }
+    results.append(("Platt scaling", r_platt))
+
+    # Platt threshold transfer
+    platt_train_probs = np.array(sigmoid(platt_A * train_scores + platt_B))
+    platt_t, platt_train_f1 = find_best_threshold(platt_train_probs, train_labels)
+    _, _, platt_test_f1 = threshold_f1(platt_p_arr, platt_l_arr, platt_t)
+    threshold_results.append(("Platt scaling", platt_train_f1, platt_test_f1, platt_train_f1 - platt_test_f1))
+
+    # 9. Min-max normalization baseline
+    print("9. Min-max normalization (baseline)")
+    minmax_all_probs, minmax_all_labels = [], []
+    minmax_ndcgs, minmax_aps, minmax_precisions = [], [], []
+    for qid, qtokens in eval_dataset.queries:
+        qrel = dataset.qrels[qid]
+        scores = bm25_model.get_scores(qtokens)
+        minmax_probs = minmax_normalize(scores, train_scores)
+        top_k_idx = np.argsort(-minmax_probs)[:k]
+        ranked_dids = [dataset.doc_ids[i] for i in top_k_idx]
+        graded = get_graded_relevance_vector(ranked_dids, qrel)
+        binary = get_relevance_vector(ranked_dids, qrel)
+        minmax_ndcgs.append(ndcg_at_k(graded, k))
+        minmax_aps.append(average_precision(binary))
+        minmax_precisions.append(precision_at_k(binary, k))
+        nonzero = scores > 0
+        if np.any(nonzero):
+            nz_dids = [dataset.doc_ids[i] for i, nz in enumerate(nonzero) if nz]
+            nz_labels = [float(qrel.get(did, 0) >= 1) for did in nz_dids]
+            minmax_all_probs.extend(minmax_probs[nonzero].tolist())
+            minmax_all_labels.extend(nz_labels)
+
+    minmax_p_arr = np.array(minmax_all_probs) if minmax_all_probs else np.array([])
+    minmax_l_arr = np.array(minmax_all_labels) if minmax_all_labels else np.array([])
+    minmax_ece = expected_calibration_error(minmax_p_arr, minmax_l_arr) if len(minmax_p_arr) > 0 else 1.0
+    minmax_brier = brier_score(minmax_p_arr, minmax_l_arr) if len(minmax_p_arr) > 0 else 1.0
+    r_minmax = {
+        f"NDCG@{k}": float(np.mean(minmax_ndcgs)),
+        f"P@{k}": float(np.mean(minmax_precisions)),
+        "MAP": float(np.mean(minmax_aps)),
+        "ECE": minmax_ece,
+        "Brier": minmax_brier,
+    }
+    results.append(("Min-max normalization", r_minmax))
+
+    # Min-max threshold transfer
+    minmax_train = minmax_normalize(train_scores, train_scores)
+    minmax_t, minmax_train_f1 = find_best_threshold(minmax_train, train_labels)
+    _, _, minmax_test_f1 = threshold_f1(minmax_p_arr, minmax_l_arr, minmax_t)
+    threshold_results.append(("Min-max normalization", minmax_train_f1, minmax_test_f1, minmax_train_f1 - minmax_test_f1))
+
+    # 10. Batch fit -- prior_aware mode (C2)
+    print("10. Batch fit (prior_aware, C2)")
+    scorer_fit_pa = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene", base_rate=None)
+    scorer_fit_pa.index(dataset.corpus_tokens, show_progress=False)
+    # Collect TF and doc_len_ratio for training data
+    qid_to_tokens_map = {qid: qt for qid, qt in dataset.queries}
+    train_tfs, train_dlrs = [], []
+    for qid in train_qids:
+        qtokens = qid_to_tokens_map[qid]
+        qrel = dataset.qrels[qid]
+        scores = bm25_model.get_scores(qtokens)
+        nonzero = scores > 0
+        if not np.any(nonzero):
+            continue
+        for i, nz in enumerate(nonzero):
+            if nz:
+                doc_tokens = dataset.corpus_tokens[i]
+                query_set = set(qtokens)
+                tf_val = float(sum(1 for t in doc_tokens if t in query_set))
+                dl = len(doc_tokens)
+                avgdl = scorer_fit_pa.avgdl
+                train_tfs.append(tf_val)
+                train_dlrs.append(dl / avgdl)
+
+    train_tfs_arr = np.array(train_tfs[:len(train_scores)])
+    train_dlrs_arr = np.array(train_dlrs[:len(train_scores)])
+    scorer_fit_pa._transform.fit(
+        train_scores, train_labels,
+        learning_rate=0.01, max_iterations=3000,
+        mode="prior_aware",
+        tfs=train_tfs_arr, doc_len_ratios=train_dlrs_arr,
+    )
+    print(f"   alpha={scorer_fit_pa._transform.alpha:.4f}, "
+          f"beta={scorer_fit_pa._transform.beta:.4f}, mode=prior_aware")
+    r = evaluate_bayesian(scorer_fit_pa, eval_dataset, k=k)
+    results.append(("Batch fit (prior_aware)", r))
+    tr_f1, te_f1, gap = evaluate_threshold_transfer(scorer_fit_pa, dataset, train_qids, eval_qids)
+    threshold_results.append(("Batch fit (prior_aware)", tr_f1, te_f1, gap))
+
+    # 11. Batch fit -- prior_free mode (C3)
+    print("11. Batch fit (prior_free, C3)")
+    scorer_fit_pf = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene", base_rate=None)
+    scorer_fit_pf.index(dataset.corpus_tokens, show_progress=False)
+    scorer_fit_pf._transform.fit(
+        train_scores, train_labels,
+        learning_rate=0.05, max_iterations=3000,
+        mode="prior_free",
+    )
+    print(f"   alpha={scorer_fit_pf._transform.alpha:.4f}, "
+          f"beta={scorer_fit_pf._transform.beta:.4f}, mode=prior_free")
+    r = evaluate_bayesian(scorer_fit_pf, eval_dataset, k=k)
+    results.append(("Batch fit (prior_free)", r))
+    tr_f1, te_f1, gap = evaluate_threshold_transfer(scorer_fit_pf, dataset, train_qids, eval_qids)
+    threshold_results.append(("Batch fit (prior_free)", tr_f1, te_f1, gap))
 
     # -----------------------------------------------------------------------
     # Summary table

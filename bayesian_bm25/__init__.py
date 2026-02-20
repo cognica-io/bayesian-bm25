@@ -7,10 +7,16 @@
 """Bayesian BM25 -- probabilistic transforms for BM25 retrieval scores."""
 
 from bayesian_bm25.probability import BayesianProbabilityTransform
-from bayesian_bm25.fusion import log_odds_conjunction, prob_and, prob_or
+from bayesian_bm25.fusion import (
+    cosine_to_probability,
+    log_odds_conjunction,
+    prob_and,
+    prob_or,
+)
 
 __all__ = [
     "BayesianProbabilityTransform",
+    "cosine_to_probability",
     "log_odds_conjunction",
     "prob_and",
     "prob_or",

@@ -22,6 +22,29 @@ import numpy as np
 from bayesian_bm25.probability import _EPSILON, _clamp_probability, logit, sigmoid
 
 
+def cosine_to_probability(
+    score: np.ndarray | float,
+) -> np.ndarray | float:
+    """Convert cosine similarity to probability (Definition 7.1.2).
+
+    Maps cosine similarity in [-1, 1] to probability in (0, 1) via
+    P_vector = (1 + score) / 2, with epsilon clamping for numerical
+    stability.
+
+    Parameters
+    ----------
+    score : float or array
+        Cosine similarity score(s) in [-1, 1].
+
+    Returns
+    -------
+    Probability value(s) in (0, 1).
+    """
+    score = np.asarray(score, dtype=np.float64)
+    result = _clamp_probability((1.0 + score) / 2.0)
+    return float(result) if result.ndim == 0 else result
+
+
 def prob_and(probs: np.ndarray) -> np.ndarray | float:
     """Probabilistic AND via product rule in log-space (Eq. 33-34).
 
@@ -59,6 +82,7 @@ def prob_or(probs: np.ndarray) -> np.ndarray | float:
 def log_odds_conjunction(
     probs: np.ndarray,
     alpha: float = 0.5,
+    weights: np.ndarray | None = None,
 ) -> np.ndarray | float:
     """Log-odds conjunction with multiplicative confidence scaling (Paper 2, Section 4).
 
@@ -66,6 +90,11 @@ def log_odds_conjunction(
       1. Computing the mean log-odds (Eq. 20)
       2. Multiplicative confidence scaling by n^alpha (Eq. 23)
       3. Converting back to probability via sigmoid (Eq. 26)
+
+    When ``weights`` are provided, uses the Log-OP (Log-linear Opinion
+    Pool) formulation from Paper 2, Theorem 8.3 / Remark 8.4 instead:
+    sigma(sum(w_i * logit(P_i))) where sum(w_i) = 1 and w_i >= 0.
+    The ``alpha`` parameter is ignored in weighted mode.
 
     The multiplicative formulation (rather than additive) preserves the
     sign of evidence (Theorem 4.2.2), preventing accidental inversion
@@ -79,13 +108,32 @@ def log_odds_conjunction(
         Probability values to combine.  The last axis is reduced.
     alpha : float
         Confidence scaling exponent.  Higher values amplify the effect
-        of multiple agreeing signals.
+        of multiple agreeing signals.  Ignored when weights are provided.
+    weights : array of shape (n,) or None
+        Per-signal reliability weights for the Log-OP formulation.
+        Must be non-negative and sum to 1.  When None (default),
+        uses the unweighted mean log-odds with n^alpha scaling.
 
     Returns
     -------
     Combined probability after log-odds conjunction.
     """
     probs = _clamp_probability(np.asarray(probs, dtype=np.float64))
+
+    if weights is not None:
+        weights = np.asarray(weights, dtype=np.float64)
+        if np.any(weights < 0):
+            raise ValueError("weights must be non-negative")
+        if abs(float(np.sum(weights)) - 1.0) > 1e-6:
+            raise ValueError(
+                f"weights must sum to 1, got {float(np.sum(weights))}"
+            )
+
+        # Log-OP: sigma(sum(w_i * logit(P_i)))  (Theorem 8.3)
+        l_weighted = np.sum(weights * logit(probs), axis=-1)
+        result = sigmoid(l_weighted)
+        return float(result) if np.ndim(result) == 0 else result
+
     n = probs.shape[-1]
 
     # Step 1: mean log-odds (Eq. 20)
