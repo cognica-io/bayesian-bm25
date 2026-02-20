@@ -12,8 +12,10 @@ Key capabilities:
 
 - **Score-to-probability transform** -- convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
 - **Base rate calibration** -- corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68--77% without relevance labels
-- **Parameter learning** -- batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging
-- **Probabilistic fusion** -- combine multiple probability signals using log-odds conjunction, which resolves the shrinkage problem of naive probabilistic AND
+- **Parameter learning** -- batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
+- **Probabilistic fusion** -- combine multiple probability signals using log-odds conjunction with optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
+- **Hybrid search** -- `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
+- **WAND pruning** -- `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
 - **Search integration** -- drop-in scorer wrapping [bm25s](https://github.com/xhluca/bm25s) that returns probabilities instead of raw scores
 
 ## Adoption
@@ -79,6 +81,39 @@ prob_and(signals)                # 0.357 (shrinkage problem)
 log_odds_conjunction(signals)    # 0.773 (agreement-aware)
 ```
 
+### Hybrid Text + Vector Search
+
+```python
+import numpy as np
+from bayesian_bm25 import cosine_to_probability, log_odds_conjunction
+
+# BM25 probabilities (from Bayesian BM25)
+bm25_probs = np.array([0.85, 0.60, 0.40])
+
+# Vector search cosine similarities -> probabilities
+cosine_scores = np.array([0.92, 0.35, 0.70])
+vector_probs = cosine_to_probability(cosine_scores)  # [0.96, 0.675, 0.85]
+
+# Fuse with reliability weights (BM25 weight=0.6, vector weight=0.4)
+stacked = np.stack([bm25_probs, vector_probs], axis=-1)
+fused = log_odds_conjunction(stacked, weights=np.array([0.6, 0.4]))
+```
+
+### WAND Pruning with Bayesian Upper Bounds
+
+```python
+from bayesian_bm25 import BayesianProbabilityTransform
+
+transform = BayesianProbabilityTransform(alpha=1.5, beta=2.0, base_rate=0.01)
+
+# Standard BM25 upper bound per query term
+bm25_upper_bound = 5.0
+
+# Bayesian upper bound for safe pruning -- any document's actual
+# probability is guaranteed to be at most this value
+bayesian_bound = transform.wand_upper_bound(bm25_upper_bound)
+```
+
 ### Online Learning from User Feedback
 
 ```python
@@ -96,6 +131,23 @@ for score, label in feedback_stream:
 # Use Polyak-averaged parameters for stable inference
 alpha = transform.averaged_alpha
 beta = transform.averaged_beta
+```
+
+### Training Modes
+
+```python
+from bayesian_bm25 import BayesianProbabilityTransform
+
+transform = BayesianProbabilityTransform(alpha=1.0, beta=0.0)
+
+# C1 (balanced, default): train on sigmoid likelihood
+transform.fit(scores, labels, mode="balanced")
+
+# C2 (prior-aware): train on full Bayesian posterior
+transform.fit(scores, labels, mode="prior_aware", tfs=tfs, doc_len_ratios=ratios)
+
+# C3 (prior-free): train on likelihood, inference uses prior=0.5
+transform.fit(scores, labels, mode="prior_free")
 ```
 
 ## Benchmarks
@@ -136,7 +188,12 @@ F1 scores using the best threshold found on training queries, applied to evaluat
 | Batch fit (no base rate) | 0.1577 | 0.1405 | 0.2358 | 0.2294 |
 | Batch fit + base_rate=auto | 0.1559 | 0.1403 | 0.3316 | 0.3341 |
 
-Reproduce with `python benchmarks/base_rate.py` (requires `pip install ir_datasets`).
+Reproduce with `python benchmarks/base_rate.py` (requires `pip install ir_datasets`). The base rate benchmark also includes Platt scaling, min-max normalization, and prior-aware/prior-free training mode comparisons.
+
+Additional benchmarks (no external datasets required):
+
+- `python benchmarks/weighted_fusion.py` -- weighted vs uniform log-odds fusion across noise scenarios
+- `python benchmarks/wand_upper_bound.py` -- WAND upper bound tightness and skip rate analysis
 
 ## Citation
 

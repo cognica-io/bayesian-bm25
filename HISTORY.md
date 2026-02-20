@@ -1,5 +1,24 @@
 # History
 
+## 0.3.0 (2026-02-20)
+
+- Add cosine similarity to probability conversion for hybrid text + vector search
+  - `cosine_to_probability()`: maps cosine similarity [-1, 1] to probability (0, 1) via (1 + score) / 2 with epsilon clamping (Definition 7.1.2)
+- Add weighted log-odds conjunction for per-signal reliability weighting
+  - `log_odds_conjunction()` accepts optional `weights` parameter
+  - Uses Log-OP formulation: sigma(sum(w_i * logit(P_i))) (Theorem 8.3, Remark 8.4)
+  - Weights must be non-negative and sum to 1; unweighted behavior unchanged
+- Add WAND upper bound for safe Bayesian document pruning
+  - `BayesianProbabilityTransform.wand_upper_bound()`: computes tightest safe probability upper bound using p_max=0.9 (Theorem 6.1.2, Theorem 4.2.4)
+  - Supports base_rate-aware bounds for tighter pruning
+- Add prior-aware training modes (C1/C2/C3 conditions from Algorithm 8.3.1)
+  - `fit()` and `update()` accept `mode` parameter: `"balanced"` (C1, default), `"prior_aware"` (C2), `"prior_free"` (C3)
+  - Prior-aware (C2): trains on full Bayesian posterior with chain-rule gradients through dP/dL
+  - Prior-free (C3): trains on likelihood, inference uses prior=0.5
+- Add weighted fusion benchmark (`benchmarks/weighted_fusion.py`)
+- Add WAND upper bound tightness benchmark (`benchmarks/wand_upper_bound.py`)
+- Extend base rate benchmark with Platt scaling, min-max normalization, and C2/C3 training mode rows
+
 ## 0.2.0 (2026-02-18)
 
 - Add corpus-level base rate prior for unsupervised probability calibration
