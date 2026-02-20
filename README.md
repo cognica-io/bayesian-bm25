@@ -2,7 +2,7 @@
 
 [[Blog](https://www.cognica.io/en/blog/posts/2026-02-01-bayesian-bm25-hybrid-search)] [[Papers](docs/papers)]
 
-A probabilistic framework that converts raw BM25 retrieval scores into calibrated relevance probabilities using Bayesian inference.
+The reference implementation of the [Bayesian BM25](https://doi.org/10.5281/zenodo.18414940) and [From Bayesian Inference to Neural Computation](https://doi.org/10.5281/zenodo.18512411) papers, by the original author. Converts raw BM25 retrieval scores into calibrated relevance probabilities using Bayesian inference.
 
 ## Overview
 
