@@ -1,5 +1,27 @@
 # History
 
+## 0.3.1 (2026-02-21)
+
+- Optimize posterior computation using two-step Bayes update (Remark 4.4.5)
+  - Replaces `sigmoid(logit(L) + logit(br) + logit(p))` with two sequential
+    Bayes updates using only multiplication and division
+  - `score_to_probability()` delegates to `posterior()` instead of duplicating
+    base_rate logic
+- Vectorize scorer internals for faster retrieval
+  - `_scores_to_probabilities()` processes all k documents per query in one
+    vectorized numpy call instead of a scalar-by-scalar inner loop
+  - Add `_compute_tf_batch()` for batch term frequency computation
+  - Deduplicate pseudo-query sampling: `_sample_pseudo_query_scores()` is
+    called once during indexing instead of separately by `_estimate_parameters()`
+    and `_estimate_base_rate()`
+- Add calibration metrics to the main package
+  - `expected_calibration_error()`, `brier_score()`, `reliability_diagram()`
+    are now importable from `bayesian_bm25` directly
+  - `benchmarks/metrics.py` re-exports from the main package for backward
+    compatibility
+- Fix `norm_prior` docstring to correctly describe peak at 0.5 and floor at
+  0.0/1.0
+
 ## 0.3.0 (2026-02-20)
 
 - Add cosine similarity to probability conversion for hybrid text + vector search

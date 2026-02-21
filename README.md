@@ -11,11 +11,12 @@ Standard BM25 produces unbounded scores that lack consistent meaning across quer
 Key capabilities:
 
 - **Score-to-probability transform** — convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
-- **Base rate calibration** — corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68–77% without relevance labels
+- **Base rate calibration** — corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68--77% without relevance labels
 - **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
 - **Probabilistic fusion** — combine multiple probability signals using log-odds conjunction with optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
 - **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
 - **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
+- **Calibration metrics** — `expected_calibration_error()`, `brier_score()`, and `reliability_diagram()` for evaluating probability quality
 - **Search integration** — drop-in scorer wrapping [bm25s](https://github.com/xhluca/bm25s) that returns probabilities instead of raw scores
 
 ## Adoption
@@ -112,6 +113,20 @@ bm25_upper_bound = 5.0
 # Bayesian upper bound for safe pruning -- any document's actual
 # probability is guaranteed to be at most this value
 bayesian_bound = transform.wand_upper_bound(bm25_upper_bound)
+```
+
+### Evaluating Calibration Quality
+
+```python
+import numpy as np
+from bayesian_bm25 import expected_calibration_error, brier_score, reliability_diagram
+
+probabilities = np.array([0.9, 0.8, 0.3, 0.1, 0.7, 0.2])
+labels = np.array([1.0, 1.0, 0.0, 0.0, 1.0, 0.0])
+
+ece = expected_calibration_error(probabilities, labels)   # lower is better
+bs = brier_score(probabilities, labels)                   # lower is better
+bins = reliability_diagram(probabilities, labels, n_bins=5)  # (avg_pred, avg_actual, count)
 ```
 
 ### Online Learning from User Feedback
