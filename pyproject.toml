@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bayesian-bm25"
-version = "0.3.0"
+version = "0.3.1"
 description = "Bayesian probability transforms for BM25 retrieval scores"
 readme = "README.md"
 license = "Apache-2.0"
