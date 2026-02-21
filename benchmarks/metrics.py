@@ -4,11 +4,33 @@
 # Copyright (c) 2023-2026 Cognica, Inc.
 #
 
-"""IR evaluation metrics for benchmarking."""
+"""IR evaluation metrics for benchmarking.
+
+Calibration metrics (ECE, Brier score, reliability diagram) are re-exported
+from the main ``bayesian_bm25.metrics`` module.  IR ranking metrics (DCG,
+NDCG, precision, AP) remain here as benchmark-only utilities.
+"""
 
 from __future__ import annotations
 
 import numpy as np
+
+# Re-export calibration metrics from the main package
+from bayesian_bm25.metrics import (
+    brier_score,
+    expected_calibration_error,
+    reliability_diagram,
+)
+
+__all__ = [
+    "average_precision",
+    "brier_score",
+    "dcg_at_k",
+    "expected_calibration_error",
+    "ndcg_at_k",
+    "precision_at_k",
+    "reliability_diagram",
+]
 
 
 def dcg_at_k(relevance: np.ndarray, k: int) -> float:
@@ -49,74 +71,3 @@ def average_precision(relevance: np.ndarray) -> float:
             relevant_count += 1
             precisions.append(relevant_count / (i + 1))
     return float(np.mean(precisions))
-
-
-def expected_calibration_error(
-    probabilities: np.ndarray,
-    labels: np.ndarray,
-    n_bins: int = 10,
-) -> float:
-    """Expected Calibration Error (ECE).
-
-    Measures how well predicted probabilities match actual relevance
-    rates.  Lower is better.  Perfect calibration = 0.
-    """
-    probabilities = np.asarray(probabilities, dtype=np.float64)
-    labels = np.asarray(labels, dtype=np.float64)
-
-    bin_edges = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    total = len(probabilities)
-
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (probabilities > lo) & (probabilities <= hi)
-        if lo == 0:
-            mask = (probabilities >= lo) & (probabilities <= hi)
-        count = np.sum(mask)
-        if count == 0:
-            continue
-        avg_prob = np.mean(probabilities[mask])
-        avg_label = np.mean(labels[mask])
-        ece += (count / total) * abs(avg_prob - avg_label)
-
-    return float(ece)
-
-
-def brier_score(
-    probabilities: np.ndarray,
-    labels: np.ndarray,
-) -> float:
-    """Brier score: mean squared error between probabilities and labels.
-
-    Decomposes into calibration + discrimination.  Lower is better.
-    A constant prediction of base rate achieves the reference score.
-    """
-    probabilities = np.asarray(probabilities, dtype=np.float64)
-    labels = np.asarray(labels, dtype=np.float64)
-    return float(np.mean((probabilities - labels) ** 2))
-
-
-def reliability_diagram(
-    probabilities: np.ndarray,
-    labels: np.ndarray,
-    n_bins: int = 10,
-) -> list[tuple[float, float, int]]:
-    """Compute reliability diagram data: (avg_predicted, avg_actual, count) per bin.
-
-    Perfect calibration means avg_predicted == avg_actual for every bin.
-    """
-    probabilities = np.asarray(probabilities, dtype=np.float64)
-    labels = np.asarray(labels, dtype=np.float64)
-    bin_edges = np.linspace(0, 1, n_bins + 1)
-    bins = []
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (probabilities > lo) & (probabilities <= hi)
-        if lo == 0:
-            mask = (probabilities >= lo) & (probabilities <= hi)
-        count = int(np.sum(mask))
-        if count == 0:
-            continue
-        avg_pred = float(np.mean(probabilities[mask]))
-        avg_actual = float(np.mean(labels[mask]))
-        bins.append((avg_pred, avg_actual, count))
-    return bins

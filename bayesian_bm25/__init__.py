@@ -13,13 +13,21 @@ from bayesian_bm25.fusion import (
     prob_and,
     prob_or,
 )
+from bayesian_bm25.metrics import (
+    brier_score,
+    expected_calibration_error,
+    reliability_diagram,
+)
 
 __all__ = [
     "BayesianProbabilityTransform",
+    "brier_score",
     "cosine_to_probability",
+    "expected_calibration_error",
     "log_odds_conjunction",
     "prob_and",
     "prob_or",
+    "reliability_diagram",
 ]
 
 # Lazy import for scorer (requires optional bm25s dependency)

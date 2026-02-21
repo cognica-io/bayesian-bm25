@@ -116,12 +116,17 @@ class BayesianBM25Scorer:
         )
         self._avgdl = float(np.mean(self._doc_lengths))
 
-        alpha, beta = self._estimate_parameters(corpus_tokens)
+        # Sample pseudo-query scores once, reuse for both estimation steps
+        per_query_scores = self._sample_pseudo_query_scores(corpus_tokens)
+
+        alpha, beta = self._estimate_parameters(per_query_scores)
 
         # Resolve base_rate
         base_rate: float | None = None
         if self._user_base_rate == "auto":
-            base_rate = self._estimate_base_rate(corpus_tokens)
+            base_rate = self._estimate_base_rate(
+                per_query_scores, len(corpus_tokens)
+            )
         elif isinstance(self._user_base_rate, (int, float)):
             base_rate = float(self._user_base_rate)
 
@@ -156,12 +161,11 @@ class BayesianBM25Scorer:
         return per_query_scores
 
     def _estimate_parameters(
-        self, corpus_tokens: list[list[str]]
+        self, per_query_scores: list[np.ndarray]
     ) -> tuple[float, float]:
         """Auto-estimate alpha and beta from the corpus score distribution.
 
-        Samples documents as pseudo-queries to build a score distribution,
-        then sets:
+        Uses pre-computed pseudo-query scores to set:
           - beta = median(scores)  -- sigmoid midpoint at typical score
           - alpha = 1 / std(scores) -- normalise steepness to score spread
 
@@ -169,8 +173,6 @@ class BayesianBM25Scorer:
         """
         if self._user_alpha is not None and self._user_beta is not None:
             return self._user_alpha, self._user_beta
-
-        per_query_scores = self._sample_pseudo_query_scores(corpus_tokens)
 
         if not per_query_scores:
             return (self._user_alpha or 1.0, self._user_beta or 0.0)
@@ -185,7 +187,7 @@ class BayesianBM25Scorer:
         return alpha, beta
 
     def _estimate_base_rate(
-        self, corpus_tokens: list[list[str]]
+        self, per_query_scores: list[np.ndarray], n_docs: int
     ) -> float:
         """Auto-estimate the corpus-level base rate of relevance.
 
@@ -193,9 +195,6 @@ class BayesianBM25Scorer:
         percentile of non-zero scores.  The average count divided by
         corpus size gives the base rate estimate, clamped to [1e-6, 0.5].
         """
-        per_query_scores = self._sample_pseudo_query_scores(corpus_tokens)
-        n_docs = len(corpus_tokens)
-
         if not per_query_scores:
             return 1e-6
 
@@ -274,10 +273,16 @@ class BayesianBM25Scorer:
         )
         return probabilities.squeeze(0)
 
-    def _compute_tf(self, doc_tokens: list[str], query_tokens: list[str]) -> float:
-        """Compute total term frequency of query tokens in a document."""
+    def _compute_tf_batch(
+        self, doc_ids: np.ndarray, query_tokens: list[str]
+    ) -> np.ndarray:
+        """Compute total term frequencies for multiple documents against a query."""
         query_set = set(query_tokens)
-        return float(sum(1 for t in doc_tokens if t in query_set))
+        corpus_tokens = self._corpus_tokens
+        return np.array(
+            [sum(1 for t in corpus_tokens[did] if t in query_set) for did in doc_ids],
+            dtype=np.float64,
+        )
 
     def _scores_to_probabilities(
         self,
@@ -294,20 +299,22 @@ class BayesianBM25Scorer:
 
         for q_idx in range(doc_ids.shape[0]):
             query = query_tokens_batch[q_idx]
-            for d_idx in range(doc_ids.shape[1]):
-                did = int(doc_ids[q_idx, d_idx])
-                score = float(bm25_scores[q_idx, d_idx])
+            scores = bm25_scores[q_idx]
 
-                if score <= 0:
-                    probabilities[q_idx, d_idx] = 0.0
-                    continue
+            active_mask = scores > 0
+            if not np.any(active_mask):
+                continue
 
-                doc_len = self._doc_lengths[did]
-                doc_len_ratio = doc_len / self._avgdl
-                tf = self._compute_tf(self._corpus_tokens[did], query)
+            active_ids = doc_ids[q_idx][active_mask].astype(int)
+            active_scores = scores[active_mask]
 
-                probabilities[q_idx, d_idx] = self._transform.score_to_probability(
-                    score, tf, doc_len_ratio
+            doc_len_ratios = self._doc_lengths[active_ids] / self._avgdl
+            tfs = self._compute_tf_batch(active_ids, query)
+
+            probabilities[q_idx, active_mask] = (
+                self._transform.score_to_probability(
+                    active_scores, tfs, doc_len_ratios
                 )
+            )
 
         return probabilities

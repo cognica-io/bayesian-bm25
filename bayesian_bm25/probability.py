@@ -59,7 +59,8 @@ class BayesianProbabilityTransform:
         Midpoint (shift) of the sigmoid likelihood function.
     base_rate : float or None
         Corpus-level base rate of relevance, in (0, 1).  When set,
-        the posterior is computed in log-odds space as
+        the posterior includes base_rate via a two-step Bayes update
+        (Remark 4.4.5), equivalent to
         sigmoid(logit(L) + logit(base_rate) + logit(prior)).
         None (default) disables base rate correction for backward
         compatibility.  base_rate=0.5 is neutral (logit(0.5) = 0).
@@ -118,9 +119,9 @@ class BayesianProbabilityTransform:
 
         P_norm = 0.3 + 0.6 * (1 - min(1, |doc_len_ratio - 0.5| * 2))
 
-        where doc_len_ratio = doc_len / avgdl (values near 1.0 are average).
-        The prior peaks when doc_len_ratio ~ 0.5 and decreases for extreme
-        lengths.
+        where doc_len_ratio = doc_len / avgdl.  The prior peaks at 0.9
+        when doc_len_ratio = 0.5 and falls to a floor of 0.3 at
+        doc_len_ratio = 0.0 and doc_len_ratio >= 1.0.
         """
         r = np.asarray(doc_len_ratio, dtype=np.float64)
         result = 0.3 + 0.6 * (1.0 - np.minimum(1.0, np.abs(r - 0.5) * 2.0))
@@ -143,20 +144,27 @@ class BayesianProbabilityTransform:
         prior: np.ndarray | float,
         base_rate: float | None = None,
     ) -> np.ndarray | float:
-        """Bayesian posterior (Eq. 22).
+        """Bayesian posterior via two-step Bayes update (Eq. 22, Remark 4.4.5).
 
-        Without base_rate: L*p / (L*p + (1-L)*(1-p))
-        With base_rate:    sigmoid(logit(L) + logit(base_rate) + logit(prior))
+        Without base_rate:
+            P = L*p / (L*p + (1-L)*(1-p))
+
+        With base_rate (two-step, avoids expensive logit/sigmoid):
+            Step 1: p1 = L*p / (L*p + (1-L)*(1-p))
+            Step 2: P  = p1*br / (p1*br + (1-p1)*(1-br))
+
+        Equivalent to sigmoid(logit(L) + logit(prior) + logit(base_rate)).
         """
         l_val = np.asarray(likelihood_val, dtype=np.float64)
         p = np.asarray(prior, dtype=np.float64)
+        numerator = l_val * p
+        denominator = numerator + (1.0 - l_val) * (1.0 - p)
+        result = _clamp_probability(numerator / denominator)
         if base_rate is not None:
-            logit_sum = logit(l_val) + logit(base_rate) + logit(p)
-            result = _clamp_probability(sigmoid(logit_sum))
-        else:
-            numerator = l_val * p
-            denominator = numerator + (1.0 - l_val) * (1.0 - p)
-            result = _clamp_probability(numerator / denominator)
+            br = np.float64(base_rate)
+            numerator_br = result * br
+            denominator_br = numerator_br + (1.0 - result) * (1.0 - br)
+            result = _clamp_probability(numerator_br / denominator_br)
         return float(result) if np.ndim(result) == 0 else result
 
     def score_to_probability(
@@ -169,7 +177,8 @@ class BayesianProbabilityTransform:
 
         Computes likelihood from the score, composite prior from tf and
         doc_len_ratio, then applies the Bayesian posterior formula.
-        When base_rate is set, uses the three-term log-odds formulation.
+        When base_rate is set, the posterior includes base_rate via a
+        two-step Bayes update (Remark 4.4.5).
 
         In prior_free mode (C3), uses prior=0.5 so the posterior equals the
         likelihood, ignoring the composite prior at inference time.
@@ -181,18 +190,7 @@ class BayesianProbabilityTransform:
         else:
             prior = self.composite_prior(tf, doc_len_ratio)
 
-        if self.base_rate is not None:
-            # Two-step: compute two-term posterior via direct formula,
-            # then apply base_rate as one more Bayes update.
-            # Equivalent to sigmoid(logit(L) + logit(br) + logit(prior))
-            # but avoids expensive log/exp operations.
-            p2 = self.posterior(l_val, prior)
-            br = self.base_rate
-            numerator = p2 * br
-            denominator = numerator + (1.0 - p2) * (1.0 - br)
-            result = _clamp_probability(numerator / denominator)
-            return float(result) if np.ndim(result) == 0 else result
-        return self.posterior(l_val, prior)
+        return self.posterior(l_val, prior, base_rate=self.base_rate)
 
     def wand_upper_bound(
         self,
