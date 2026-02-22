@@ -13,7 +13,7 @@ Key capabilities:
 - **Score-to-probability transform** — convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
 - **Base rate calibration** — corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68--77% without relevance labels
 - **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
-- **Probabilistic fusion** — combine multiple probability signals using log-odds conjunction with optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
+- **Probabilistic fusion** — combine multiple probability signals using log-odds conjunction with multiplicative confidence scaling and optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
 - **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
 - **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
 - **Calibration metrics** — `expected_calibration_error()`, `brier_score()`, and `reliability_diagram()` for evaluating probability quality
@@ -98,6 +98,9 @@ vector_probs = cosine_to_probability(cosine_scores)  # [0.96, 0.675, 0.85]
 # Fuse with reliability weights (BM25 weight=0.6, vector weight=0.4)
 stacked = np.stack([bm25_probs, vector_probs], axis=-1)
 fused = log_odds_conjunction(stacked, weights=np.array([0.6, 0.4]))
+
+# Fuse with weights and confidence scaling (alpha + weights compose)
+fused = log_odds_conjunction(stacked, alpha=0.5, weights=np.array([0.6, 0.4]))
 ```
 
 ### WAND Pruning with Bayesian Upper Bounds

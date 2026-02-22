@@ -1,5 +1,27 @@
 # History
 
+## 0.3.2 (2026-02-22)
+
+- Support alpha + weights composability in `log_odds_conjunction()`
+  - Per-signal weights (Theorem 8.3) and confidence scaling by signal count
+    (Section 4.2) are orthogonal and compose multiplicatively:
+    `sigma(n^alpha * sum(w_i * logit(P_i)))`
+  - Change `alpha` default from `0.5` to `None` for backward compatibility:
+    `None` resolves to `0.5` in unweighted mode and `0.0` in weighted mode
+  - Explicit `alpha` applies in both unweighted and weighted modes
+- Add comprehensive theorem verification tests (24 new tests)
+  - Theorem 5.1.2 / 5.2.2: strict bounds for `prob_and` and `prob_or`
+  - Theorem 4.1.2a: Log-OP / Product of Experts algebraic equivalence
+  - Remark 5.2.3: heterogeneous signal combination (BM25 + cosine pipeline)
+  - Proposition 4.3.2: single signal identity for all alpha values
+  - Section 4.2 + Theorem 8.3: weighted alpha composition
+  - Theorem 3.2.1 + Corollary 3.2.2: monotone shrinkage of product rule
+  - Proposition 3.4.1: information loss in product rule vs log-odds conjunction
+  - Theorem 4.4.1 + Proposition 4.4.2: sqrt(n) scaling law
+  - Theorem 4.5.1 (iii): spread property (disagreement reduces confidence)
+  - Remark 4.1.3: geometric mean residual vs log-odds mean
+  - Theorem 6.2.1: sigmoid uniqueness (alternative activations fail)
+
 ## 0.3.1 (2026-02-21)
 
 - Optimize posterior computation using two-step Bayes update (Remark 4.4.5)
