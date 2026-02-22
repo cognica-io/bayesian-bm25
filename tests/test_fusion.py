@@ -268,3 +268,32 @@ class TestWeightedLogOddsConjunction:
         result = log_odds_conjunction(probs, weights=w)
         # Two high signals dominate -> result > 0.5
         assert result > 0.5
+
+    def test_weighted_with_explicit_alpha(self):
+        """When alpha is explicitly set, n^alpha scaling is applied in weighted mode."""
+        probs = np.array([0.8, 0.8])
+        w = np.array([0.5, 0.5])
+        # alpha=0.0: no scaling (n^0 = 1)
+        result_alpha0 = log_odds_conjunction(probs, alpha=0.0, weights=w)
+        # alpha=0.5: n^0.5 = sqrt(2) scaling
+        result_alpha05 = log_odds_conjunction(probs, alpha=0.5, weights=w)
+        # Higher alpha -> stronger amplification for agreeing signals
+        assert result_alpha05 > result_alpha0
+
+    def test_weighted_alpha_none_backward_compatible(self):
+        """alpha=None in weighted mode behaves like old code (alpha ignored)."""
+        probs = np.array([0.7, 0.8, 0.6])
+        w = np.array([0.4, 0.4, 0.2])
+        # Old behavior: sigma(sum(w_i * logit(P_i))) with no n^alpha
+        from bayesian_bm25.probability import logit as _logit, sigmoid as _sigmoid
+        expected = _sigmoid(np.sum(w * _logit(probs)))
+        result = log_odds_conjunction(probs, weights=w)
+        assert result == pytest.approx(expected, abs=1e-10)
+
+    def test_weighted_alpha_zero_matches_current(self):
+        """Explicit alpha=0.0 in weighted mode matches no-scaling behavior."""
+        probs = np.array([0.7, 0.8, 0.6])
+        w = np.array([0.4, 0.4, 0.2])
+        result_none = log_odds_conjunction(probs, weights=w)
+        result_zero = log_odds_conjunction(probs, alpha=0.0, weights=w)
+        assert result_zero == pytest.approx(result_none, abs=1e-10)

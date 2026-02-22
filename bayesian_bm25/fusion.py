@@ -81,7 +81,7 @@ def prob_or(probs: np.ndarray) -> np.ndarray | float:
 
 def log_odds_conjunction(
     probs: np.ndarray,
-    alpha: float = 0.5,
+    alpha: float | None = None,
     weights: np.ndarray | None = None,
 ) -> np.ndarray | float:
     """Log-odds conjunction with multiplicative confidence scaling (Paper 2, Section 4).
@@ -92,9 +92,11 @@ def log_odds_conjunction(
       3. Converting back to probability via sigmoid (Eq. 26)
 
     When ``weights`` are provided, uses the Log-OP (Log-linear Opinion
-    Pool) formulation from Paper 2, Theorem 8.3 / Remark 8.4 instead:
-    sigma(sum(w_i * logit(P_i))) where sum(w_i) = 1 and w_i >= 0.
-    The ``alpha`` parameter is ignored in weighted mode.
+    Pool) formulation from Paper 2, Theorem 8.3 / Remark 8.4:
+    sigma(n^alpha * sum(w_i * logit(P_i))) where sum(w_i) = 1 and
+    w_i >= 0.  Per-signal weights (Theorem 8.3) and confidence scaling
+    by signal count (Section 4.2) are orthogonal and compose
+    multiplicatively.
 
     The multiplicative formulation (rather than additive) preserves the
     sign of evidence (Theorem 4.2.2), preventing accidental inversion
@@ -106,9 +108,11 @@ def log_odds_conjunction(
     ----------
     probs : array of shape (..., n)
         Probability values to combine.  The last axis is reduced.
-    alpha : float
+    alpha : float or None
         Confidence scaling exponent.  Higher values amplify the effect
-        of multiple agreeing signals.  Ignored when weights are provided.
+        of multiple agreeing signals.  When None (default), uses 0.5
+        in unweighted mode and 0.0 in weighted mode, preserving
+        backward compatibility for both calling conventions.
     weights : array of shape (n,) or None
         Per-signal reliability weights for the Log-OP formulation.
         Must be non-negative and sum to 1.  When None (default),
@@ -119,6 +123,7 @@ def log_odds_conjunction(
     Combined probability after log-odds conjunction.
     """
     probs = _clamp_probability(np.asarray(probs, dtype=np.float64))
+    n = probs.shape[-1]
 
     if weights is not None:
         weights = np.asarray(weights, dtype=np.float64)
@@ -129,18 +134,23 @@ def log_odds_conjunction(
                 f"weights must sum to 1, got {float(np.sum(weights))}"
             )
 
-        # Log-OP: sigma(sum(w_i * logit(P_i)))  (Theorem 8.3)
-        l_weighted = np.sum(weights * logit(probs), axis=-1)
+        effective_alpha = 0.0 if alpha is None else alpha
+
+        # Log-OP with confidence scaling:
+        # sigma(n^alpha * sum(w_i * logit(P_i)))  (Theorem 8.3 + Section 4.2)
+        l_weighted = (n ** effective_alpha) * np.sum(
+            weights * logit(probs), axis=-1
+        )
         result = sigmoid(l_weighted)
         return float(result) if np.ndim(result) == 0 else result
 
-    n = probs.shape[-1]
+    effective_alpha = 0.5 if alpha is None else alpha
 
     # Step 1: mean log-odds (Eq. 20)
     l_bar = np.mean(logit(probs), axis=-1)
 
     # Step 2: multiplicative confidence scaling (Eq. 23)
-    l_adjusted = l_bar * (n ** alpha)
+    l_adjusted = l_bar * (n ** effective_alpha)
 
     # Step 3: back to probability (Eq. 26)
     result = sigmoid(l_adjusted)

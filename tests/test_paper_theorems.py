@@ -24,7 +24,12 @@ from bayesian_bm25.probability import (
     logit,
     sigmoid,
 )
-from bayesian_bm25.fusion import log_odds_conjunction, prob_and, prob_or
+from bayesian_bm25.fusion import (
+    cosine_to_probability,
+    log_odds_conjunction,
+    prob_and,
+    prob_or,
+)
 
 
 # -----------------------------------------------------------------------
@@ -530,6 +535,205 @@ class TestConjunctionVsProductRule:
 # -----------------------------------------------------------------------
 # Output range and numerical stability
 # -----------------------------------------------------------------------
+
+
+class TestConjunctionStrictBounds:
+    """Verify Theorem 5.1.2 from Paper 1.
+
+    For p_i in (0, 1) with n >= 2:
+        0 < prob_and(probs) < min(probs)
+    """
+
+    def test_prob_and_strictly_below_min(self):
+        """prob_and(probs) < min(probs) for n >= 2 with p_i in (0, 1)."""
+        rng = np.random.default_rng(42)
+        for _ in range(1000):
+            n = rng.integers(2, 6)
+            probs = rng.uniform(0.01, 0.99, size=n)
+            result = prob_and(probs)
+            assert result > 0, (
+                f"Lower bound violated: probs={probs}, result={result}"
+            )
+            assert result < np.min(probs), (
+                f"Upper bound violated: probs={probs}, result={result}, "
+                f"min={np.min(probs)}"
+            )
+
+
+class TestDisjunctionStrictBounds:
+    """Verify Theorem 5.2.2 from Paper 1.
+
+    For p_i in (0, 1) with n >= 2:
+        max(probs) < prob_or(probs) < 1
+    """
+
+    def test_prob_or_strictly_above_max(self):
+        """prob_or(probs) > max(probs) for n >= 2 with p_i in (0, 1)."""
+        rng = np.random.default_rng(42)
+        for _ in range(1000):
+            n = rng.integers(2, 6)
+            probs = rng.uniform(0.01, 0.99, size=n)
+            result = prob_or(probs)
+            assert result > np.max(probs), (
+                f"Lower bound violated: probs={probs}, result={result}, "
+                f"max={np.max(probs)}"
+            )
+            assert result < 1, (
+                f"Upper bound violated: probs={probs}, result={result}"
+            )
+
+
+class TestLogOPEquivalence:
+    """Verify Theorem 4.1.2a from Paper 2.
+
+    The log-odds mean sigma(mean(logit(P_i))) equals the normalized
+    Product of Experts (PoE) formula:
+        P_LogOP = prod(P_i^{1/n}) / (prod(P_i^{1/n}) + prod((1-P_i)^{1/n}))
+    """
+
+    def test_log_odds_mean_equals_normalized_poe(self):
+        """sigma(mean(logit(P_i))) == normalized PoE for random vectors."""
+        rng = np.random.default_rng(42)
+        for _ in range(1000):
+            n = rng.integers(2, 7)
+            probs = rng.uniform(0.01, 0.99, size=n)
+
+            # Path 1: log-odds mean (alpha=0 to get pure mean)
+            log_odds_result = sigmoid(np.mean(logit(probs)))
+
+            # Path 2: normalized PoE
+            # prod(P_i^{1/n}) / (prod(P_i^{1/n}) + prod((1-P_i)^{1/n}))
+            prod_p = np.prod(probs ** (1.0 / n))
+            prod_1mp = np.prod((1.0 - probs) ** (1.0 / n))
+            poe_result = prod_p / (prod_p + prod_1mp)
+
+            np.testing.assert_allclose(log_odds_result, poe_result, atol=1e-10), (
+                f"PoE equivalence failed: n={n}, probs={probs}, "
+                f"log_odds={log_odds_result}, poe={poe_result}"
+            )
+
+
+class TestHeterogeneousSignalCombination:
+    """Verify Remark 5.2.3 from Paper 2.
+
+    When combining signals with different calibrations (sigmoid-calibrated
+    BM25 + linear-calibrated cosine), the logit acts as identity on BM25
+    but as a genuine nonlinearity on cosine.
+    """
+
+    def test_bm25_plus_cosine_pipeline(self):
+        """Sigmoid-calibrated BM25 + linear-calibrated cosine -> valid probability."""
+        bm25_scores = np.array([0.5, 1.0, 2.0, 3.0, 5.0])
+        cosine_scores = np.array([0.2, 0.4, 0.6, 0.8, 0.95])
+
+        # Calibrate BM25 via sigmoid (alpha=1, beta=1)
+        bm25_probs = sigmoid(1.0 * (bm25_scores - 1.0))
+
+        # Calibrate cosine via linear mapping
+        cosine_probs = cosine_to_probability(cosine_scores)
+
+        results = []
+        for i in range(len(bm25_scores)):
+            probs = np.array([bm25_probs[i], cosine_probs[i]])
+            result = log_odds_conjunction(probs)
+            # Must be a valid probability
+            assert 0 < result < 1, (
+                f"Invalid probability: bm25={bm25_scores[i]}, "
+                f"cosine={cosine_scores[i]}, result={result}"
+            )
+            results.append(result)
+
+        # Monotonicity: both signals increase -> result should increase
+        results = np.array(results)
+        assert np.all(np.diff(results) > 0), (
+            f"Monotonicity violated: results={results}"
+        )
+
+    def test_logit_nonlinearity_for_linear_calibration(self):
+        """logit(cosine_to_probability(s)) is nonlinear in s.
+
+        If it were linear, logit(cosine_to_probability(s)) = a*s + b for
+        some constants.  We show this fails by checking that the second
+        differences are non-zero (a linear function has zero second
+        differences).
+        """
+        s = np.linspace(-0.9, 0.9, 100)
+        transformed = logit(cosine_to_probability(s))
+
+        # Second differences of a linear function are zero
+        second_diff = np.diff(transformed, n=2)
+        assert not np.allclose(second_diff, 0.0, atol=1e-8), (
+            "logit(cosine_to_probability(s)) appears linear, "
+            "but should be nonlinear"
+        )
+
+
+class TestSingleSignalIdentity:
+    """Verify Proposition 4.3.2 from Paper 2.
+
+    When n=1: l_adjusted = logit(P_1) * 1^alpha = logit(P_1) for ANY alpha,
+    so P_final = P_1 regardless of alpha.
+    """
+
+    def test_single_signal_identity_all_alphas(self):
+        """n=1 returns P_1 for any alpha value."""
+        rng = np.random.default_rng(42)
+        probs = rng.uniform(0.01, 0.99, size=50)
+        for alpha in [0.0, 0.5, 1.0, 2.0, 5.0]:
+            for p in probs:
+                result = log_odds_conjunction(np.array([p]), alpha=alpha)
+                assert result == pytest.approx(p, abs=1e-8), (
+                    f"Single signal identity failed: p={p}, alpha={alpha}, "
+                    f"result={result}"
+                )
+
+
+class TestWeightedAlphaComposition:
+    """Verify that alpha and weights compose correctly (Paper 2, Section 4.2 + Theorem 8.3).
+
+    The composed formula is:
+        P = sigma(n^alpha * sum(w_i * logit(P_i)))
+    """
+
+    def test_weighted_alpha_composition(self):
+        """sigma(n^alpha * sum(w_i * logit(P_i))) matches hand-computed values."""
+        probs = np.array([0.8, 0.6])
+        w = np.array([0.7, 0.3])
+        alpha = 0.5
+        n = 2
+
+        # Hand-compute expected value
+        l_weighted = np.sum(w * logit(probs))
+        expected = sigmoid((n ** alpha) * l_weighted)
+
+        result = log_odds_conjunction(probs, alpha=alpha, weights=w)
+        assert result == pytest.approx(expected, abs=1e-10)
+
+    def test_uniform_weights_with_alpha_matches_unweighted(self):
+        """Uniform weights w_i=1/n with explicit alpha matches unweighted formula.
+
+        Unweighted: sigma(n^alpha * mean(logit(P_i)))
+                  = sigma(n^alpha * (1/n) * sum(logit(P_i)))
+
+        Weighted with w_i=1/n:
+                    sigma(n^alpha * sum((1/n) * logit(P_i)))
+                  = sigma(n^alpha * (1/n) * sum(logit(P_i)))
+
+        These are identical.
+        """
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            n = rng.integers(2, 6)
+            probs = rng.uniform(0.01, 0.99, size=n)
+            alpha = rng.uniform(0.0, 2.0)
+            uniform_w = np.full(n, 1.0 / n)
+
+            unweighted = log_odds_conjunction(probs, alpha=alpha)
+            weighted = log_odds_conjunction(probs, alpha=alpha, weights=uniform_w)
+            assert weighted == pytest.approx(unweighted, abs=1e-10), (
+                f"Uniform weights != unweighted: n={n}, alpha={alpha:.3f}, "
+                f"probs={probs}"
+            )
 
 
 class TestOutputRange:
