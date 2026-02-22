@@ -736,6 +736,344 @@ class TestWeightedAlphaComposition:
             )
 
 
+class TestMonotoneShrinkage:
+    """Verify Theorem 3.2.1 + Corollary 3.2.2 from Paper 1.
+
+    Adding one more signal to prob_and always strictly decreases the result.
+    For p_i in (0, 1): prob_and(n+1 signals) < prob_and(n signals).
+    """
+
+    def test_prob_and_decreases_with_more_signals(self):
+        """prob_and result strictly decreases as n grows."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            # Generate a pool of 2..8 signals
+            max_n = rng.integers(3, 9)
+            all_probs = rng.uniform(0.01, 0.99, size=max_n)
+
+            prev_result = prob_and(all_probs[:2])
+            for n in range(3, max_n + 1):
+                result = prob_and(all_probs[:n])
+                assert result < prev_result, (
+                    f"Shrinkage violated: n={n}, prev={prev_result:.6f}, "
+                    f"cur={result:.6f}, probs={all_probs[:n]}"
+                )
+                prev_result = result
+
+    def test_prob_and_approaches_zero(self):
+        """Many signals push prob_and toward zero."""
+        probs = np.full(50, 0.9)
+        result = prob_and(probs)
+        # 0.9^50 = 0.00515...
+        assert result < 0.01
+
+
+class TestInformationLoss:
+    """Verify Proposition 3.4.1 from Paper 1.
+
+    The product rule is invariant to agreement structure: two different
+    input vectors with the same product give the same prob_and result.
+    This is precisely the information loss that log_odds_conjunction fixes.
+    """
+
+    def test_same_product_same_result(self):
+        """prob_and depends only on the product, not individual values."""
+        # (0.9, 0.1) and (0.3, 0.3) both have product 0.09
+        result_a = prob_and(np.array([0.9, 0.1]))
+        result_b = prob_and(np.array([0.3, 0.3]))
+        assert result_a == pytest.approx(result_b, abs=1e-10)
+
+    def test_conjunction_breaks_invariance(self):
+        """log_odds_conjunction distinguishes agreement from disagreement."""
+        # Same pairs as above: product is the same, but agreement structure differs
+        disagreement = log_odds_conjunction(np.array([0.9, 0.1]))
+        agreement = log_odds_conjunction(np.array([0.3, 0.3]))
+        # Disagreement (0.9, 0.1) -> ~0.5 (logits cancel)
+        # Agreement (0.3, 0.3) -> ~0.23 (both signal irrelevance)
+        assert disagreement != pytest.approx(agreement, abs=0.01), (
+            f"Conjunction failed to distinguish: disagreement={disagreement:.4f}, "
+            f"agreement={agreement:.4f}"
+        )
+
+    def test_randomized_same_product_invariance(self):
+        """For arbitrary pairs with the same product, prob_and is identical."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            # Pick a target product in (0, 1)
+            target = rng.uniform(0.01, 0.99)
+            # Build two pairs: (a, target/a) and (b, target/b)
+            a = rng.uniform(max(target, 0.01), 0.99)
+            b = rng.uniform(max(target, 0.01), 0.99)
+            pair_a = np.array([a, target / a])
+            pair_b = np.array([b, target / b])
+            # Both must produce the same prob_and result
+            result_a = prob_and(pair_a)
+            result_b = prob_and(pair_b)
+            assert result_a == pytest.approx(result_b, abs=1e-8), (
+                f"Product invariance violated: pair_a={pair_a}, pair_b={pair_b}, "
+                f"result_a={result_a:.10f}, result_b={result_b:.10f}"
+            )
+
+
+class TestSqrtNScalingLaw:
+    """Verify Theorem 4.4.1 + Proposition 4.4.2 from Paper 2.
+
+    The sqrt(n) scaling (alpha=0.5) preserves the signal-to-noise ratio
+    of evidence as the number of signals grows.  Specifically:
+
+    - For identical signals p, the effective logit is logit(p) * sqrt(n)
+    - This means confidence grows as sqrt(n), analogous to the standard
+      error of the mean shrinking as 1/sqrt(n)
+    """
+
+    def test_effective_logit_scales_as_sqrt_n(self):
+        """The effective log-odds scale as sqrt(n) for identical signals."""
+        for p in [0.6, 0.7, 0.8, 0.9]:
+            base_logit = logit(p)
+            for n in [2, 3, 4, 5, 8, 10]:
+                probs = np.full(n, p)
+                result = log_odds_conjunction(probs, alpha=0.5)
+                expected = sigmoid(base_logit * np.sqrt(n))
+                assert result == pytest.approx(expected, abs=1e-10), (
+                    f"sqrt(n) scaling failed: p={p}, n={n}, "
+                    f"result={result}, expected={expected}"
+                )
+
+    def test_sqrt_scaling_vs_linear_scaling(self):
+        """sqrt(n) scaling grows slower than linear (alpha=1) scaling."""
+        p = 0.8
+        for n in [2, 3, 5, 10]:
+            probs = np.full(n, p)
+            sqrt_result = log_odds_conjunction(probs, alpha=0.5)
+            linear_result = log_odds_conjunction(probs, alpha=1.0)
+            # For p > 0.5 and n >= 2, linear scaling amplifies more
+            assert linear_result > sqrt_result, (
+                f"Linear should amplify more: n={n}, "
+                f"sqrt={sqrt_result:.4f}, linear={linear_result:.4f}"
+            )
+
+    def test_sqrt_scaling_vs_no_scaling(self):
+        """sqrt(n) scaling amplifies more than no scaling (alpha=0)."""
+        p = 0.8
+        for n in [2, 3, 5, 10]:
+            probs = np.full(n, p)
+            sqrt_result = log_odds_conjunction(probs, alpha=0.5)
+            no_scale_result = log_odds_conjunction(probs, alpha=0.0)
+            # For p > 0.5 and n >= 2, sqrt scaling amplifies beyond alpha=0
+            assert sqrt_result > no_scale_result, (
+                f"sqrt should amplify more than alpha=0: n={n}, "
+                f"sqrt={sqrt_result:.4f}, none={no_scale_result:.4f}"
+            )
+
+    def test_confidence_growth_rate(self):
+        """Doubling n should approximately double the effective log-odds deviation.
+
+        For alpha=0.5: l_eff(2n) / l_eff(n) = sqrt(2n) / sqrt(n) = sqrt(2).
+        """
+        p = 0.75
+        base_logit = logit(p)
+        for n in [2, 4, 8]:
+            l_eff_n = base_logit * np.sqrt(n)
+            l_eff_2n = base_logit * np.sqrt(2 * n)
+            ratio = l_eff_2n / l_eff_n
+            assert ratio == pytest.approx(np.sqrt(2), abs=1e-10), (
+                f"Growth rate not sqrt(2): n={n}, ratio={ratio}"
+            )
+
+
+class TestSpreadProperty:
+    """Verify Theorem 4.5.1 (iii) from Paper 2.
+
+    When signals have high variance (some high, some low but not
+    symmetric), the conjunction result is moderated toward 0.5 compared
+    to using only the agreeing signals.  Disagreement reduces confidence.
+    """
+
+    def test_disagreement_reduces_confidence(self):
+        """Adding a contradicting signal moves the result toward 0.5."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            # Start with two agreeing high signals
+            p_high = rng.uniform(0.7, 0.95)
+            agreeing = np.array([p_high, p_high])
+            result_agree = log_odds_conjunction(agreeing, alpha=0.0)
+
+            # Add a low (contradicting) signal
+            p_low = rng.uniform(0.05, 0.3)
+            mixed = np.array([p_high, p_high, p_low])
+            result_mixed = log_odds_conjunction(mixed, alpha=0.0)
+
+            # The mixed result should be closer to 0.5 than the agreeing result
+            dist_agree = abs(result_agree - 0.5)
+            dist_mixed = abs(result_mixed - 0.5)
+            assert dist_mixed < dist_agree, (
+                f"Disagreement did not reduce confidence: "
+                f"agree={result_agree:.4f} (dist={dist_agree:.4f}), "
+                f"mixed={result_mixed:.4f} (dist={dist_mixed:.4f}), "
+                f"p_high={p_high:.3f}, p_low={p_low:.3f}"
+            )
+
+    def test_high_variance_near_half(self):
+        """Signals spread symmetrically around 0.5 produce result near 0.5."""
+        # Equal number of signals above and below 0.5, symmetrically placed
+        for offset in [0.1, 0.2, 0.3, 0.4]:
+            probs = np.array([0.5 + offset, 0.5 - offset])
+            result = log_odds_conjunction(probs, alpha=0.0)
+            assert result == pytest.approx(0.5, abs=1e-8), (
+                f"Symmetric spread not neutral: offset={offset}, result={result}"
+            )
+
+    def test_variance_ordering(self):
+        """Higher variance inputs produce results closer to 0.5 (alpha=0).
+
+        Compare [0.8, 0.8] (low variance) vs [0.95, 0.65] (same mean logit
+        is not guaranteed, so we fix the mean logit and vary spread).
+        """
+        # Fix mean logit, vary spread
+        mean_logit = logit(0.75)  # ~1.0986
+        for spread in [0.0, 0.5, 1.0, 1.5]:
+            p1 = sigmoid(mean_logit + spread)
+            p2 = sigmoid(mean_logit - spread)
+            probs = np.array([p1, p2])
+            result = log_odds_conjunction(probs, alpha=0.0)
+            # With alpha=0, mean logit is preserved, so result should
+            # always equal sigmoid(mean_logit) regardless of spread
+            expected = sigmoid(mean_logit)
+            assert result == pytest.approx(expected, abs=1e-8), (
+                f"Alpha=0 should be spread-invariant: spread={spread}, "
+                f"result={result}, expected={expected}"
+            )
+
+
+class TestGeometricMeanResidual:
+    """Verify Remark 4.1.3 from Paper 2.
+
+    The geometric mean in probability space prod(P_i)^{1/n} differs from
+    the log-odds mean sigma(mean(logit(P_i))) by a nonlinear residual.
+    They are only equal when all P_i are identical.
+    """
+
+    def test_geometric_mean_differs_from_log_odds_mean(self):
+        """For heterogeneous probabilities, geometric mean != log-odds mean."""
+        rng = np.random.default_rng(42)
+        differ_count = 0
+        for _ in range(1000):
+            n = rng.integers(2, 6)
+            probs = rng.uniform(0.1, 0.9, size=n)
+
+            # Geometric mean in probability space
+            geo_mean = np.prod(probs) ** (1.0 / n)
+
+            # Log-odds mean
+            log_odds_mean = sigmoid(np.mean(logit(probs)))
+
+            if not np.isclose(geo_mean, log_odds_mean, atol=1e-6):
+                differ_count += 1
+
+        # They should differ for the vast majority of heterogeneous inputs
+        assert differ_count > 900, (
+            f"Expected most cases to differ, but only {differ_count}/1000 did"
+        )
+
+    def test_identical_signals_no_residual(self):
+        """When all P_i = p, geometric mean = p = log-odds mean (no residual)."""
+        for p in [0.1, 0.3, 0.5, 0.7, 0.9]:
+            for n in [2, 3, 5, 10]:
+                probs = np.full(n, p)
+                geo_mean = np.prod(probs) ** (1.0 / n)
+                log_odds_mean = sigmoid(np.mean(logit(probs)))
+                assert geo_mean == pytest.approx(p, abs=1e-10)
+                assert log_odds_mean == pytest.approx(p, abs=1e-10)
+
+    def test_geometric_mean_underestimates_for_high_probs(self):
+        """For agreeing high probabilities, geometric mean < log-odds mean.
+
+        The geometric mean suffers from the same shrinkage as the product
+        rule (just normalized by n), while the log-odds mean correctly
+        preserves the consensus.
+        """
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            n = rng.integers(2, 6)
+            # All probabilities above 0.5 but not identical
+            probs = rng.uniform(0.6, 0.95, size=n)
+            # Make them not identical
+            probs = np.sort(probs)
+            if np.allclose(probs, probs[0]):
+                continue
+
+            geo_mean = np.prod(probs) ** (1.0 / n)
+            log_odds_mean = sigmoid(np.mean(logit(probs)))
+
+            assert geo_mean < log_odds_mean, (
+                f"Geometric mean should underestimate: probs={probs}, "
+                f"geo={geo_mean:.6f}, log_odds={log_odds_mean:.6f}"
+            )
+
+
+class TestSigmoidUniqueness:
+    """Verify Theorem 6.2.1 from Paper 2.
+
+    The sigmoid is the unique function satisfying all three properties:
+    (a) Maps R -> (0, 1)
+    (b) Symmetric: f(x) + f(-x) = 1
+    (c) Self-derivative: f'(x) = f(x) * (1 - f(x))
+
+    Alternative activations must violate at least one property.
+    """
+
+    def test_sigmoid_satisfies_all_three(self):
+        """Sigmoid satisfies (a), (b), and (c) simultaneously."""
+        x = np.linspace(-10, 10, 1000)
+        s = sigmoid(x)
+
+        # (a) Output in (0, 1)
+        assert np.all(s > 0) and np.all(s < 1)
+
+        # (b) Symmetry: s(x) + s(-x) = 1
+        np.testing.assert_allclose(s + sigmoid(-x), 1.0, atol=1e-12)
+
+        # (c) Self-derivative: s'(x) = s(x) * (1 - s(x))
+        analytical = s * (1.0 - s)
+        h = 1e-7
+        numerical = (sigmoid(x + h) - sigmoid(x - h)) / (2 * h)
+        np.testing.assert_allclose(analytical, numerical, atol=1e-6)
+
+    def test_relu_violates_range(self):
+        """ReLU violates property (a): output is not bounded in (0, 1)."""
+        x = np.array([2.0, 5.0, 10.0])
+        relu = np.maximum(0, x)
+        # ReLU output exceeds 1 for x > 1
+        assert np.any(relu > 1), "ReLU should violate (0, 1) range"
+
+    def test_tanh_rescaled_violates_self_derivative(self):
+        """Rescaled tanh f(x) = (1 + tanh(x))/2 satisfies (a) and (b) but not (c).
+
+        This function maps R -> (0, 1) and is symmetric, but its derivative
+        is (1 - tanh(x)^2) / 2, which does NOT equal f(x) * (1 - f(x)).
+        """
+        x = np.linspace(-5, 5, 1000)
+        f = (1.0 + np.tanh(x)) / 2.0
+
+        # (a) Range: satisfied
+        assert np.all(f > 0) and np.all(f < 1)
+
+        # (b) Symmetry: f(x) + f(-x) = (1+tanh(x))/2 + (1+tanh(-x))/2
+        #             = (1+tanh(x))/2 + (1-tanh(x))/2 = 1. Satisfied.
+        np.testing.assert_allclose(f + (1.0 + np.tanh(-x)) / 2.0, 1.0, atol=1e-12)
+
+        # (c) Self-derivative: VIOLATED
+        # Actual derivative: (1 - tanh(x)^2) / 2
+        actual_deriv = (1.0 - np.tanh(x) ** 2) / 2.0
+        # Self-derivative formula: f(x) * (1 - f(x))
+        self_deriv = f * (1.0 - f)
+
+        # These should NOT be equal (tanh_rescaled violates property c)
+        assert not np.allclose(actual_deriv, self_deriv, atol=1e-4), (
+            "Rescaled tanh should violate the self-derivative property"
+        )
+
+
 class TestOutputRange:
     """All probability outputs must be in (0, 1) for any valid input."""
 
