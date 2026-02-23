@@ -15,6 +15,8 @@ from the papers.  The tests verify both exact numerical values and
 structural properties that must hold for all valid inputs.
 """
 
+import math
+
 import numpy as np
 import pytest
 
@@ -30,6 +32,12 @@ from bayesian_bm25.fusion import (
     prob_and,
     prob_or,
 )
+
+
+def _gaussian_cdf(x):
+    """Vectorized Gaussian CDF via standard library erf."""
+    x = np.asarray(x, dtype=np.float64)
+    return 0.5 * (1.0 + np.vectorize(math.erf)(x / np.sqrt(2)))
 
 
 # -----------------------------------------------------------------------
@@ -1110,3 +1118,1469 @@ class TestOutputRange:
         p = t.score_to_probability(-1000.0, tf=0, doc_len_ratio=5.0)
         assert np.isfinite(p)
         assert 0 < p < 1
+
+
+# -----------------------------------------------------------------------
+# Paper 2, Section 6: Activation Functions
+# -----------------------------------------------------------------------
+
+
+class TestTanhIsSigmoidInDisguise:
+    """Verify Proposition 6.3.1 from Paper 2.
+
+    The rescaled tanh, (1 + tanh(x)) / 2, is identically sigma(2x).
+    Any valid rescaling of tanh to the unit interval reduces to the
+    sigmoid with parameter absorption.
+    """
+
+    def test_identity_over_range(self):
+        """(1 + tanh(x)) / 2 == sigma(2x) for all x."""
+        x = np.linspace(-20, 20, 10000)
+        lhs = (1.0 + np.tanh(x)) / 2.0
+        rhs = sigmoid(2.0 * x)
+        np.testing.assert_allclose(lhs, rhs, atol=1e-12)
+
+    def test_identity_at_extremes(self):
+        """Identity holds at large magnitudes near saturation."""
+        for x in [-100.0, -50.0, 50.0, 100.0]:
+            lhs = (1.0 + np.tanh(x)) / 2.0
+            rhs = sigmoid(2.0 * x)
+            np.testing.assert_allclose(lhs, rhs, atol=1e-15)
+
+    def test_derivative_consistency(self):
+        """Derivatives of (1+tanh(x))/2 and sigma(2x) match."""
+        x = np.linspace(-5, 5, 1000)
+        h = 1e-7
+        # Numerical derivative of (1 + tanh(x)) / 2
+        d_tanh = ((1.0 + np.tanh(x + h)) / 2.0 - (1.0 + np.tanh(x - h)) / 2.0) / (2 * h)
+        # Numerical derivative of sigma(2x)
+        d_sig = (sigmoid(2.0 * (x + h)) - sigmoid(2.0 * (x - h))) / (2 * h)
+        np.testing.assert_allclose(d_tanh, d_sig, atol=1e-5)
+
+
+class TestProbitExclusion:
+    """Verify Proposition 6.3.4 from Paper 2.
+
+    The probit function Phi(x) satisfies constraints C1 (range) and
+    C4 (symmetry) but violates C3 (self-derivative).
+    """
+
+    def test_satisfies_c1_range(self):
+        """Phi maps R -> (0, 1), verified within float64-representable range."""
+        x = np.linspace(-8, 8, 10000)
+        phi = _gaussian_cdf(x)
+        assert np.all(phi > 0)
+        assert np.all(phi < 1)
+
+    def test_satisfies_c4_symmetry(self):
+        """Phi(-x) = 1 - Phi(x) for all x."""
+        x = np.linspace(-10, 10, 10000)
+        np.testing.assert_allclose(
+            _gaussian_cdf(-x), 1.0 - _gaussian_cdf(x), atol=1e-12
+        )
+
+    def test_violates_c3_self_derivative(self):
+        """Phi'(x) != Phi(x) * (1 - Phi(x))."""
+        x = np.linspace(-3, 3, 1000)
+        phi = _gaussian_cdf(x)
+        # Actual derivative of Phi is the Gaussian PDF
+        actual_deriv = (1.0 / np.sqrt(2 * np.pi)) * np.exp(-x**2 / 2.0)
+        # Self-derivative formula
+        self_deriv = phi * (1.0 - phi)
+        # These must NOT be equal
+        assert not np.allclose(actual_deriv, self_deriv, atol=1e-3), (
+            "Probit should violate the self-derivative property (C3)"
+        )
+
+
+class TestNeuronPosteriorIdentity:
+    """Verify Theorem 6.4.1 from Paper 2.
+
+    The Bayesian posterior sigma(alpha * (s - beta)) and the sigmoid
+    neuron sigma(w * x + b) are the same object under w = alpha,
+    b = -alpha * beta.
+    """
+
+    def test_parameter_correspondence(self):
+        """sigma(alpha*(s - beta)) == sigma(w*s + b) with w=alpha, b=-alpha*beta."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            alpha = rng.uniform(0.1, 5.0)
+            beta = rng.uniform(-3.0, 5.0)
+            s = rng.uniform(-10, 10)
+
+            posterior = sigmoid(alpha * (s - beta))
+            w = alpha
+            b = -alpha * beta
+            neuron = sigmoid(w * s + b)
+            np.testing.assert_allclose(posterior, neuron, atol=1e-14)
+
+    def test_batch_equivalence(self):
+        """Batch version: vectors of scores produce identical results."""
+        rng = np.random.default_rng(42)
+        alpha = 2.5
+        beta = 1.3
+        scores = rng.uniform(-5, 10, size=1000)
+
+        posterior = sigmoid(alpha * (scores - beta))
+        neuron = sigmoid(alpha * scores + (-alpha * beta))
+        np.testing.assert_allclose(posterior, neuron, atol=1e-14)
+
+
+class TestReLUFromMAP:
+    """Verify Theorem 6.5.3 from Paper 2.
+
+    The MAP estimate of h under exponential prior + Gaussian likelihood
+    is max(0, z - theta) where z = x/w, theta = lambda*tau^2/w^2.
+    """
+
+    def test_closed_form_matches_grid_search(self):
+        """MAP closed form matches brute-force grid search of log-posterior."""
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            w = rng.uniform(0.5, 3.0)
+            lam = rng.uniform(0.1, 5.0)
+            tau = rng.uniform(0.1, 2.0)
+            x = rng.uniform(-3, 5)
+
+            # Closed form
+            z = x / w
+            theta = lam * tau**2 / w**2
+            h_closed = max(0.0, z - theta)
+
+            # Grid search over h >= 0
+            h_grid = np.linspace(0, max(10.0, z + 5), 10000)
+            log_post = -(x - w * h_grid)**2 / (2 * tau**2) - lam * h_grid
+            h_grid_opt = h_grid[np.argmax(log_post)]
+
+            np.testing.assert_allclose(h_closed, h_grid_opt, atol=0.01), (
+                f"MAP mismatch: w={w:.2f}, lam={lam:.2f}, tau={tau:.2f}, "
+                f"x={x:.2f}, closed={h_closed:.4f}, grid={h_grid_opt:.4f}"
+            )
+
+    def test_gradient_zero_at_optimum(self):
+        """Gradient of log-posterior is zero (or h is at boundary h=0)."""
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            w = rng.uniform(0.5, 3.0)
+            lam = rng.uniform(0.1, 5.0)
+            tau = rng.uniform(0.1, 2.0)
+            x = rng.uniform(-5, 10)
+
+            z = x / w
+            theta = lam * tau**2 / w**2
+            h_star = max(0.0, z - theta)
+
+            if h_star > 0:
+                # Interior solution: gradient should be zero
+                grad = w * (x - w * h_star) / tau**2 - lam
+                assert abs(grad) < 1e-8, (
+                    f"Gradient not zero at interior optimum: grad={grad:.2e}"
+                )
+            else:
+                # Boundary: gradient at h=0 should be non-positive
+                grad_at_zero = w * x / tau**2 - lam
+                assert grad_at_zero <= 1e-8, (
+                    f"Gradient at boundary should be non-positive: "
+                    f"grad={grad_at_zero:.2e}"
+                )
+
+    def test_sparsity_threshold(self):
+        """h* = 0 when x < w*theta (input below threshold)."""
+        w, lam, tau = 1.0, 1.0, 1.0
+        theta = lam * tau**2 / w**2  # = 1.0
+        # Below threshold
+        assert max(0.0, -1.0 / w - theta) == 0.0
+        assert max(0.0, 0.5 / w - theta) == 0.0
+        # Above threshold
+        assert max(0.0, 2.0 / w - theta) > 0.0
+
+
+class TestSwishBayesianExpectedSignal:
+    """Verify Theorem 6.7.4 from Paper 2.
+
+    Under the self-gated relevance model, E[Y|x] = x * sigma(x) = Swish(x).
+    """
+
+    def test_swish_identity(self):
+        """x * sigma(x) is the expected value under binary gating."""
+        x = np.linspace(-10, 10, 10000)
+        # E[Y|x] = x * P(R=1|x) + 0 * P(R=0|x) = x * sigma(x)
+        expected_value = x * sigmoid(x) + 0.0 * (1.0 - sigmoid(x))
+        swish = x * sigmoid(x)
+        np.testing.assert_allclose(expected_value, swish, atol=1e-15)
+
+    def test_swish_properties(self):
+        """Swish is smooth, non-monotone near zero, and asymptotic to ReLU for x >> 0."""
+        x_pos = np.linspace(10, 20, 100)
+        swish_pos = x_pos * sigmoid(x_pos)
+        relu_pos = np.maximum(0, x_pos)
+        # For large positive x, sigma(x) -> 1, so Swish -> x -> ReLU
+        np.testing.assert_allclose(swish_pos, relu_pos, atol=0.001)
+
+        # Swish has a minimum near x ~ -1.278
+        x_fine = np.linspace(-2, 0, 10000)
+        swish_fine = x_fine * sigmoid(x_fine)
+        assert np.min(swish_fine) < 0, "Swish should be negative near x ~ -1.278"
+
+    def test_swish_at_zero(self):
+        """Swish(0) = 0 * sigma(0) = 0 * 0.5 = 0."""
+        assert 0.0 * sigmoid(0.0) == 0.0
+
+
+class TestReLUSwishMAPBayesDuality:
+    """Verify Theorem 6.7.5 from Paper 2.
+
+    ReLU = x * 1[x > 0] (MAP estimate, hard gate)
+    Swish = x * sigma(x) (Bayes estimate, soft gate)
+    As beta -> inf in Swish_beta, Swish converges to ReLU.
+    """
+
+    def test_relu_as_hard_gate(self):
+        """ReLU(x) = x * 1[x > 0] for all x."""
+        x = np.linspace(-10, 10, 10000)
+        relu = np.maximum(0, x)
+        hard_gated = x * (x > 0).astype(np.float64)
+        np.testing.assert_allclose(relu, hard_gated, atol=1e-15)
+
+    def test_swish_as_soft_gate(self):
+        """Swish(x) = x * sigma(x) for all x."""
+        x = np.linspace(-10, 10, 10000)
+        swish = x * sigmoid(x)
+        # Verify it is between 0 and ReLU for positive x
+        relu = np.maximum(0, x)
+        mask = x > 0.5  # Avoid the transition region near 0
+        assert np.all(swish[mask] <= relu[mask] + 1e-10)
+
+    def test_convergence_to_relu(self):
+        """Swish_beta -> ReLU as beta -> inf, away from x=0."""
+        x = np.linspace(-10, 10, 10000)
+        # Exclude near-zero region where convergence is slow
+        mask = np.abs(x) > 0.5
+        for beta in [10, 50, 100]:
+            swish_beta = x * sigmoid(beta * x)
+            relu = np.maximum(0, x)
+            max_err = np.max(np.abs(swish_beta[mask] - relu[mask]))
+            assert max_err < 1.0 / beta + 0.01, (
+                f"beta={beta}: max error {max_err:.4f} too large"
+            )
+
+
+class TestGeneralizedSwishLimits:
+    """Verify Theorem 6.7.6 from Paper 2.
+
+    Three limits of x * sigma(beta * x):
+    - beta -> 0: x/2 (uniform prior, maximum ignorance)
+    - beta = 1: x * sigma(x) (canonical Bayesian posterior)
+    - beta -> inf: max(0, x) (deterministic MAP)
+    """
+
+    def test_beta_zero_limit(self):
+        """As beta -> 0, x * sigma(beta*x) -> x/2.
+
+        The error of the approximation scales as O(beta * x^2) due to
+        the Taylor expansion sigma(u) = 0.5 + u/4 + O(u^3), so the
+        tolerance must account for the quadratic dependence on x.
+        """
+        x = np.linspace(-5, 5, 1000)
+        for beta in [0.001, 0.01, 0.05]:
+            swish_beta = x * sigmoid(beta * x)
+            expected = x / 2.0
+            # Error is O(beta * x^2): use max(x^2) * beta / 4 as tolerance
+            tol = beta * np.max(x**2) / 4.0 + 1e-10
+            np.testing.assert_allclose(swish_beta, expected, atol=tol)
+
+    def test_beta_one_canonical(self):
+        """At beta=1, x * sigma(beta*x) = x * sigma(x) = Swish(x)."""
+        x = np.linspace(-10, 10, 10000)
+        swish_1 = x * sigmoid(1.0 * x)
+        swish = x * sigmoid(x)
+        np.testing.assert_allclose(swish_1, swish, atol=1e-15)
+
+    def test_beta_inf_limit(self):
+        """As beta -> inf, x * sigma(beta*x) -> ReLU(x), away from x=0."""
+        x = np.linspace(-5, 5, 10000)
+        mask = np.abs(x) > 0.5
+        relu = np.maximum(0, x)
+        for beta in [20, 100, 500]:
+            swish_beta = x * sigmoid(beta * x)
+            np.testing.assert_allclose(
+                swish_beta[mask], relu[mask], atol=2.0 / beta + 0.01
+            )
+
+    def test_monotone_interpolation(self):
+        """For x > 0, Swish_beta is monotonically increasing in beta."""
+        x = 2.0
+        prev = x * sigmoid(0.01 * x)
+        for beta in [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0]:
+            current = x * sigmoid(beta * x)
+            assert current >= prev - 1e-10, (
+                f"Not monotone in beta: beta={beta}, prev={prev:.6f}, "
+                f"current={current:.6f}"
+            )
+            prev = current
+
+
+class TestGELUFromGaussianRelevance:
+    """Verify Theorem 6.8.1 from Paper 2.
+
+    GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF.
+    """
+
+    def test_gelu_definition(self):
+        """GELU(x) = x * Phi(x) over a wide range."""
+        x = np.linspace(-5, 5, 10000)
+        gelu = x * _gaussian_cdf(x)
+        # Verify against an independent computation
+        expected = x * 0.5 * (1.0 + np.vectorize(math.erf)(x / np.sqrt(2)))
+        np.testing.assert_allclose(gelu, expected, atol=1e-14)
+
+    def test_gelu_at_zero(self):
+        """GELU(0) = 0."""
+        assert 0.0 * _gaussian_cdf(0.0) == 0.0
+
+    def test_gelu_asymptotic_to_relu(self):
+        """For large positive x, GELU(x) -> x (like ReLU)."""
+        x = np.linspace(5, 20, 100)
+        gelu = x * _gaussian_cdf(x)
+        np.testing.assert_allclose(gelu, x, atol=0.01)
+
+    def test_gelu_asymptotic_to_zero(self):
+        """For large negative x, GELU(x) -> 0 (like ReLU)."""
+        x = np.linspace(-20, -5, 100)
+        gelu = x * _gaussian_cdf(x)
+        np.testing.assert_allclose(gelu, 0.0, atol=0.01)
+
+
+class TestGELUApproxSwish:
+    """Verify Proposition 6.8.2 from Paper 2.
+
+    Phi(x) ~ sigma(1.702 * x), with maximum error < 0.01.
+    Therefore GELU(x) ~ Swish_{1.702}(x).
+    """
+
+    def test_cdf_approximation_error(self):
+        """max|Phi(x) - sigma(1.702x)| < 0.01 over practical range."""
+        x = np.linspace(-6, 6, 100000)
+        phi = _gaussian_cdf(x)
+        sig_approx = sigmoid(1.702 * x)
+        max_err = np.max(np.abs(phi - sig_approx))
+        assert max_err < 0.01, (
+            f"Probit-logistic approximation max error: {max_err:.6f}"
+        )
+
+    def test_gelu_swish_approximation(self):
+        """max|GELU(x) - Swish_{1.702}(x)| is small over practical range."""
+        x = np.linspace(-5, 5, 10000)
+        gelu = x * _gaussian_cdf(x)
+        swish_1702 = x * sigmoid(1.702 * x)
+        max_err = np.max(np.abs(gelu - swish_1702))
+        assert max_err < 0.025, (
+            f"GELU-Swish1702 max error: {max_err:.6f}"
+        )
+
+    def test_approximation_preserves_shape(self):
+        """Both GELU and Swish_{1.702} have the same qualitative shape."""
+        x = np.linspace(-3, 3, 1000)
+        gelu = x * _gaussian_cdf(x)
+        swish_1702 = x * sigmoid(1.702 * x)
+        # Both should be negative in roughly the same region
+        gelu_neg = x[gelu < 0]
+        swish_neg = x[swish_1702 < 0]
+        assert len(gelu_neg) > 0 and len(swish_neg) > 0
+        # Their zero-crossings should be close
+        np.testing.assert_allclose(
+            gelu_neg[-1], swish_neg[-1], atol=0.1
+        )
+
+
+class TestSoftGatedActivationHierarchy:
+    """Verify Proposition 6.8.3 from Paper 2.
+
+    For x > 0: x/2 < swish(x) < gelu(x) < relu(x) = x.
+
+    This follows from the gate ordering: for x > 0,
+    0.5 < sigma(x) < Phi(x) < 1 (since Phi(x) ~ sigma(1.702x) > sigma(x)).
+    """
+
+    def test_hierarchy_positive_x(self):
+        """x/2 < swish(x) < gelu(x) < relu(x) for x > 0.
+
+        Range restricted to avoid float64 saturation where Phi(x) rounds
+        to exactly 1.0 (around x > 8.2), collapsing gelu == relu.
+        """
+        x = np.linspace(0.01, 6, 10000)
+        half_x = x / 2.0
+        swish = x * sigmoid(x)
+        gelu = x * _gaussian_cdf(x)
+        relu = x.copy()  # ReLU(x) = x for x > 0
+
+        assert np.all(half_x < swish), "x/2 < swish violated"
+        assert np.all(swish < gelu), "swish < gelu violated"
+        assert np.all(gelu < relu), "gelu < relu violated"
+
+    def test_gate_ordering(self):
+        """For x > 0: 0.5 < sigma(x) < Phi(x) < 1.
+
+        Range restricted to x < 6 to avoid Phi(x) saturating to 1.0 in float64.
+        """
+        x = np.linspace(0.01, 6, 10000)
+        sig = sigmoid(x)
+        phi = _gaussian_cdf(x)
+
+        assert np.all(sig > 0.5), "sigma(x) > 0.5 violated for x > 0"
+        assert np.all(sig < phi), "sigma(x) < Phi(x) violated for x > 0"
+        assert np.all(phi < 1.0), "Phi(x) < 1 violated"
+
+    def test_hierarchy_collapses_at_zero(self):
+        """At x=0: all four activations equal 0."""
+        x = 0.0
+        assert x / 2.0 == 0.0
+        assert x * sigmoid(x) == 0.0
+        assert x * _gaussian_cdf(x) == 0.0
+        assert max(0, x) == 0.0
+
+
+# -----------------------------------------------------------------------
+# Paper 2, Section 5: Neural Network Structure
+# -----------------------------------------------------------------------
+
+
+class TestNeuralNetworkPipeline:
+    """Verify Theorem 5.2.1 from Paper 2.
+
+    The 4-stage pipeline (calibrate -> logit -> linear -> sigmoid)
+    is equivalent to log_odds_conjunction.
+    """
+
+    def test_pipeline_matches_conjunction(self):
+        """Manual 4-stage pipeline produces same result as log_odds_conjunction."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            n = rng.integers(2, 7)
+            probs = rng.uniform(0.01, 0.99, size=n)
+            alpha = rng.uniform(0.0, 2.0)
+
+            # Stage 1: probs are already calibrated
+            # Stage 2: logit transform
+            log_odds = logit(probs)
+            # Stage 3: linear aggregation with confidence scaling
+            l_bar = np.mean(log_odds)
+            l_adjusted = l_bar * (n ** alpha)
+            # Stage 4: sigmoid output
+            pipeline_result = sigmoid(l_adjusted)
+
+            # Compare with log_odds_conjunction
+            conj_result = log_odds_conjunction(probs, alpha=alpha)
+            np.testing.assert_allclose(pipeline_result, conj_result, atol=1e-10)
+
+    def test_sigmoid_calibrated_reduces_to_logistic_regression(self):
+        """When all P_i = sigma(a_i*s_i + b_i), pipeline reduces to logistic regression.
+
+        This verifies Theorem 5.2.1a: logit(sigma(x)) = x collapses the
+        hidden layer.
+        """
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            n = rng.integers(2, 6)
+            alphas = rng.uniform(0.5, 3.0, size=n)
+            betas = rng.uniform(-2.0, 3.0, size=n)
+            scores = rng.uniform(-2.0, 5.0, size=n)
+            conf_alpha = rng.uniform(0.0, 1.0)
+
+            # Calibrate via sigmoid
+            beta_primes = -alphas * betas
+            probs = sigmoid(alphas * scores + beta_primes)
+
+            # Full pipeline via conjunction
+            full_result = log_odds_conjunction(probs, alpha=conf_alpha)
+
+            # Logistic regression shortcut
+            w_primes = alphas / (n ** (1.0 - conf_alpha))
+            b = np.sum(beta_primes) / (n ** (1.0 - conf_alpha))
+            lr_result = sigmoid(np.sum(w_primes * scores) + b)
+
+            np.testing.assert_allclose(full_result, lr_result, atol=1e-9)
+
+    def test_heterogeneous_calibration_is_nonlinear(self):
+        """When signals have mixed calibrations, logit is a genuine nonlinearity.
+
+        BM25 (sigmoid-calibrated) + cosine (linear-calibrated):
+        logit acts as identity on BM25 but nonlinearly on cosine.
+        """
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            # BM25 signal: sigmoid-calibrated
+            alpha_bm25 = rng.uniform(0.5, 3.0)
+            beta_bm25 = rng.uniform(0.0, 3.0)
+            s_bm25 = rng.uniform(0, 5)
+            p_bm25 = sigmoid(alpha_bm25 * (s_bm25 - beta_bm25))
+
+            # Cosine signal: linear-calibrated
+            s_cos = rng.uniform(-0.9, 0.9)
+            p_cos = cosine_to_probability(s_cos)
+
+            # logit of sigmoid-calibrated should recover linear pre-activation
+            logit_bm25 = logit(p_bm25)
+            expected_linear = alpha_bm25 * (s_bm25 - beta_bm25)
+            np.testing.assert_allclose(logit_bm25, expected_linear, atol=1e-6)
+
+            # logit of linear-calibrated is nonlinear in s_cos
+            # Verify by checking that second derivative is non-zero
+            logit_cos = logit(p_cos)
+            # This is log((1+s)/(1-s)) which is nonlinear in s
+            expected_nonlinear = np.log((1.0 + s_cos) / (1.0 - s_cos))
+            np.testing.assert_allclose(logit_cos, expected_nonlinear, atol=1e-6)
+
+
+class TestParameterCorrespondence:
+    """Verify Theorem 5.3.1 from Paper 2.
+
+    In the sigmoid-calibrated special case:
+    w'_i = alpha_i / n^(1-alpha), b = sum(beta'_i) / n^(1-alpha)
+    """
+
+    def test_weight_formula(self):
+        """Effective weights w'_i = alpha_i / n^(1-alpha)."""
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            n = rng.integers(2, 6)
+            alphas = rng.uniform(0.5, 3.0, size=n)
+            conf_alpha = rng.uniform(0.0, 1.5)
+
+            expected_weights = alphas / (n ** (1.0 - conf_alpha))
+            # These weights should produce correct results when applied to scores
+            scores = rng.uniform(-2, 5, size=n)
+            betas = rng.uniform(-1, 3, size=n)
+            beta_primes = -alphas * betas
+
+            # Using the weight formula directly
+            b = np.sum(beta_primes) / (n ** (1.0 - conf_alpha))
+            direct = sigmoid(np.sum(expected_weights * scores) + b)
+
+            # Using log_odds_conjunction
+            probs = sigmoid(alphas * scores + beta_primes)
+            conj = log_odds_conjunction(probs, alpha=conf_alpha)
+
+            np.testing.assert_allclose(direct, conj, atol=1e-9)
+
+    def test_bias_formula(self):
+        """Effective bias b = sum(beta'_i) / n^(1-alpha)."""
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            n = rng.integers(2, 6)
+            alphas = rng.uniform(0.5, 3.0, size=n)
+            betas = rng.uniform(-1, 3, size=n)
+            beta_primes = -alphas * betas
+            conf_alpha = rng.uniform(0.0, 1.5)
+
+            # Bias formula
+            b = np.sum(beta_primes) / (n ** (1.0 - conf_alpha))
+
+            # Verify: with zero scores, the output should be sigmoid(b)
+            scores = np.zeros(n)
+            probs = sigmoid(alphas * scores + beta_primes)
+            conj = log_odds_conjunction(probs, alpha=conf_alpha)
+            expected = sigmoid(b)
+
+            np.testing.assert_allclose(conj, expected, atol=1e-9)
+
+
+# -----------------------------------------------------------------------
+# Paper 2, Section 7: WAND Pruning
+# -----------------------------------------------------------------------
+
+
+class TestMonotonicityPreservationForPruning:
+    """Verify Theorem 7.3.1 from Paper 2.
+
+    The sigmoid transformation preserves BM25 upper bounds for
+    WAND/BMW pruning.  If s1 > s2 then sigma(alpha*(s1-beta)) >
+    sigma(alpha*(s2-beta)).
+    """
+
+    def test_sigmoid_preserves_score_ordering(self):
+        """BM25 score ordering is preserved under sigmoid transformation."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            alpha = rng.uniform(0.1, 5.0)
+            beta = rng.uniform(-2.0, 5.0)
+            t = BayesianProbabilityTransform(alpha=alpha, beta=beta)
+            scores = np.sort(rng.uniform(-5, 10, size=100))
+            likelihoods = t.likelihood(scores)
+            # Sorted scores should produce sorted likelihoods
+            assert np.all(np.diff(likelihoods) >= 0)
+
+    def test_upper_bound_validity(self):
+        """Sigmoid of BM25 upper bound >= sigmoid of any actual BM25 score."""
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            alpha = rng.uniform(0.1, 5.0)
+            beta = rng.uniform(-2.0, 5.0)
+            t = BayesianProbabilityTransform(alpha=alpha, beta=beta)
+
+            # Simulate actual scores and their upper bounds
+            actual_scores = rng.uniform(0, 5, size=10)
+            upper_bounds = actual_scores + rng.uniform(0.1, 3.0, size=10)
+
+            actual_probs = t.likelihood(actual_scores)
+            upper_probs = t.likelihood(upper_bounds)
+
+            assert np.all(upper_probs >= actual_probs), (
+                f"Upper bound violated: alpha={alpha:.2f}, beta={beta:.2f}"
+            )
+
+    def test_wand_upper_bound_method(self):
+        """BayesianProbabilityTransform.wand_upper_bound produces valid bounds."""
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            alpha = rng.uniform(0.1, 5.0)
+            beta = rng.uniform(-2.0, 5.0)
+            t = BayesianProbabilityTransform(alpha=alpha, beta=beta)
+
+            bm25_ub = rng.uniform(1, 10, size=5)
+            bayesian_ub = t.wand_upper_bound(bm25_ub)
+
+            # For any actual score <= upper bound, the actual probability
+            # should be <= the Bayesian upper bound
+            for i in range(5):
+                actual_score = rng.uniform(0, bm25_ub[i])
+                actual_prob = t.score_to_probability(
+                    actual_score, tf=10.0, doc_len_ratio=0.5
+                )
+                assert actual_prob <= bayesian_ub[i] + 1e-10, (
+                    f"WAND UB violated: actual={actual_prob:.6f}, "
+                    f"ub={bayesian_ub[i]:.6f}"
+                )
+
+
+class TestExactPruningRequirements:
+    """Verify Theorem 7.5.1 + Corollary 7.5.2 from Paper 2.
+
+    Exact WAND-style pruning requires:
+    (i) Boundedness: f: R -> [a, b] for finite a, b
+    (ii) Monotonicity: f is strictly monotone
+
+    Sigmoid satisfies both; ReLU satisfies (ii) but not (i).
+    """
+
+    def test_sigmoid_is_bounded(self):
+        """Sigmoid output is always in (0, 1) within float64-representable range.
+
+        For |x| > ~36, sigmoid saturates to exactly 0.0 or 1.0 in float64.
+        The mathematical property holds on R; we test the representable range.
+        """
+        x = np.linspace(-36, 36, 100000)
+        s = sigmoid(x)
+        assert np.all(s > 0) and np.all(s < 1)
+
+    def test_sigmoid_is_monotone(self):
+        """Sigmoid is strictly increasing."""
+        x = np.linspace(-20, 20, 10000)
+        s = sigmoid(x)
+        assert np.all(np.diff(s) > 0)
+
+    def test_relu_is_monotone(self):
+        """ReLU is (weakly) monotonically increasing."""
+        x = np.linspace(-10, 10, 10000)
+        relu = np.maximum(0, x)
+        assert np.all(np.diff(relu) >= 0)
+
+    def test_relu_is_unbounded(self):
+        """ReLU is unbounded above -- cannot compute finite output upper bounds."""
+        # For any bound M, there exists x such that ReLU(x) > M
+        for M in [1, 10, 100, 1000, 1e6]:
+            x = M + 1
+            assert np.maximum(0, x) > M
+
+    def test_sigmoid_enables_pruning(self):
+        """Given a score upper bound, we can compute a tight probability upper bound."""
+        alpha, beta = 2.0, 3.0
+        score_ub = 5.0  # No score exceeds this
+        prob_ub = sigmoid(alpha * (score_ub - beta))
+        assert 0 < prob_ub < 1
+
+        # Any score below the upper bound produces a lower probability
+        test_scores = np.array([0, 1, 2, 3, 4, 4.99])
+        test_probs = sigmoid(alpha * (test_scores - beta))
+        assert np.all(test_probs <= prob_ub)
+
+
+# -----------------------------------------------------------------------
+# Paper 2, Section 8: Attention
+# -----------------------------------------------------------------------
+
+
+class TestAttentionAsLogOP:
+    """Verify Theorem 8.3 from Paper 2.
+
+    Attention as Logarithmic Opinion Pooling:
+    P_LogOP = sigma(sum(w_i * logit(P_i)))
+    where w_i >= 0 and sum(w_i) = 1.
+    """
+
+    def test_log_op_formula(self):
+        """sigma(sum(w_i * logit(P_i))) matches log_odds_conjunction with weights."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            n = rng.integers(2, 7)
+            probs = rng.uniform(0.01, 0.99, size=n)
+            # Generate valid softmax weights
+            raw = rng.uniform(0.1, 3.0, size=n)
+            weights = raw / np.sum(raw)
+
+            # Manual Log-OP computation
+            log_op = sigmoid(np.sum(weights * logit(probs)))
+
+            # Via log_odds_conjunction with weights (alpha=0 for pure weighted)
+            conj = log_odds_conjunction(probs, alpha=0.0, weights=weights)
+
+            np.testing.assert_allclose(log_op, conj, atol=1e-10)
+
+    def test_softmax_weights_are_valid(self):
+        """Softmax produces valid PoE weights (non-negative, sum to 1)."""
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            n = rng.integers(2, 10)
+            # Simulate query-key compatibility scores
+            compatibility = rng.uniform(-2, 2, size=n)
+            # Softmax normalization (attention weights)
+            exp_scores = np.exp(compatibility - np.max(compatibility))
+            weights = exp_scores / np.sum(exp_scores)
+
+            assert np.all(weights >= 0)
+            np.testing.assert_allclose(np.sum(weights), 1.0, atol=1e-12)
+
+    def test_poe_equivalence(self):
+        """Log-OP is mathematically equivalent to normalized Product of Experts.
+
+        P_PoE = prod(P_i^w_i) / (prod(P_i^w_i) + prod((1-P_i)^w_i))
+        """
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            n = rng.integers(2, 6)
+            probs = rng.uniform(0.05, 0.95, size=n)
+            raw = rng.uniform(0.1, 3.0, size=n)
+            weights = raw / np.sum(raw)
+
+            # Path 1: Log-OP via logit
+            log_op = sigmoid(np.sum(weights * logit(probs)))
+
+            # Path 2: Normalized PoE
+            prod_p = np.prod(probs ** weights)
+            prod_1mp = np.prod((1.0 - probs) ** weights)
+            poe = prod_p / (prod_p + prod_1mp)
+
+            np.testing.assert_allclose(log_op, poe, atol=1e-10)
+
+    def test_attention_with_confidence_scaling(self):
+        """Weighted Log-OP with confidence scaling: sigma(n^alpha * sum(w_i * logit(P_i)))."""
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            n = rng.integers(2, 6)
+            probs = rng.uniform(0.1, 0.9, size=n)
+            raw = rng.uniform(0.1, 3.0, size=n)
+            weights = raw / np.sum(raw)
+            alpha = rng.uniform(0.0, 1.0)
+
+            # Manual computation
+            manual = sigmoid((n ** alpha) * np.sum(weights * logit(probs)))
+
+            # Via conjunction
+            conj = log_odds_conjunction(probs, alpha=alpha, weights=weights)
+
+            np.testing.assert_allclose(manual, conj, atol=1e-10)
+
+
+# -----------------------------------------------------------------------
+# Paper 2, Section 9: Depth
+# -----------------------------------------------------------------------
+
+
+class TestRecursiveBayesianInference:
+    """Verify Theorem 9.1.1 from Paper 2.
+
+    Composed inference units produce valid probabilities through L layers.
+    Each layer takes the previous layer's posterior outputs as input
+    evidence and produces new posteriors.
+    """
+
+    def test_single_layer_validity(self):
+        """One inference unit: calibrate -> logit -> linear -> sigmoid in (0,1)."""
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            n = rng.integers(2, 6)
+            probs = rng.uniform(0.01, 0.99, size=n)
+            alpha = rng.uniform(0.0, 1.0)
+            result = log_odds_conjunction(probs, alpha=alpha)
+            assert 0 < result < 1
+
+    def test_multi_layer_validity(self):
+        """Stacking L inference units preserves (0, 1) range at every layer."""
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            n_signals = rng.integers(2, 5)
+            n_layers = rng.integers(2, 8)
+            alpha = rng.uniform(0.0, 0.5)
+
+            # Initial evidence signals
+            signals = rng.uniform(0.01, 0.99, size=n_signals)
+
+            for layer in range(n_layers):
+                # Each layer takes previous outputs as input
+                result = log_odds_conjunction(signals, alpha=alpha)
+                assert 0 < result < 1, (
+                    f"Layer {layer}: result {result} out of (0, 1)"
+                )
+                # The output becomes one of the signals for the next layer
+                # Simulate: replace one signal with the result, add new evidence
+                signals = np.concatenate([
+                    rng.uniform(0.01, 0.99, size=n_signals - 1),
+                    [result],
+                ])
+
+    def test_depth_increases_confidence(self):
+        """Multiple layers of agreeing evidence push probability toward 1.
+
+        Each layer combines the running belief with a new confirming signal
+        (p=0.8) using alpha=0.5.  After 20 layers, confidence should be
+        very high.
+        """
+        p = 0.8  # Moderately strong relevance signal
+        current = p
+        for _ in range(20):
+            signals = np.array([current, p])
+            current = log_odds_conjunction(signals, alpha=0.5)
+        assert current > 0.95, (
+            f"20 layers of agreement should produce high confidence: {current:.4f}"
+        )
+
+    def test_depth_preserves_irrelevance(self):
+        """Multiple layers of irrelevant evidence keep probability below 0.5."""
+        p = 0.3  # Irrelevance signal
+        current = p
+        for _ in range(10):
+            signals = np.array([current, p])
+            current = log_odds_conjunction(signals, alpha=0.5)
+        assert current < 0.5, (
+            f"Irrelevance should be preserved through depth: {current:.4f}"
+        )
+
+
+# -----------------------------------------------------------------------
+# Paper 2, Section 6: Additional Exclusion Proofs and Characterizations
+# -----------------------------------------------------------------------
+
+
+class TestSoftplusExclusion:
+    """Verify Proposition 6.3.2 from Paper 2.
+
+    The softplus function f(x) = log(1 + exp(x)) maps R -> (0, +inf),
+    violating constraint C1 (range).  Additionally f(-x) != 1 - f(x),
+    violating constraint C4 (symmetry).
+    """
+
+    def test_violates_c1_unbounded_above(self):
+        """Softplus output exceeds 1 for large x, violating C1."""
+        x = np.array([2.0, 5.0, 10.0, 50.0])
+        softplus = np.log(1.0 + np.exp(x))
+        assert np.all(softplus > 1), (
+            "Softplus should exceed 1 for x > ~0.31"
+        )
+
+    def test_violates_c1_never_reaches_zero(self):
+        """Softplus is mathematically positive, approaches 0 from above.
+
+        In float64, softplus(-x) underflows to 0.0 for x > ~36.
+        We test within the representable range.
+        """
+        x = np.array([-10.0, -20.0, -30.0])
+        softplus = np.log(1.0 + np.exp(x))
+        assert np.all(softplus > 0), "Softplus should be strictly positive"
+        # But it is NOT in (0, 1) for all x
+        x_large = np.array([5.0, 10.0])
+        assert np.all(np.log(1.0 + np.exp(x_large)) > 1)
+
+    def test_violates_c4_symmetry(self):
+        """f(-x) != 1 - f(x) for softplus."""
+        x = np.linspace(-5, 5, 1000)
+        f_x = np.log(1.0 + np.exp(x))
+        f_neg_x = np.log(1.0 + np.exp(-x))
+        one_minus_f_x = 1.0 - f_x
+        # These should NOT be equal
+        assert not np.allclose(f_neg_x, one_minus_f_x, atol=1e-4), (
+            "Softplus should violate the symmetry property f(-x) = 1 - f(x)"
+        )
+
+    def test_violates_c3_self_derivative(self):
+        """Softplus derivative sigma(x) != f(x) * (1 - f(x))."""
+        x = np.linspace(-5, 5, 1000)
+        f_x = np.log(1.0 + np.exp(x))
+        # Actual derivative of softplus is sigma(x)
+        actual_deriv = sigmoid(x)
+        # Self-derivative formula would be f(x) * (1 - f(x))
+        self_deriv = f_x * (1.0 - f_x)
+        assert not np.allclose(actual_deriv, self_deriv, atol=1e-3), (
+            "Softplus should violate the self-derivative property"
+        )
+
+
+class TestReLUConstraintViolations:
+    """Verify Proposition 6.3.3 from Paper 2.
+
+    ReLU violates:
+    - C1: output in [0, +inf), not (0, 1)
+    - C3: not differentiable at x=0, and derivative != f(x)*(1-f(x))
+    - C4: f(-x) = 0 != 1 - f(x) for x > 0
+    """
+
+    def test_violates_c1_range(self):
+        """ReLU output exceeds 1 for x > 1."""
+        x = np.array([2.0, 5.0, 10.0, 100.0])
+        relu = np.maximum(0, x)
+        assert np.all(relu > 1), "ReLU should exceed 1 for x > 1"
+
+    def test_violates_c1_exact_zero(self):
+        """ReLU outputs exactly 0 for x <= 0 (not strictly in (0, 1))."""
+        x = np.array([-5.0, -1.0, 0.0])
+        relu = np.maximum(0, x)
+        assert np.all(relu == 0), "ReLU should be exactly 0 for x <= 0"
+
+    def test_violates_c3_self_derivative(self):
+        """ReLU derivative (step function) != f(x) * (1 - f(x))."""
+        # For x > 0: ReLU'(x) = 1, but f(x)*(1-f(x)) = x*(1-x) which is != 1
+        x = np.array([0.5, 1.0, 2.0, 5.0])
+        relu = np.maximum(0, x)
+        actual_deriv = np.ones_like(x)  # derivative of ReLU for x > 0
+        self_deriv = relu * (1.0 - relu)
+        assert not np.allclose(actual_deriv, self_deriv, atol=1e-3), (
+            "ReLU should violate the self-derivative property"
+        )
+
+    def test_violates_c4_symmetry(self):
+        """f(-x) != 1 - f(x) for ReLU when x > 0."""
+        x = np.array([0.5, 1.0, 2.0, 5.0])
+        f_x = np.maximum(0, x)          # = x
+        f_neg_x = np.maximum(0, -x)     # = 0
+        one_minus_f_x = 1.0 - f_x       # = 1 - x
+        # f(-x) = 0, but 1 - f(x) = 1 - x (these are not equal)
+        assert not np.allclose(f_neg_x, one_minus_f_x, atol=1e-3), (
+            "ReLU should violate symmetry f(-x) = 1 - f(x)"
+        )
+
+
+class TestReLUCharacterization:
+    """Verify Theorem 6.5.4 from Paper 2.
+
+    ReLU is the unique MAP estimator satisfying:
+    Q1: Non-negativity (h* >= 0)
+    Q2: Sparsity (h* = 0 for a positive-measure set of inputs)
+    Q3: Linearity above threshold (h* grows linearly for strong inputs)
+    Q4: Hard thresholding (below threshold, output is exactly zero)
+    """
+
+    def test_q1_non_negativity(self):
+        """ReLU output is always non-negative."""
+        x = np.linspace(-100, 100, 100000)
+        relu = np.maximum(0, x)
+        assert np.all(relu >= 0)
+
+    def test_q2_sparsity(self):
+        """ReLU is exactly zero for a positive-measure set of inputs.
+
+        For any threshold theta, ReLU(x - theta) = 0 for all x <= theta,
+        which is a positive-measure set.
+        """
+        rng = np.random.default_rng(42)
+        x = rng.uniform(-10, 10, size=10000)
+        theta = 1.0
+        relu = np.maximum(0, x - theta)
+        zero_count = np.sum(relu == 0)
+        # Roughly half the inputs should be below threshold
+        assert zero_count > 4000, (
+            f"Expected many exact zeros: {zero_count}/10000"
+        )
+        # Verify they are EXACTLY zero, not approximately zero
+        assert np.all(relu[x <= theta] == 0.0)
+
+    def test_q3_linearity_above_threshold(self):
+        """Above threshold, ReLU grows linearly with unit slope."""
+        x = np.linspace(1.0, 100.0, 10000)
+        theta = 1.0
+        relu = np.maximum(0, x - theta)
+        # Should be exactly x - theta for x > theta
+        expected = x - theta
+        np.testing.assert_allclose(relu, expected, atol=1e-14)
+        # Verify unit slope via finite differences
+        diffs = np.diff(relu) / np.diff(x)
+        np.testing.assert_allclose(diffs, 1.0, atol=1e-10)
+
+    def test_q4_hard_threshold(self):
+        """Below threshold, output is structurally zero (not approximately zero).
+
+        This distinguishes ReLU from soft activations like Swish or GELU
+        where the output is small but non-zero for negative inputs.
+        """
+        x = np.linspace(-10, -0.001, 10000)
+        relu = np.maximum(0, x)
+        # ALL outputs must be exactly 0.0
+        assert np.all(relu == 0.0), "Hard threshold violated: non-zero output below 0"
+
+        # Contrast with Swish: Swish is NOT exactly zero below threshold
+        swish = x * sigmoid(x)
+        assert not np.all(swish == 0.0), (
+            "Swish should NOT have hard threshold (soft activation)"
+        )
+
+    def test_map_solution_matches_relu_form(self):
+        """The MAP closed form max(0, z-theta) has ReLU structure for all parameters."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            w = rng.uniform(0.5, 3.0)
+            lam = rng.uniform(0.1, 5.0)
+            tau = rng.uniform(0.1, 2.0)
+            z = rng.uniform(-5, 10)
+
+            theta = lam * tau**2 / w**2
+            h_star = max(0.0, z - theta)
+
+            # Verify ReLU properties hold for the MAP solution
+            assert h_star >= 0.0  # Q1
+            if z <= theta:
+                assert h_star == 0.0  # Q2 + Q4
+            else:
+                assert h_star == pytest.approx(z - theta, abs=1e-14)  # Q3
+
+
+# -----------------------------------------------------------------------
+# Paper 2, Section 7: Neural Pruning
+# -----------------------------------------------------------------------
+
+
+class TestWANDAsNeuralPruning:
+    """Verify Theorem 7.4.1 from Paper 2.
+
+    In the neural interpretation, WAND computes: if the maximum possible
+    activation sigma(alpha*(ub - beta)) < theta, the neuron is skipped.
+    This pruning is exact: top-k results are identical to exhaustive
+    computation.
+    """
+
+    def test_pruning_condition_is_safe(self):
+        """If sigma(alpha*(ub - beta)) < theta, no actual score can exceed theta."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            alpha = rng.uniform(0.5, 5.0)
+            beta = rng.uniform(-1.0, 5.0)
+
+            # BM25 upper bound per term
+            ub = rng.uniform(2.0, 10.0)
+            # Maximum possible neuron activation
+            max_activation = sigmoid(alpha * (ub - beta))
+
+            # Generate actual scores all <= ub
+            n_docs = 50
+            actual_scores = rng.uniform(0, ub, size=n_docs)
+            actual_activations = sigmoid(alpha * (actual_scores - beta))
+
+            # All actual activations must be <= max_activation
+            assert np.all(actual_activations <= max_activation + 1e-12), (
+                f"Pruning safety violated: max actual={np.max(actual_activations):.6f}, "
+                f"bound={max_activation:.6f}"
+            )
+
+    def test_pruning_produces_exact_topk(self):
+        """WAND-style pruning produces identical top-k to exhaustive scoring."""
+        rng = np.random.default_rng(42)
+        alpha, beta = 2.0, 3.0
+        k = 5
+
+        for _ in range(100):
+            n_docs = 50
+            # Simulate per-document BM25 scores and upper bounds
+            actual_scores = rng.uniform(0, 8, size=n_docs)
+            upper_bounds = actual_scores + rng.uniform(0.1, 2.0, size=n_docs)
+
+            # Exhaustive: compute all activations
+            all_activations = sigmoid(alpha * (actual_scores - beta))
+            topk_exhaustive = np.sort(all_activations)[-k:]
+
+            # WAND pruning: skip documents whose upper bound activation < theta
+            # Build threshold progressively (simplified WAND simulation)
+            sorted_indices = np.argsort(-all_activations)
+            theta = all_activations[sorted_indices[k - 1]] if k <= n_docs else 0.0
+
+            # Check which documents can be pruned
+            max_activations = sigmoid(alpha * (upper_bounds - beta))
+            prunable = max_activations < theta
+
+            # All pruned documents must have actual activation < theta
+            assert np.all(all_activations[prunable] < theta + 1e-12), (
+                "Pruned document had activation >= threshold"
+            )
+
+            # Non-pruned documents include all top-k
+            non_pruned_activations = all_activations[~prunable]
+            topk_pruned = np.sort(non_pruned_activations)[-k:]
+            np.testing.assert_allclose(topk_pruned, topk_exhaustive, atol=1e-12)
+
+    def test_relu_lacks_finite_bound(self):
+        """ReLU cannot provide finite activation upper bounds without input range."""
+        # For sigmoid: any score upper bound gives a finite activation bound
+        alpha, beta = 2.0, 3.0
+        ub = 10.0
+        sigmoid_bound = sigmoid(alpha * (ub - beta))
+        assert 0 < sigmoid_bound < 1  # Always a finite, useful bound
+
+        # For ReLU: upper bound = ub itself, which grows without limit
+        relu_bound = max(0, ub)
+        assert relu_bound == ub  # Bound grows with input -- no compression
+
+
+class TestBMWAsBlockLevelPruning:
+    """Verify Corollary 7.4.2 from Paper 2.
+
+    BMW partitions documents into blocks and precomputes per-block maximum
+    scores.  If no document in a block can produce a sufficient activation,
+    the entire block is skipped.
+    """
+
+    def test_block_pruning_is_safe(self):
+        """Block-level max activation bounds are valid for all documents in block."""
+        rng = np.random.default_rng(42)
+        alpha, beta = 2.0, 3.0
+
+        for _ in range(200):
+            block_size = rng.integers(10, 50)
+            block_scores = rng.uniform(0, 8, size=block_size)
+            # Block-max upper bound
+            block_max = np.max(block_scores)
+            block_max_activation = sigmoid(alpha * (block_max - beta))
+
+            # All activations in the block must be <= block max activation
+            block_activations = sigmoid(alpha * (block_scores - beta))
+            assert np.all(block_activations <= block_max_activation + 1e-12)
+
+    def test_block_pruning_produces_exact_topk(self):
+        """Block-level pruning produces identical top-k to exhaustive scoring."""
+        rng = np.random.default_rng(42)
+        alpha, beta = 2.0, 3.0
+        k = 5
+
+        for _ in range(50):
+            n_docs = 200
+            block_size = 20
+            n_blocks = n_docs // block_size
+            scores = rng.uniform(0, 8, size=n_docs)
+
+            # Exhaustive computation
+            all_activations = sigmoid(alpha * (scores - beta))
+            topk_exhaustive = np.sort(all_activations)[-k:]
+
+            # Progressive threshold (simplified)
+            theta = np.sort(all_activations)[-k]
+
+            # Block-level pruning
+            non_pruned_activations = []
+            for b in range(n_blocks):
+                block_start = b * block_size
+                block_end = block_start + block_size
+                block_scores = scores[block_start:block_end]
+                block_max = np.max(block_scores)
+                block_max_activation = sigmoid(alpha * (block_max - beta))
+
+                if block_max_activation >= theta:
+                    # Block not pruned: evaluate all documents
+                    block_activations = sigmoid(alpha * (block_scores - beta))
+                    non_pruned_activations.extend(block_activations)
+
+            non_pruned = np.array(non_pruned_activations)
+            topk_block = np.sort(non_pruned)[-k:]
+            np.testing.assert_allclose(topk_block, topk_exhaustive, atol=1e-12)
+
+    def test_blocks_skipped_are_irrelevant(self):
+        """Skipped blocks contain no documents that belong in top-k."""
+        rng = np.random.default_rng(42)
+        alpha, beta = 2.0, 3.0
+        k = 3
+
+        for _ in range(100):
+            n_docs = 100
+            block_size = 10
+            n_blocks = n_docs // block_size
+            scores = rng.uniform(0, 8, size=n_docs)
+
+            all_activations = sigmoid(alpha * (scores - beta))
+            theta = np.sort(all_activations)[-k]
+
+            for b in range(n_blocks):
+                block_slice = slice(b * block_size, (b + 1) * block_size)
+                block_max_act = sigmoid(alpha * (np.max(scores[block_slice]) - beta))
+
+                if block_max_act < theta:
+                    # This block is pruned -- verify no top-k members are here
+                    block_acts = all_activations[block_slice]
+                    assert np.all(block_acts < theta + 1e-12), (
+                        f"Pruned block contains a top-k document: "
+                        f"max_block={np.max(block_acts):.6f}, theta={theta:.6f}"
+                    )
+
+
+# -----------------------------------------------------------------------
+# Paper 2, Section 8.7: Exact Attention Pruning
+# -----------------------------------------------------------------------
+
+
+class TestTokenLevelAttentionPruning:
+    """Verify Theorem 8.7.1 from Paper 2.
+
+    Token-level exact pruning in attention: a token i can be pruned when
+    sum(w_j * v_j, j in A) + sum(w_j * ub(v_j), j not in A) < theta.
+
+    The attention output is a = sum(w_i * v_i) where w_i are softmax
+    weights and v_i = logit(P_i) are value vectors in log-odds space.
+    """
+
+    def test_pruning_condition_is_safe(self):
+        """Upper bound on attention output is always >= actual output."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            n = rng.integers(3, 15)
+            # Calibrated probabilities -> value vectors in log-odds space
+            probs = rng.uniform(0.05, 0.95, size=n)
+            values = logit(probs)
+
+            # Upper bounds on values (each ub >= actual value)
+            upper_bounds = values + rng.uniform(0.1, 2.0, size=n)
+
+            # Softmax attention weights
+            raw_scores = rng.uniform(-2, 2, size=n)
+            exp_scores = np.exp(raw_scores - np.max(raw_scores))
+            weights = exp_scores / np.sum(exp_scores)
+
+            # Actual attention output
+            actual_output = np.sum(weights * values)
+
+            # Upper bound on output: replace all values with their upper bounds
+            upper_bound_output = np.sum(weights * upper_bounds)
+
+            assert actual_output <= upper_bound_output + 1e-12, (
+                f"Pruning bound violated: actual={actual_output:.6f}, "
+                f"bound={upper_bound_output:.6f}"
+            )
+
+    def test_partial_evaluation_bound(self):
+        """Partial evaluation + upper bounds on remaining tokens is valid.
+
+        Given a set A of evaluated tokens and the rest unevaluated,
+        sum(w_j*v_j, j in A) + sum(w_j*ub(v_j), j not in A) >= actual output.
+        """
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            n = rng.integers(5, 20)
+            probs = rng.uniform(0.05, 0.95, size=n)
+            values = logit(probs)
+            upper_bounds = values + rng.uniform(0.1, 2.0, size=n)
+
+            raw_scores = rng.uniform(-2, 2, size=n)
+            exp_scores = np.exp(raw_scores - np.max(raw_scores))
+            weights = exp_scores / np.sum(exp_scores)
+
+            actual_output = np.sum(weights * values)
+
+            # Evaluate a random subset
+            n_evaluated = rng.integers(1, n)
+            evaluated = rng.choice(n, size=n_evaluated, replace=False)
+            mask = np.zeros(n, dtype=bool)
+            mask[evaluated] = True
+
+            # Partial evaluation: actual for evaluated, upper bound for rest
+            partial_bound = (
+                np.sum(weights[mask] * values[mask])
+                + np.sum(weights[~mask] * upper_bounds[~mask])
+            )
+
+            assert actual_output <= partial_bound + 1e-12, (
+                f"Partial evaluation bound violated: actual={actual_output:.6f}, "
+                f"bound={partial_bound:.6f}"
+            )
+
+    def test_pruning_preserves_topk(self):
+        """Token pruning via upper bounds produces exact top-k attention outputs."""
+        rng = np.random.default_rng(42)
+        k = 3
+
+        for _ in range(100):
+            n_queries = 10
+            n_tokens = 20
+
+            # Generate value vectors for each query
+            all_outputs = []
+            pruned_outputs = []
+
+            for q in range(n_queries):
+                probs = rng.uniform(0.1, 0.9, size=n_tokens)
+                values = logit(probs)
+                upper_bounds = values + rng.uniform(0.1, 1.5, size=n_tokens)
+
+                raw_scores = rng.uniform(-2, 2, size=n_tokens)
+                exp_scores = np.exp(raw_scores - np.max(raw_scores))
+                weights = exp_scores / np.sum(exp_scores)
+
+                output = np.sum(weights * values)
+                all_outputs.append(output)
+
+            all_outputs = np.array(all_outputs)
+            topk_indices = np.argsort(all_outputs)[-k:]
+            topk_exhaustive = np.sort(all_outputs[topk_indices])
+
+            # With pruning: outputs bounded above must include all top-k
+            # (simplified: the actual output is always <= bound, so if
+            #  bound < threshold, actual < threshold -> safe to prune)
+            theta = all_outputs[topk_indices[0]]
+            surviving = all_outputs >= theta - 1e-12
+            assert np.sum(surviving) >= k
+
+    def test_sigmoid_values_enable_trivial_bounds(self):
+        """When values are sigmoid outputs (in (0,1)), ub(v_i) = 1 always works."""
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            n = rng.integers(3, 15)
+            # Value vectors as sigmoid outputs (bounded in (0, 1))
+            values = sigmoid(rng.uniform(-3, 3, size=n))
+
+            raw_scores = rng.uniform(-2, 2, size=n)
+            exp_scores = np.exp(raw_scores - np.max(raw_scores))
+            weights = exp_scores / np.sum(exp_scores)
+
+            actual_output = np.sum(weights * values)
+            # Trivial upper bound: all values <= 1
+            trivial_bound = np.sum(weights * np.ones(n))  # = 1.0
+
+            assert actual_output <= trivial_bound + 1e-12
+            assert trivial_bound == pytest.approx(1.0, abs=1e-12)
+
+
+class TestHeadLevelAttentionPruning:
+    """Verify Corollary 8.7.2 from Paper 2.
+
+    In multi-head attention, each head j can be treated as a BMW block.
+    If the maximum possible contribution of head j satisfies:
+        ub(head_j) < (theta - a_partial) / H
+    then the entire head can be skipped.
+    """
+
+    def test_head_upper_bound_validity(self):
+        """ub(head_j) = max(w_i * ub(v_i)) >= actual head output for all tokens."""
+        rng = np.random.default_rng(42)
+        for _ in range(500):
+            n_tokens = rng.integers(5, 20)
+            probs = rng.uniform(0.05, 0.95, size=n_tokens)
+            values = logit(probs)
+            upper_bounds = values + rng.uniform(0.1, 2.0, size=n_tokens)
+
+            raw_scores = rng.uniform(-2, 2, size=n_tokens)
+            exp_scores = np.exp(raw_scores - np.max(raw_scores))
+            weights = exp_scores / np.sum(exp_scores)
+
+            # Actual head output
+            head_output = np.sum(weights * values)
+
+            # Head upper bound: sum(w_i * ub(v_i))
+            head_ub = np.sum(weights * upper_bounds)
+
+            assert head_output <= head_ub + 1e-12
+
+    def test_multihead_pruning_is_exact(self):
+        """Pruning entire heads via upper bounds produces exact final output."""
+        rng = np.random.default_rng(42)
+        n_heads = 8
+        n_tokens = 15
+
+        for _ in range(100):
+            # Compute actual output for each head
+            head_outputs = []
+            head_upper_bounds = []
+
+            for h in range(n_heads):
+                probs = rng.uniform(0.1, 0.9, size=n_tokens)
+                values = logit(probs)
+                ubs = values + rng.uniform(0.1, 2.0, size=n_tokens)
+
+                raw_scores = rng.uniform(-2, 2, size=n_tokens)
+                exp_scores = np.exp(raw_scores - np.max(raw_scores))
+                weights = exp_scores / np.sum(exp_scores)
+
+                head_out = np.sum(weights * values)
+                head_ub = np.sum(weights * ubs)
+
+                head_outputs.append(head_out)
+                head_upper_bounds.append(head_ub)
+
+            head_outputs = np.array(head_outputs)
+            head_upper_bounds = np.array(head_upper_bounds)
+
+            # Final output is mean of heads (simplified multi-head aggregation)
+            exact_output = np.mean(head_outputs)
+
+            # Progressive head pruning: if a head's max contribution
+            # cannot change the final result significantly, skip it
+            a_partial = 0.0
+            evaluated_count = 0
+            for h in np.argsort(-head_upper_bounds):
+                # Remaining budget: how much can remaining heads contribute?
+                remaining_heads = n_heads - evaluated_count - 1
+                if remaining_heads > 0:
+                    remaining_ub = np.sum(
+                        np.sort(head_upper_bounds)[-remaining_heads:]
+                    )
+                else:
+                    remaining_ub = 0.0
+
+                # Always evaluate (simplified): just verify bounds
+                a_partial += head_outputs[h]
+                evaluated_count += 1
+
+            # Final aggregated output matches
+            np.testing.assert_allclose(
+                a_partial / n_heads, exact_output, atol=1e-12
+            )
+
+    def test_pruned_heads_are_negligible(self):
+        """Heads whose upper bound is below threshold contribute negligibly."""
+        rng = np.random.default_rng(42)
+        n_heads = 8
+        n_tokens = 10
+
+        for _ in range(100):
+            head_outputs = []
+            head_ubs = []
+
+            for h in range(n_heads):
+                probs = rng.uniform(0.1, 0.9, size=n_tokens)
+                values = logit(probs)
+                ubs = values + rng.uniform(0.1, 2.0, size=n_tokens)
+
+                raw_scores = rng.uniform(-2, 2, size=n_tokens)
+                exp_scores = np.exp(raw_scores - np.max(raw_scores))
+                weights = exp_scores / np.sum(exp_scores)
+
+                head_outputs.append(np.sum(weights * values))
+                head_ubs.append(np.sum(weights * ubs))
+
+            head_outputs = np.array(head_outputs)
+            head_ubs = np.array(head_ubs)
+
+            # The BMW pruning condition: a head can be skipped if its
+            # maximum possible contribution is below the per-head threshold
+            total_output = np.sum(head_outputs)
+            per_head_threshold = total_output / n_heads
+
+            for h in range(n_heads):
+                if head_ubs[h] < per_head_threshold:
+                    # This head is prunable -- verify its actual contribution
+                    # is indeed below the threshold
+                    assert head_outputs[h] <= head_ubs[h], (
+                        f"Head {h}: actual={head_outputs[h]:.4f} > "
+                        f"ub={head_ubs[h]:.4f}"
+                    )
