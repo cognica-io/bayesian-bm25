@@ -1,5 +1,36 @@
 # History
 
+## 0.4.0 (2026-02-24)
+
+- Add `LearnableLogOddsWeights` for per-signal reliability learning (Remark 5.3.2)
+  - Learns weights that map from the Naive Bayes uniform initialization
+    (w_i = 1/n) to per-signal reliability weights via softmax parameterization
+    over unconstrained logits
+  - Completes the correspondence to a fully parameterized single-layer network
+    in log-odds space: `logit -> weighted sum -> sigmoid`
+  - Hebbian gradient: `dL/dz_j = n^alpha * (p - y) * w_j * (x_j - x_bar_w)`
+    (pre-synaptic activity x post-synaptic error, backprop-free)
+  - Batch `fit()` via gradient descent on BCE loss
+  - Online `update()` via SGD with EMA-smoothed gradients, bias correction,
+    L2 gradient clipping, learning rate decay, and Polyak averaging of weights
+    in the simplex
+  - Alpha (confidence scaling) is fixed, only weights are learned; the two are
+    orthogonal (Paper 2, Section 4.2)
+- Add theorem verification tests for Remark 5.3.2
+  - Naive Bayes initialization: uniform 1/n weights match unweighted conjunction
+  - Hebbian gradient structure: zero gradient when signals identical, correct
+    direction for overestimating signals
+  - Theorem 5.3.1: equal-quality signals maintain approximately uniform weights
+- Add learnable weights benchmark (`benchmarks/learnable_weights.py`)
+  - Weight recovery accuracy across 2--5 signals with varying noise
+  - Fusion quality comparison: uniform vs oracle vs learned weights (BCE, MSE,
+    Spearman)
+  - Online convergence tracking: `update()` vs `fit()` target
+  - Timing measurements for `fit()` and `update()` at various scales
+- Add learnable fusion example (`examples/learnable_fusion.py`)
+  - Batch fit, online update, Polyak-averaged inference, and alpha confidence
+    scaling for a 3-signal hybrid search system
+
 ## 0.3.2 (2026-02-22)
 
 - Support alpha + weights composability in `log_odds_conjunction()`

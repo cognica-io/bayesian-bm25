@@ -14,6 +14,7 @@ Key capabilities:
 - **Base rate calibration** — corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68--77% without relevance labels
 - **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
 - **Probabilistic fusion** — combine multiple probability signals using log-odds conjunction with multiplicative confidence scaling and optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
+- **Learnable fusion weights** — `LearnableLogOddsWeights` learns per-signal reliability from labeled data via a Hebbian gradient that is backprop-free, starting from Naive Bayes uniform initialization (Remark 5.3.2)
 - **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
 - **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
 - **Calibration metrics** — `expected_calibration_error()`, `brier_score()`, and `reliability_diagram()` for evaluating probability quality
@@ -101,6 +102,28 @@ fused = log_odds_conjunction(stacked, weights=np.array([0.6, 0.4]))
 
 # Fuse with weights and confidence scaling (alpha + weights compose)
 fused = log_odds_conjunction(stacked, alpha=0.5, weights=np.array([0.6, 0.4]))
+```
+
+### Learning Fusion Weights from Data
+
+```python
+import numpy as np
+from bayesian_bm25 import LearnableLogOddsWeights
+
+# 3 retrieval signals: BM25, vector search, metadata match
+learner = LearnableLogOddsWeights(n_signals=3, alpha=0.0)
+# Initial weights are uniform: [0.333, 0.333, 0.333]
+
+# Batch fit from labeled data (probs: m x 3, labels: m)
+learner.fit(training_probs, training_labels, learning_rate=0.1)
+# Learned weights reflect signal reliability: [0.70, 0.19, 0.11]
+
+# Online refinement from streaming feedback
+for probs, label in feedback_stream:
+    learner.update(probs, label, learning_rate=0.05, momentum=0.9)
+
+# Inference with Polyak-averaged weights for stability
+fused = learner(test_probs, use_averaged=True)
 ```
 
 ### WAND Pruning with Bayesian Upper Bounds
@@ -222,6 +245,7 @@ Reproduce with `python benchmarks/base_rate.py` (requires `pip install bayesian-
 
 Additional benchmarks (no external datasets required):
 
+- `python benchmarks/learnable_weights.py` — learnable weight recovery, fusion quality, online convergence, and timing
 - `python benchmarks/weighted_fusion.py` — weighted vs uniform log-odds fusion across noise scenarios
 - `python benchmarks/wand_upper_bound.py` — WAND upper bound tightness and skip rate analysis
 
