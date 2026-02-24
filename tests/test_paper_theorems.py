@@ -27,6 +27,7 @@ from bayesian_bm25.probability import (
     sigmoid,
 )
 from bayesian_bm25.fusion import (
+    LearnableLogOddsWeights,
     cosine_to_probability,
     log_odds_conjunction,
     prob_and,
@@ -2584,3 +2585,140 @@ class TestHeadLevelAttentionPruning:
                         f"Head {h}: actual={head_outputs[h]:.4f} > "
                         f"ub={head_ubs[h]:.4f}"
                     )
+
+
+# -----------------------------------------------------------------------
+# Remark 5.3.2: Learnable Weights / Naive Bayes Init
+# -----------------------------------------------------------------------
+
+
+class TestRemark532NaiveBayesInit:
+    """Verify Remark 5.3.2: uniform 1/n weights are the Naive Bayes init."""
+
+    def test_initial_weights_are_uniform(self):
+        """Initial weights w_i = 1/n for various n."""
+        for n in [1, 2, 3, 5, 8]:
+            learner = LearnableLogOddsWeights(n_signals=n)
+            expected = np.full(n, 1.0 / n)
+            np.testing.assert_allclose(learner.weights, expected, atol=1e-15)
+
+    def test_uniform_init_matches_unweighted_conjunction(self):
+        """Uniform init with alpha=0 matches unweighted conjunction with alpha=0.
+
+        At initialization, LearnableLogOddsWeights(n, alpha=0) should produce
+        the same result as log_odds_conjunction(probs, alpha=0) because
+        uniform weights w_i=1/n make the weighted sum equal to the mean.
+        """
+        rng = np.random.RandomState(42)
+        for n in [2, 3, 5]:
+            learner = LearnableLogOddsWeights(n_signals=n, alpha=0.0)
+            probs = rng.uniform(0.1, 0.9, size=n)
+            result_learner = learner(probs)
+            result_unweighted = log_odds_conjunction(probs, alpha=0.0)
+            assert result_learner == pytest.approx(result_unweighted, abs=1e-10), (
+                f"Mismatch for n={n}: learner={result_learner}, "
+                f"unweighted={result_unweighted}"
+            )
+
+
+class TestHebbianGradientStructure:
+    """Verify the Hebbian gradient structure from Remark 5.3.2.
+
+    The gradient dL/dz_j = n^alpha * (p - y) * w_j * (x_j - x_bar_w)
+    has key structural properties tied to the Hebbian interpretation.
+    """
+
+    def test_gradient_zero_when_signals_identical(self):
+        """Gradient is zero when all signals are identical (x_j = x_bar_w for all j).
+
+        When all input probabilities are equal, every signal equals the
+        weighted mean, so (x_j - x_bar_w) = 0 for all j.  No learning
+        signal -- the network cannot distinguish between signals.
+        """
+        learner = LearnableLogOddsWeights(n_signals=3, alpha=0.0)
+        # All signals identical -> x_j = x_bar_w for all j
+        probs = np.array([[0.7, 0.7, 0.7]])
+        labels = np.array([1.0])
+
+        n = learner.n_signals
+        scale = n ** learner.alpha
+        x = logit(probs)
+        w = learner.weights
+        x_bar_w = np.sum(w * x, axis=-1)
+        p = np.atleast_1d(np.asarray(sigmoid(scale * x_bar_w), dtype=np.float64))
+        error = p - labels
+
+        grad = np.mean(
+            scale * error[:, np.newaxis] * w[np.newaxis, :] * (x - x_bar_w[:, np.newaxis]),
+            axis=0,
+        )
+        np.testing.assert_allclose(grad, 0.0, atol=1e-15)
+
+    def test_gradient_reduces_weight_of_overestimating_signal(self):
+        """When prediction overshoots (p > y), the gradient reduces weight of above-mean signals.
+
+        For a positive label y=1, if p > 1 (impossible, but for y=0):
+        error = (p - y) > 0.  A signal above the weighted mean has
+        (x_j - x_bar_w) > 0.  The gradient dL/dz_j > 0 means z_j
+        will decrease, reducing that signal's weight -- correct behavior.
+        """
+        learner = LearnableLogOddsWeights(n_signals=2, alpha=0.0)
+        # Signal 0: high, Signal 1: low.  Label=0 (not relevant).
+        # Combined prediction will be > 0, so p > 0.5 > y=0.
+        probs = np.array([[0.9, 0.3]])
+        labels = np.array([0.0])
+
+        n = learner.n_signals
+        scale = n ** learner.alpha
+        x = logit(probs)
+        w = learner.weights
+        x_bar_w = np.sum(w * x, axis=-1)
+        p = np.atleast_1d(np.asarray(sigmoid(scale * x_bar_w), dtype=np.float64))
+        error = p - labels  # positive (p > 0, y = 0)
+
+        grad = np.mean(
+            scale * error[:, np.newaxis] * w[np.newaxis, :] * (x - x_bar_w[:, np.newaxis]),
+            axis=0,
+        )
+
+        # Signal 0 (0.9) is above the weighted mean -> positive gradient
+        # -> z_0 will decrease -> weight of the "too high" signal decreases
+        assert grad[0] > 0, f"Expected positive gradient for above-mean signal, got {grad[0]}"
+
+        # Signal 1 (0.3) is below the weighted mean -> negative gradient
+        # -> z_1 will increase -> weight of the "more correct" signal increases
+        assert grad[1] < 0, f"Expected negative gradient for below-mean signal, got {grad[1]}"
+
+
+class TestTheorem531ParameterCorrespondence:
+    """Verify Theorem 5.3.1: equal-quality signals maintain uniform weights.
+
+    When all signals are equally informative, training should not
+    significantly perturb the weights from their uniform initialization.
+    """
+
+    def test_equal_quality_signals_stay_uniform(self):
+        """Equal-quality signals maintain approximately uniform weights after training."""
+        rng = np.random.RandomState(42)
+        n = 3
+        m = 500
+        labels = rng.randint(0, 2, size=m).astype(np.float64)
+
+        # All signals are equally informative (same noise level)
+        signals = []
+        for _ in range(n):
+            s = np.where(labels == 1, 0.8, 0.2)
+            noise = rng.uniform(-0.1, 0.1, size=m)
+            s = np.clip(s + noise, 0.05, 0.95)
+            signals.append(s)
+        probs = np.column_stack(signals)
+
+        learner = LearnableLogOddsWeights(n_signals=n, alpha=0.0)
+        learner.fit(probs, labels, learning_rate=0.05, max_iterations=1000)
+
+        # Weights should remain approximately uniform
+        uniform = np.full(n, 1.0 / n)
+        np.testing.assert_allclose(learner.weights, uniform, atol=0.1, err_msg=(
+            f"Equal-quality signals should maintain ~uniform weights, "
+            f"got {learner.weights}"
+        ))
