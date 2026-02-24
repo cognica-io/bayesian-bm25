@@ -218,7 +218,7 @@ F1 scores using the best threshold found on training queries, applied to evaluat
 | Batch fit (prior-aware, C2) | 0.1657 | 0.1539 | 0.3370 | 0.3275 |
 | Batch fit (prior-free, C3) | 0.1808 | 0.1758 | 0.2836 | 0.2852 |
 
-Reproduce with `python benchmarks/base_rate.py` (requires `pip install ir_datasets`). The base rate benchmark also includes Platt scaling, min-max normalization, and prior-aware/prior-free training mode comparisons.
+Reproduce with `python benchmarks/base_rate.py` (requires `pip install bayesian-bm25[bench]`). The base rate benchmark also includes Platt scaling, min-max normalization, and prior-aware/prior-free training mode comparisons.
 
 Additional benchmarks (no external datasets required):
 

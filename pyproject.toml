@@ -18,6 +18,10 @@ Repository = "https://github.com/cognica-io/bayesian-bm25"
 
 [project.optional-dependencies]
 scorer = ["bm25s>=0.2.0"]
+bench = [
+    "bm25s>=0.2.0",
+    "ir_datasets",
+]
 dev = [
     "pytest>=7.0",
     "bm25s>=0.2.0",
