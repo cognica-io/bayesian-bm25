@@ -6,7 +6,7 @@
 
 """Probabilistic score combination functions.
 
-Implements AND, OR, and log-odds conjunction for combining multiple
+Implements AND, OR, NOT, and log-odds conjunction for combining multiple
 probability estimates.  The log-odds conjunction (from "From Bayesian
 Inference to Neural Computation") resolves the shrinkage problem of
 naive probabilistic AND by using geometric-mean log-odds with an
@@ -43,6 +43,27 @@ def cosine_to_probability(
     score = np.asarray(score, dtype=np.float64)
     result = _clamp_probability((1.0 + score) / 2.0)
     return float(result) if result.ndim == 0 else result
+
+
+def prob_not(prob: np.ndarray | float) -> np.ndarray | float:
+    """Probabilistic NOT via complement rule (Eq. 35).
+
+    Computes P(NOT R) = 1 - P(R).  In log-odds space this corresponds
+    to negation: logit(1 - p) = -logit(p), so NOT simply flips the
+    sign of evidence.
+
+    Parameters
+    ----------
+    prob : float or array
+        Probability value(s) to negate.
+
+    Returns
+    -------
+    Complement probability: 1 - p, clamped to (epsilon, 1 - epsilon).
+    """
+    prob = _clamp_probability(np.asarray(prob, dtype=np.float64))
+    result = _clamp_probability(1.0 - prob)
+    return float(result) if np.ndim(result) == 0 else result
 
 
 def prob_and(probs: np.ndarray) -> np.ndarray | float:

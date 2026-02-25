@@ -1,5 +1,20 @@
 # History
 
+## 0.4.1 (2026-02-25)
+
+- Add `prob_not()` for probabilistic negation (complement rule)
+  - Computes `P(NOT R) = 1 - P(R)` with epsilon clamping for numerical stability
+  - In log-odds space, NOT corresponds to simple negation: `logit(1 - p) = -logit(p)`
+  - Composes naturally with `prob_and()`, `prob_or()`, and `log_odds_conjunction()`
+    for exclusion queries (e.g., "python AND NOT java")
+  - Satisfies De Morgan's laws: `NOT(A AND B) = OR(NOT A, NOT B)` and
+    `NOT(A OR B) = AND(NOT A, NOT B)`
+- Add Boolean NOT example (`examples/boolean_not.py`)
+  - Exclusion query scenario with ranking
+  - Full Boolean operation comparison table
+  - De Morgan's laws verification
+  - Log-odds conjunction with exclusion
+
 ## 0.4.0 (2026-02-24)
 
 - Add `LearnableLogOddsWeights` for per-signal reliability learning (Remark 5.3.2)

@@ -13,7 +13,7 @@ Key capabilities:
 - **Score-to-probability transform** — convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
 - **Base rate calibration** — corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68--77% without relevance labels
 - **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
-- **Probabilistic fusion** — combine multiple probability signals using log-odds conjunction with multiplicative confidence scaling and optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
+- **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling and optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
 - **Learnable fusion weights** — `LearnableLogOddsWeights` learns per-signal reliability from labeled data via a Hebbian gradient that is backprop-free, starting from Naive Bayes uniform initialization (Remark 5.3.2)
 - **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
 - **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
@@ -75,12 +75,16 @@ doc_ids, probabilities = scorer.retrieve([["machine", "learning"]], k=3)
 
 ```python
 import numpy as np
-from bayesian_bm25 import log_odds_conjunction, prob_and, prob_or
+from bayesian_bm25 import log_odds_conjunction, prob_and, prob_not, prob_or
 
 signals = np.array([0.85, 0.70, 0.60])
 
 prob_and(signals)                # 0.357 (shrinkage problem)
 log_odds_conjunction(signals)    # 0.773 (agreement-aware)
+
+# Exclusion query: "python AND NOT java"
+p_python, p_java = 0.90, 0.75
+prob_and(np.array([p_python, prob_not(p_java)]))  # 0.225
 ```
 
 ### Hybrid Text + Vector Search
