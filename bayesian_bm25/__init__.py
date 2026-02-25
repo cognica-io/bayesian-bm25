@@ -6,12 +6,15 @@
 
 """Bayesian BM25 -- probabilistic transforms for BM25 retrieval scores."""
 
+from importlib.metadata import version as _metadata_version
+
 from bayesian_bm25.probability import BayesianProbabilityTransform
 from bayesian_bm25.fusion import (
     LearnableLogOddsWeights,
     cosine_to_probability,
     log_odds_conjunction,
     prob_and,
+    prob_not,
     prob_or,
 )
 from bayesian_bm25.metrics import (
@@ -20,7 +23,10 @@ from bayesian_bm25.metrics import (
     reliability_diagram,
 )
 
+__version__ = _metadata_version("bayesian-bm25")
+
 __all__ = [
+    "__version__",
     "BayesianProbabilityTransform",
     "LearnableLogOddsWeights",
     "brier_score",
@@ -28,6 +34,7 @@ __all__ = [
     "expected_calibration_error",
     "log_odds_conjunction",
     "prob_and",
+    "prob_not",
     "prob_or",
     "reliability_diagram",
 ]

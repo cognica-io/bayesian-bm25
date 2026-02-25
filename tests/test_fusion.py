@@ -14,8 +14,27 @@ from bayesian_bm25.fusion import (
     cosine_to_probability,
     log_odds_conjunction,
     prob_and,
+    prob_not,
     prob_or,
 )
+
+
+class TestVersion:
+    def test_version_accessible(self):
+        """__version__ is accessible and matches pyproject.toml."""
+        import bayesian_bm25
+
+        assert hasattr(bayesian_bm25, "__version__")
+        assert isinstance(bayesian_bm25.__version__, str)
+        # Minimal semver sanity: at least "X.Y.Z"
+        parts = bayesian_bm25.__version__.split(".")
+        assert len(parts) >= 2, f"Unexpected version format: {bayesian_bm25.__version__}"
+
+    def test_version_in_all(self):
+        """__version__ is exported in __all__."""
+        import bayesian_bm25
+
+        assert "__version__" in bayesian_bm25.__all__
 
 
 class TestCosineToProbability:
@@ -52,6 +71,66 @@ class TestCosineToProbability:
         scores = np.linspace(-1.0, 1.0, 20)
         result = cosine_to_probability(scores)
         assert np.all(np.diff(result) > 0)
+
+
+class TestProbNot:
+    def test_complement(self):
+        """NOT 0.8 = 0.2."""
+        result = prob_not(0.8)
+        assert result == pytest.approx(0.2)
+
+    def test_half(self):
+        """NOT 0.5 = 0.5 (uncertainty is self-complementary)."""
+        result = prob_not(0.5)
+        assert result == pytest.approx(0.5)
+
+    def test_near_zero(self):
+        """NOT of near-zero -> near-one."""
+        result = prob_not(0.01)
+        assert result == pytest.approx(0.99)
+
+    def test_near_one(self):
+        """NOT of near-one -> near-zero."""
+        result = prob_not(0.99)
+        assert result == pytest.approx(0.01)
+
+    def test_involution(self):
+        """NOT(NOT(p)) = p (double negation)."""
+        for p in [0.1, 0.3, 0.5, 0.7, 0.9]:
+            assert prob_not(prob_not(p)) == pytest.approx(p, abs=1e-9)
+
+    def test_bounds(self):
+        """Output is always in (0, 1) with clamping."""
+        for p in [0.0, 0.5, 1.0]:
+            result = prob_not(p)
+            assert 0 < result < 1, f"Out of bounds for p={p}: {result}"
+
+    def test_array_input(self):
+        probs = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+        result = prob_not(probs)
+        assert result.shape == (5,)
+        np.testing.assert_allclose(result, [0.9, 0.7, 0.5, 0.3, 0.1])
+
+    def test_log_odds_negation(self):
+        """logit(NOT p) = -logit(p)."""
+        from bayesian_bm25.probability import logit
+
+        for p in [0.2, 0.4, 0.6, 0.8]:
+            assert logit(prob_not(p)) == pytest.approx(-logit(p), abs=1e-9)
+
+    def test_de_morgan_and(self):
+        """De Morgan: NOT(A AND B) = OR(NOT A, NOT B)."""
+        a, b = 0.7, 0.8
+        lhs = prob_not(prob_and(np.array([a, b])))
+        rhs = prob_or(np.array([prob_not(a), prob_not(b)]))
+        assert lhs == pytest.approx(rhs, abs=1e-9)
+
+    def test_de_morgan_or(self):
+        """De Morgan: NOT(A OR B) = AND(NOT A, NOT B)."""
+        a, b = 0.7, 0.8
+        lhs = prob_not(prob_or(np.array([a, b])))
+        rhs = prob_and(np.array([prob_not(a), prob_not(b)]))
+        assert lhs == pytest.approx(rhs, abs=1e-9)
 
 
 class TestProbAnd:
