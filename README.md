@@ -18,6 +18,7 @@ Key capabilities:
 - **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
 - **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
 - **Calibration metrics** — `expected_calibration_error()`, `brier_score()`, and `reliability_diagram()` for evaluating probability quality
+- **Fusion debugger** — `FusionDebugger` records every intermediate value through the full pipeline (likelihood, prior, posterior, fusion) for transparent inspection, document comparison, and crossover detection; supports hierarchical fusion tracing with AND/OR/NOT composition
 - **Search integration** — drop-in scorer wrapping [bm25s](https://github.com/xhluca/bm25s) that returns probabilities instead of raw scores
 
 ## Adoption
@@ -143,6 +144,38 @@ bm25_upper_bound = 5.0
 # Bayesian upper bound for safe pruning -- any document's actual
 # probability is guaranteed to be at most this value
 bayesian_bound = transform.wand_upper_bound(bm25_upper_bound)
+```
+
+### Debugging the Fusion Pipeline
+
+```python
+from bayesian_bm25 import BayesianProbabilityTransform
+from bayesian_bm25.debug import FusionDebugger
+
+transform = BayesianProbabilityTransform(alpha=0.45, beta=6.10, base_rate=0.02)
+debugger = FusionDebugger(transform)
+
+# Trace a single document through the full pipeline
+trace = debugger.trace_document(
+    bm25_score=8.42, tf=5, doc_len_ratio=0.60,
+    cosine_score=0.74, doc_id="doc-42",
+)
+print(debugger.format_trace(trace))
+
+# Compare two documents to see which signal drove the rank difference
+trace_a = debugger.trace_document(bm25_score=8.42, tf=5, doc_len_ratio=0.60, cosine_score=0.74)
+trace_b = debugger.trace_document(bm25_score=5.10, tf=2, doc_len_ratio=1.20, cosine_score=0.88)
+comparison = debugger.compare(trace_a, trace_b)
+print(debugger.format_comparison(comparison))
+
+# Hierarchical fusion: AND(OR(title, body), vector, NOT(spam))
+step1 = debugger.trace_fusion([0.85, 0.70], names=["title", "body"], method="prob_or")
+step2 = debugger.trace_not(0.90, name="spam")
+step3 = debugger.trace_fusion(
+    [step1.fused_probability, 0.80, step2.complement],
+    names=["OR(title,body)", "vector", "NOT(spam)"],
+    method="prob_and",
+)
 ```
 
 ### Evaluating Calibration Quality

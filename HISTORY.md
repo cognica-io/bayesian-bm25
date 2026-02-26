@@ -1,5 +1,43 @@
 # History
 
+## 0.5.0 (2026-02-26)
+
+- Add `FusionDebugger` for transparent pipeline inspection (`bayesian_bm25.debug`)
+  - Records every intermediate value through the full probability pipeline
+    (likelihood, prior, posterior, fusion) so you can trace *why* a document
+    received a particular fused score
+  - `trace_bm25()`: trace a single BM25 score through sigmoid likelihood,
+    composite prior, and Bayesian posterior, capturing logit-space intermediates
+  - `trace_vector()`: trace cosine similarity through probability conversion
+  - `trace_fusion()`: trace the combination of multiple probability signals
+    with method-specific intermediates for `log_odds`, `prob_and`, `prob_or`,
+    and `prob_not`
+  - `trace_document()`: full pipeline trace composing BM25 + vector + fusion
+    into a single `DocumentTrace` with all intermediate values
+  - `trace_not()`: trace probabilistic negation (complement) of a single signal
+  - `compare()`: compare two `DocumentTrace` objects to explain rank differences,
+    identifying the dominant signal and crossover stages where signals disagree
+  - `format_trace()`, `format_summary()`, `format_comparison()`: human-readable
+    output for traces, one-line summaries, and side-by-side comparisons
+- Support all four fusion methods as `method` parameter in `trace_document()`
+  and `trace_fusion()`: `"log_odds"`, `"prob_and"`, `"prob_or"`, `"prob_not"`
+  - `prob_and`: records `log_probs` and `log_prob_sum` intermediates
+  - `prob_or`: records `complements`, `log_complements`, and
+    `log_complement_sum` intermediates
+  - `prob_not`: computes `prod(1 - p_i)` -- the probability that NONE of the
+    signals indicate relevance (complement of `prob_or`)
+- Support hierarchical (nested) fusion
+  - `trace_fusion()` returns a `FusionTrace` whose `fused_probability` can be
+    fed directly into the next `trace_fusion()` call, enabling arbitrary
+    composition trees such as `AND(OR(title, body), vector, NOT(spam))`
+- Support weighted log-odds fusion in `trace_document()` via `weights` parameter
+- Add `FusionDebugger` as lazy import in `bayesian_bm25.__init__`
+- Add fusion debugger example (`examples/fusion_debugger.py`)
+  - 12 examples covering single signal trace, full document trace, batch
+    summaries, document comparison, crossover detection, prob_and/or/not
+    tracing, hierarchical fusion, all-methods comparison, weighted fusion,
+    and base_rate effect demonstration
+
 ## 0.4.1 (2026-02-25)
 
 - Add `prob_not()` for probabilistic negation (complement rule)

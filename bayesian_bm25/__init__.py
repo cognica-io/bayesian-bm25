@@ -39,9 +39,12 @@ __all__ = [
     "reliability_diagram",
 ]
 
-# Lazy import for scorer (requires optional bm25s dependency)
+# Lazy imports for optional modules
 def __getattr__(name: str):
     if name == "BayesianBM25Scorer":
         from bayesian_bm25.scorer import BayesianBM25Scorer
         return BayesianBM25Scorer
+    if name == "FusionDebugger":
+        from bayesian_bm25.debug import FusionDebugger
+        return FusionDebugger
     raise AttributeError(f"module 'bayesian_bm25' has no attribute {name!r}")
