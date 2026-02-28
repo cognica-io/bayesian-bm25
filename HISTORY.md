@@ -1,5 +1,30 @@
 # History
 
+## 0.6.0 (2026-02-28)
+
+- Add `balanced_log_odds_fusion()` for hybrid sparse-dense retrieval
+  - Converts both Bayesian BM25 probabilities and dense cosine similarities
+    to logit space, min-max normalizes each to equalize voting power, and
+    combines with configurable weights
+  - Prevents heavy-tailed sparse logits (from sigmoid unwrapping) from
+    drowning the dense signal while preserving the Bayesian BM25 framework's
+    document-length and term-frequency priors
+  - Accepts `weight` parameter for asymmetric signal weighting (default 0.5)
+  - Composes existing library functions (`logit`, `cosine_to_probability`,
+    `_clamp_probability`) rather than reimplementing inline
+- Add BEIR hybrid search benchmark (`benchmarks/hybrid_beir.py`)
+  - Retrieve-then-evaluate protocol (top-1000 per signal, union candidates,
+    pytrec_eval) on 5 BEIR datasets: ArguAna, FiQA, NFCorpus, SciDocs, SciFact
+  - 9 fusion methods compared: BM25, Dense, Convex, RRF, Bayesian-OR,
+    Bayesian-LogOdds, LO-Local, Bayesian-LO-BR, Bayesian-Balanced
+  - Bayesian-Balanced achieves highest average NDCG@10 (41.36%), beating
+    Convex (41.15%), RRF (40.48%), and BM25 (35.38%)
+  - Also leads in MAP@10 (30.23%) and Recall@10 (49.92%)
+  - Tokenization uses bm25s.tokenize with Snowball English stemmer + stop word
+    removal, matching the BEIR official BM25 baseline (Lucene EnglishAnalyzer)
+  - Embedding cache (.npz) to skip re-encoding across runs
+- Add BEIR hybrid search results to README
+
 ## 0.5.0 (2026-02-26)
 
 - Add `FusionDebugger` for transparent pipeline inspection (`bayesian_bm25.debug`)
@@ -24,7 +49,7 @@
   - `prob_and`: records `log_probs` and `log_prob_sum` intermediates
   - `prob_or`: records `complements`, `log_complements`, and
     `log_complement_sum` intermediates
-  - `prob_not`: computes `prod(1 - p_i)` -- the probability that NONE of the
+  - `prob_not`: computes `prod(1 - p_i)` — the probability that NONE of the
     signals indicate relevance (complement of `prob_or`)
 - Support hierarchical (nested) fusion
   - `trace_fusion()` returns a `FusionTrace` whose `fused_probability` can be
@@ -75,7 +100,7 @@
     direction for overestimating signals
   - Theorem 5.3.1: equal-quality signals maintain approximately uniform weights
 - Add learnable weights benchmark (`benchmarks/learnable_weights.py`)
-  - Weight recovery accuracy across 2--5 signals with varying noise
+  - Weight recovery accuracy across 2–5 signals with varying noise
   - Fusion quality comparison: uniform vs oracle vs learned weights (BCE, MSE,
     Spearman)
   - Online convergence tracking: `update()` vs `fit()` target

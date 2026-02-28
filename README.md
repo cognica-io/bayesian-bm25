@@ -11,7 +11,7 @@ Standard BM25 produces unbounded scores that lack consistent meaning across quer
 Key capabilities:
 
 - **Score-to-probability transform** — convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
-- **Base rate calibration** — corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68--77% without relevance labels
+- **Base rate calibration** — corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68–77% without relevance labels
 - **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
 - **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling and optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
 - **Learnable fusion weights** — `LearnableLogOddsWeights` learns per-signal reliability from labeled data via a Hebbian gradient that is backprop-free, starting from Naive Bayes uniform initialization (Remark 5.3.2)
@@ -141,7 +141,7 @@ transform = BayesianProbabilityTransform(alpha=1.5, beta=2.0, base_rate=0.01)
 # Standard BM25 upper bound per query term
 bm25_upper_bound = 5.0
 
-# Bayesian upper bound for safe pruning -- any document's actual
+# Bayesian upper bound for safe pruning — any document's actual
 # probability is guaranteed to be at most this value
 bayesian_bound = transform.wand_upper_bound(bm25_upper_bound)
 ```
@@ -230,9 +230,42 @@ transform.fit(scores, labels, mode="prior_free")
 
 ## Benchmarks
 
+### BEIR Hybrid Search
+
+Evaluated on 5 [BEIR](https://github.com/beir-cellar/beir) datasets using the retrieve-then-evaluate protocol (top-1000 per signal, union candidates, pytrec_eval). Dense encoder: all-MiniLM-L6-v2. BM25: k1=1.2, b=0.75, Lucene variant with Snowball English stemmer. All methods are unsupervised (no relevance labels).
+
+#### NDCG@10
+
+| Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | Average |
+|---|---|---|---|---|---|---|
+| BM25 | 36.16 | 25.32 | 31.85 | 15.65 | 67.91 | 35.38 |
+| Dense | 36.98 | 36.87 | 31.59 | 21.64 | 64.51 | 38.32 |
+| Convex | 40.03 | 37.10 | 35.61 | 19.65 | 73.38 | 41.15 |
+| RRF | 39.61 | 36.85 | 34.43 | 20.09 | 71.43 | 40.48 |
+| **Bayesian-Balanced** | **37.28** | **40.57** | **35.63** | **21.55** | **71.75** | **41.36** |
+| LO-Local | 39.63 | 37.20 | 34.10 | 19.50 | 73.81 | 40.85 |
+| Bayesian-LogOdds | 37.17 | 33.12 | 35.25 | 18.52 | 72.25 | 39.26 |
+
+#### Delta vs BM25 (NDCG@10)
+
+| Method | Delta |
+|---|---|
+| **Bayesian-Balanced** | **+5.98** |
+| Convex | +5.78 |
+| LO-Local | +5.47 |
+| RRF | +5.10 |
+| Bayesian-LogOdds | +3.88 |
+| Dense | +2.94 |
+
+Bayesian-Balanced (`balanced_log_odds_fusion`) converts both BM25 probabilities and dense cosine similarities to logit space, min-max normalizes each to equalize voting power, and combines with equal weights. This prevents the heavy-tailed sparse logits from drowning the dense signal while preserving the Bayesian BM25 framework's document-length and term-frequency priors.
+
+Reproduce with `python benchmarks/hybrid_beir.py -d <beir-data-dir>` (requires `pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5 PyStemmer`).
+
+### Sparse Retrieval
+
 Evaluated on [BEIR](https://github.com/beir-cellar/beir) datasets (NFCorpus, SciFact) with k1=1.2, b=0.75, Lucene BM25. Queries are split 50/50 for training and evaluation. "Batch fit" uses gradient descent on training labels; all other Bayesian methods are unsupervised.
 
-### Ranking Quality
+#### Ranking Quality
 
 Base rate prior is a monotonic transform — it does not change document ordering.
 
@@ -248,7 +281,7 @@ Base rate prior is a monotonic transform — it does not change document orderin
 | Batch fit (prior-aware, C2) | 0.5066 | 0.4424 | 0.5776 | 0.5236 |
 | Batch fit (prior-free, C3) | 0.5023 | 0.4395 | 0.5880 | 0.5389 |
 
-### Probability Calibration
+#### Probability Calibration
 
 Expected Calibration Error (ECE) and Brier score. Lower is better.
 
@@ -264,7 +297,7 @@ Expected Calibration Error (ECE) and Brier score. Lower is better.
 | Batch fit (prior-aware, C2) | 0.0892 (-86.3%) | 0.0439 | 0.1427 (-82.1%) | 0.0802 |
 | Batch fit (prior-free, C3) | 0.0029 (-99.6%) | 0.0099 | 0.0058 (-99.3%) | 0.0030 |
 
-### Threshold Transfer
+#### Threshold Transfer
 
 F1 scores using the best threshold found on training queries, applied to evaluation queries. Smaller gap indicates better generalization.
 

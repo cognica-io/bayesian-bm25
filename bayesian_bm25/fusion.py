@@ -178,6 +178,62 @@ def log_odds_conjunction(
     return float(result) if np.ndim(result) == 0 else result
 
 
+def balanced_log_odds_fusion(
+    sparse_probs: np.ndarray,
+    dense_similarities: np.ndarray,
+    weight: float = 0.5,
+) -> np.ndarray | float:
+    """Balanced log-odds fusion for hybrid sparse-dense retrieval.
+
+    Combines Bayesian BM25 probabilities with dense cosine similarities
+    by normalizing both signals in logit space.  Min-max normalization
+    ensures each signal contributes equally, preventing the heavy-tailed
+    sparse logits (from sigmoid unwrapping) from drowning the dense signal.
+
+    Pipeline:
+      1. sparse_probs -> logit(p_sparse)
+      2. dense_similarities -> cosine_to_probability -> logit(p_dense)
+      3. Min-max normalize each logit array to [0, 1]
+      4. Return weight * logit_dense_norm + (1 - weight) * logit_sparse_norm
+
+    Parameters
+    ----------
+    sparse_probs : array
+        Bayesian BM25 probabilities in (0, 1), e.g. from
+        ``BayesianBM25Scorer.get_probabilities()``.
+    dense_similarities : array
+        Cosine similarities in [-1, 1] from a dense encoder.
+    weight : float
+        Weight for the dense signal (default 0.5 for equal weighting).
+        The sparse weight is ``1 - weight``.
+
+    Returns
+    -------
+    Fusion scores (not probabilities).  Higher is more relevant.
+    """
+    sparse_probs = np.asarray(sparse_probs, dtype=np.float64)
+    dense_similarities = np.asarray(dense_similarities, dtype=np.float64)
+
+    logit_sparse = logit(_clamp_probability(sparse_probs))
+    logit_dense = logit(cosine_to_probability(dense_similarities))
+
+    logit_sparse_norm = _min_max_normalize(logit_sparse)
+    logit_dense_norm = _min_max_normalize(logit_dense)
+
+    result = weight * logit_dense_norm + (1.0 - weight) * logit_sparse_norm
+    return float(result) if np.ndim(result) == 0 else result
+
+
+def _min_max_normalize(arr: np.ndarray) -> np.ndarray:
+    """Min-max normalize to [0, 1].  Returns zeros if range is negligible."""
+    arr = np.asarray(arr, dtype=np.float64)
+    lo = float(arr.min())
+    hi = float(arr.max())
+    if hi - lo < 1e-12:
+        return np.zeros_like(arr)
+    return (arr - lo) / (hi - lo)
+
+
 class LearnableLogOddsWeights:
     """Learnable per-signal reliability weights for log-odds conjunction (Remark 5.3.2).
 
