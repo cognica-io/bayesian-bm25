@@ -229,7 +229,7 @@ def fusion_bayesian_bm25_logodds(
     dense_median: float,
     dense_alpha: float,
 ) -> np.ndarray:
-    """Per-query calibrated log-odds fusion (REPORT.md Section 2).
+    """Per-query calibrated log-odds fusion.
 
     Documents with only one signal active use single-signal logit
     (not penalized for missing the other).
