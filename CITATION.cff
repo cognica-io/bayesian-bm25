@@ -3,7 +3,7 @@ title: "Bayesian BM25"
 message: "If you use this software, please cite the following papers."
 type: software
 version: 0.6.0
-date-released: "2026-02-28"
+date-released: "2026-03-02"
 license: Apache-2.0
 repository-code: "https://github.com/cognica-io/bayesian-bm25"
 authors:

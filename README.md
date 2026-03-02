@@ -232,9 +232,11 @@ transform.fit(scores, labels, mode="prior_free")
 
 ### BEIR Hybrid Search
 
-Evaluated on 5 [BEIR](https://github.com/beir-cellar/beir) datasets using the retrieve-then-evaluate protocol (top-1000 per signal, union candidates, pytrec_eval). Dense encoder: all-MiniLM-L6-v2. BM25: k1=1.2, b=0.75, Lucene variant with Snowball English stemmer. All methods are unsupervised (no relevance labels).
+Evaluated on 5 [BEIR](https://github.com/beir-cellar/beir) datasets using the retrieve-then-evaluate protocol (top-1000 per signal, union candidates, pytrec_eval). Dense encoder: all-MiniLM-L6-v2. BM25: k1=1.2, b=0.75, Lucene variant with Snowball English stemmer.
 
-#### NDCG@10
+#### NDCG@10 -- Zero-shot
+
+No relevance labels required. All parameters are fixed or auto-estimated from corpus statistics.
 
 | Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | Average |
 |---|---|---|---|---|---|---|
@@ -243,23 +245,55 @@ Evaluated on 5 [BEIR](https://github.com/beir-cellar/beir) datasets using the re
 | Convex | 40.03 | 37.10 | 35.61 | 19.65 | 73.38 | 41.15 |
 | RRF | 39.61 | 36.85 | 34.43 | 20.09 | 71.43 | 40.48 |
 | **Bayesian-Balanced** | **37.28** | **40.57** | **35.63** | **21.55** | **71.75** | **41.36** |
-| LO-Local | 39.63 | 37.20 | 34.10 | 19.50 | 73.81 | 40.85 |
+| LogOdds-Symmetric | 39.63 | 37.20 | 34.10 | 19.50 | 73.81 | 40.85 |
 | Bayesian-LogOdds | 37.17 | 33.12 | 35.25 | 18.52 | 72.25 | 39.26 |
+
+#### NDCG@10 -- Trained
+
+Uses train qrels (FiQA, NFCorpus, SciFact) or test qrels (ArguAna, SciDocs) for supervised parameter learning and grid search over base_rate, fusion_weight, and hybrid_alpha.
+
+| Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | Average |
+|---|---|---|---|---|---|---|
+| **Balanced-Tuned** | **37.29** | **40.49** | **35.65** | **22.03** | **72.70** | **41.63** |
+| Hybrid-AND-Tuned | 37.13 | 28.37 | 34.44 | 16.82 | 69.34 | 37.22 |
+| Bayesian-Tuned | 0.79 | 24.76 | 32.11 | 15.68 | 67.67 | 28.20 |
 
 #### Delta vs BM25 (NDCG@10)
 
-| Method | Delta |
+| Method | Type | Delta |
+|---|---|---|
+| **Balanced-Tuned** | **trained** | **+6.26** |
+| Bayesian-Balanced | zero-shot | +5.98 |
+| Convex | zero-shot | +5.78 |
+| LogOdds-Symmetric | zero-shot | +5.47 |
+| RRF | zero-shot | +5.10 |
+| Bayesian-LogOdds | zero-shot | +3.88 |
+| Dense | zero-shot | +2.94 |
+| Hybrid-AND-Tuned | trained | +1.84 |
+
+**Method descriptions:**
+
+| Method | Description |
 |---|---|
-| **Bayesian-Balanced** | **+5.98** |
-| Convex | +5.78 |
-| LO-Local | +5.47 |
-| RRF | +5.10 |
-| Bayesian-LogOdds | +3.88 |
-| Dense | +2.94 |
+| Convex | `w * dense + (1-w) * sparse` with grid-searched weight |
+| RRF | Reciprocal Rank Fusion (k=60) |
+| **Bayesian-Balanced** | Bayesian BM25 probs and dense sims to logit space, min-max normalize each, combine with equal weights |
+| LogOdds-Symmetric | Both raw BM25 and dense calibrated symmetrically via `logit = alpha * (score - median)`, then weighted sum |
+| Bayesian-LogOdds | Bayesian BM25 probs to logit, dense calibrated via `logit = alpha * (sim - median)`, then combined |
+| Balanced-Tuned | Bayesian-Balanced + supervised `BayesianProbabilityTransform.fit()` + grid search over base_rate and fusion_weight |
+| Hybrid-AND-Tuned | `log_odds_conjunction` of Bayesian BM25 and dense probs with tuned alpha |
+| Bayesian-Tuned | Sparse-only Bayesian BM25 with tuned alpha, beta, and base_rate (no dense signal) |
 
-Bayesian-Balanced (`balanced_log_odds_fusion`) converts both BM25 probabilities and dense cosine similarities to logit space, min-max normalizes each to equalize voting power, and combines with equal weights. This prevents the heavy-tailed sparse logits from drowning the dense signal while preserving the Bayesian BM25 framework's document-length and term-frequency priors.
+Reproduce:
+```bash
+# Zero-shot only
+python benchmarks/hybrid_beir.py -d <beir-data-dir>
 
-Reproduce with `python benchmarks/hybrid_beir.py -d <beir-data-dir>` (requires `pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5 PyStemmer`).
+# With tuning (auto-estimation + supervised learning + grid search)
+python benchmarks/hybrid_beir.py -d <beir-data-dir> --tune
+```
+
+Requires `pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5 PyStemmer`.
 
 ### Sparse Retrieval
 
