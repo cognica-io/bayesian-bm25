@@ -23,14 +23,12 @@ Requires: pip install ir_datasets
 
 from __future__ import annotations
 
-import sys
-from dataclasses import dataclass
+import argparse
+import json
+from datetime import datetime, timezone
 
 import bm25s
-import ir_datasets
 import numpy as np
-
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from bayesian_bm25.probability import sigmoid
 from bayesian_bm25.scorer import BayesianBM25Scorer
@@ -43,79 +41,12 @@ from benchmarks.metrics import (
     precision_at_k,
     reliability_diagram,
 )
-
-
-# ---------------------------------------------------------------------------
-# Dataset loading (reused from benchmark.py)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class IRDataset:
-    name: str
-    corpus_tokens: list[list[str]]
-    doc_ids: list[str]
-    queries: list[tuple[str, list[str]]]
-    qrels: dict[str, dict[str, int]]
-
-
-def load_beir_dataset(dataset_name: str, split: str = "test") -> IRDataset:
-    """Load a BEIR dataset via ir_datasets."""
-    ds_id = f"beir/{dataset_name}/{split}"
-    print(f"  Loading {ds_id}...")
-    ds = ir_datasets.load(ds_id)
-
-    doc_id_list = []
-    corpus_tokens = []
-    for doc in ds.docs_iter():
-        doc_id_list.append(doc.doc_id)
-        text = doc.text
-        if hasattr(doc, "title") and doc.title:
-            text = doc.title + " " + text
-        corpus_tokens.append(text.lower().split())
-
-    queries = []
-    for q in ds.queries_iter():
-        queries.append((q.query_id, q.text.lower().split()))
-
-    qrels: dict[str, dict[str, int]] = {}
-    for qrel in ds.qrels_iter():
-        if qrel.query_id not in qrels:
-            qrels[qrel.query_id] = {}
-        qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
-
-    queries = [(qid, qtokens) for qid, qtokens in queries if qid in qrels]
-
-    print(f"    {len(corpus_tokens)} docs, {len(queries)} queries, "
-          f"{sum(len(v) for v in qrels.values())} qrels")
-
-    return IRDataset(
-        name=dataset_name,
-        corpus_tokens=corpus_tokens,
-        doc_ids=doc_id_list,
-        queries=queries,
-        qrels=qrels,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Evaluation helpers
-# ---------------------------------------------------------------------------
-
-def get_relevance_vector(
-    ranked_doc_ids: list[str],
-    qrel: dict[str, int],
-    binary_threshold: int = 1,
-) -> np.ndarray:
-    return np.array([
-        float(qrel.get(did, 0) >= binary_threshold) for did in ranked_doc_ids
-    ])
-
-
-def get_graded_relevance_vector(
-    ranked_doc_ids: list[str],
-    qrel: dict[str, int],
-) -> np.ndarray:
-    return np.array([float(qrel.get(did, 0)) for did in ranked_doc_ids])
+from benchmarks.utils import (
+    IRDataset,
+    get_graded_relevance_vector,
+    get_relevance_vector,
+    load_beir_dataset,
+)
 
 
 def evaluate_bm25_raw(
@@ -291,7 +222,7 @@ def evaluate_threshold_transfer(
 # Main benchmark
 # ---------------------------------------------------------------------------
 
-def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> None:
+def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
     """Compare base rate prior configurations on a single dataset."""
     print(f"\n{'=' * 78}")
     print(f"Dataset: {dataset.name.upper()}")
@@ -648,8 +579,21 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> None:
             err = abs(avg_pred - avg_actual)
             print(f"    {avg_pred:>8.3f}  {avg_pred:>10.4f}  {avg_actual:>10.4f}  {count:>8}  {err:>8.4f}")
 
+    return {
+        name: r for name, r in results
+    }
+
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Base rate prior comparison benchmark"
+    )
+    parser.add_argument(
+        "-o", "--output", type=str, default=None,
+        help="Path to write JSON results",
+    )
+    args = parser.parse_args()
+
     print("=" * 78)
     print("Base Rate Prior Comparison Benchmark")
     print("=" * 78)
@@ -659,10 +603,21 @@ def main() -> None:
         ("scifact", "test"),
     ]
 
+    all_results = {}
     for ds_name, split in datasets_to_run:
         print(f"\nLoading {ds_name}...")
         dataset = load_beir_dataset(ds_name, split)
-        run_base_rate_comparison(dataset, k=10)
+        all_results[ds_name] = run_base_rate_comparison(dataset, k=10)
+
+    if args.output:
+        output = {
+            "benchmark": "base_rate",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "results": all_results,
+        }
+        with open(args.output, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"\nResults written to {args.output}")
 
 
 if __name__ == "__main__":

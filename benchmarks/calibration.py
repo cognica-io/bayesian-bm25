@@ -16,13 +16,12 @@ Requires: pip install ir_datasets
 
 from __future__ import annotations
 
-import sys
+import argparse
+import json
+from datetime import datetime, timezone
 
 import bm25s
-import ir_datasets
 import numpy as np
-
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from bayesian_bm25.probability import BayesianProbabilityTransform, sigmoid
 from bayesian_bm25.scorer import BayesianBM25Scorer
@@ -31,36 +30,7 @@ from benchmarks.metrics import (
     expected_calibration_error,
     reliability_diagram,
 )
-
-
-# ---------------------------------------------------------------------------
-# Dataset loading
-# ---------------------------------------------------------------------------
-
-
-def load_dataset(name: str, split: str = "test"):
-    """Load a BEIR dataset and return components."""
-    ds = ir_datasets.load(f"beir/{name}/{split}")
-
-    doc_ids = []
-    corpus_tokens = []
-    for doc in ds.docs_iter():
-        doc_ids.append(doc.doc_id)
-        text = doc.text
-        if hasattr(doc, "title") and doc.title:
-            text = doc.title + " " + text
-        corpus_tokens.append(text.lower().split())
-
-    queries = []
-    for q in ds.queries_iter():
-        queries.append((q.query_id, q.text.lower().split()))
-
-    qrels: dict[str, dict[str, int]] = {}
-    for qrel in ds.qrels_iter():
-        qrels.setdefault(qrel.query_id, {})[qrel.doc_id] = qrel.relevance
-
-    queries = [(qid, qt) for qid, qt in queries if qid in qrels]
-    return corpus_tokens, doc_ids, queries, qrels
+from benchmarks.utils import load_beir_dataset
 
 
 # ---------------------------------------------------------------------------
@@ -211,16 +181,19 @@ def threshold_f1(values, labels, t):
 # ---------------------------------------------------------------------------
 
 
-def run_verification(dataset_name: str) -> None:
+def run_verification(dataset_name: str) -> dict:
     print(f"\n{'=' * 72}")
     print(f"Calibration Verification: {dataset_name.upper()}")
     print(f"{'=' * 72}")
 
     # Load
     print(f"\nLoading {dataset_name}...")
-    corpus_tokens, doc_ids, queries, qrels = load_dataset(dataset_name)
+    ds = load_beir_dataset(dataset_name)
+    corpus_tokens = ds.corpus_tokens
+    doc_ids = ds.doc_ids
+    queries = ds.queries
+    qrels = ds.qrels
     qid_to_tokens = {qid: qt for qid, qt in queries}
-    print(f"  {len(corpus_tokens)} docs, {len(queries)} queries")
 
     # Split train/test
     rng = np.random.default_rng(42)
@@ -438,15 +411,46 @@ def run_verification(dataset_name: str) -> None:
     print(f"    Thr.Gap: lower = threshold generalizes across queries")
     print(f"    Brier reference (no discrimination): {constant_brier:.4f}")
 
+    return {
+        "Bayesian (auto)": {"ECE": bayesian_ece, "Brier": bayesian_brier},
+        "Bayesian (auto+br)": {"ECE": br_ece, "Brier": br_brier},
+        "Bayesian (fit)": {"ECE": fit_ece, "Brier": fit_brier},
+        "Min-max norm": {"ECE": minmax_ece, "Brier": minmax_brier},
+        "Platt scaling": {"ECE": platt_ece, "Brier": platt_brier},
+        "baselines": {
+            "constant_brier": constant_brier,
+        },
+    }
+
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Calibration verification benchmark"
+    )
+    parser.add_argument(
+        "-o", "--output", type=str, default=None,
+        help="Path to write JSON results",
+    )
+    args = parser.parse_args()
+
     print("=" * 72)
     print("Bayesian BM25 -- Calibration Verification")
     print("=" * 72)
     print("Are the probabilities meaningful?")
 
+    all_results = {}
     for ds_name in ["nfcorpus", "scifact"]:
-        run_verification(ds_name)
+        all_results[ds_name] = run_verification(ds_name)
+
+    if args.output:
+        output = {
+            "benchmark": "calibration",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "results": all_results,
+        }
+        with open(args.output, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"\nResults written to {args.output}")
 
 
 if __name__ == "__main__":

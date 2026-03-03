@@ -17,11 +17,11 @@ show when weighted fusion outperforms uniform fusion.
 
 from __future__ import annotations
 
-import sys
+import argparse
+import json
+from datetime import datetime, timezone
 
 import numpy as np
-
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from bayesian_bm25.fusion import (
     cosine_to_probability,
@@ -77,14 +77,14 @@ def evaluate_fusion(
     return {"MSE": mse, "Spearman": spearman}
 
 
-def run_weighted_fusion_benchmark() -> None:
+def run_weighted_fusion_benchmark(rng: np.random.Generator) -> dict:
     """Compare weighted vs uniform fusion across noise scenarios."""
     print("=" * 72)
     print("Weighted Log-Odds Fusion Benchmark")
     print("=" * 72)
 
-    rng = np.random.default_rng(42)
     n_docs = 1000
+    scenario_results = []
 
     # Scenarios: (bm25_noise, vector_noise, description)
     scenarios = [
@@ -136,16 +136,23 @@ def run_weighted_fusion_benchmark() -> None:
                 f"  {scenario_label:<{col_w}}  {method:<20}  "
                 f"{r['MSE']:>8.4f}  {r['Spearman']:>8.4f}"
             )
+        scenario_results.append({
+            "scenario": desc,
+            "naive_and": r_and,
+            "uniform_log_odds": r_uniform,
+            "weighted_log_odds": r_weighted,
+            "weights": weights.tolist(),
+        })
         print()
 
+    return {"scenarios": scenario_results}
 
-def run_cosine_pipeline_demo() -> None:
+
+def run_cosine_pipeline_demo(rng: np.random.Generator) -> dict:
     """Demonstrate the hybrid search pipeline using cosine_to_probability."""
     print("=" * 72)
     print("Hybrid Search Pipeline: cosine_to_probability + log_odds_conjunction")
     print("=" * 72)
-
-    rng = np.random.default_rng(42)
 
     # Simulate a query result set
     n_results = 20
@@ -179,11 +186,70 @@ def run_cosine_pipeline_demo() -> None:
     print(f"  cosine_to_probability maps [-1,1] -> (0,1) via P = (1+cos)/2")
     print(f"  log_odds_conjunction fuses in log-odds space with reliability weights")
 
+    return {
+        "n_results": n_results,
+        "weights": weights.tolist(),
+    }
+
 
 def main() -> None:
-    run_weighted_fusion_benchmark()
-    print()
-    run_cosine_pipeline_demo()
+    parser = argparse.ArgumentParser(
+        description="Weighted log-odds fusion benchmark"
+    )
+    parser.add_argument(
+        "-o", "--output", type=str, default=None,
+        help="Path to write JSON results",
+    )
+    parser.add_argument(
+        "--seeds", type=int, default=1,
+        help="Number of random seeds for statistical reporting",
+    )
+    args = parser.parse_args()
+
+    all_seed_results = []
+    for seed_idx in range(args.seeds):
+        seed = 42 + seed_idx
+        if args.seeds > 1:
+            print(f"\n{'#' * 72}")
+            print(f"# Seed {seed} ({seed_idx + 1}/{args.seeds})")
+            print(f"{'#' * 72}")
+
+        rng = np.random.default_rng(seed)
+
+        weighted_fusion = run_weighted_fusion_benchmark(rng)
+        print()
+        cosine_pipeline = run_cosine_pipeline_demo(rng)
+
+        all_seed_results.append({
+            "seed": seed,
+            "weighted_fusion": weighted_fusion,
+            "cosine_pipeline": cosine_pipeline,
+        })
+
+    if args.seeds > 1:
+        mse_values = []
+        for sr in all_seed_results:
+            for s in sr["weighted_fusion"]["scenarios"]:
+                mse_values.append(s["weighted_log_odds"]["MSE"])
+        mean_mse = float(np.mean(mse_values))
+        std_mse = float(np.std(mse_values))
+        print(f"\n{'=' * 72}")
+        print(f"Aggregate ({args.seeds} seeds):")
+        print(f"  Weighted log-odds MSE: {mean_mse:.4f} +/- {std_mse:.4f}")
+
+    if args.output:
+        results_payload = (
+            all_seed_results[0] if args.seeds == 1 else all_seed_results
+        )
+        output = {
+            "benchmark": "weighted_fusion",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "seeds": args.seeds,
+            "results": results_payload,
+        }
+        with open(args.output, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"\nResults written to {args.output}")
 
 
 if __name__ == "__main__":

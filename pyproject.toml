@@ -28,7 +28,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["bayesian_bm25*"]
+include = ["bayesian_bm25*", "benchmarks*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

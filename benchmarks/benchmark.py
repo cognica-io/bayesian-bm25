@@ -19,14 +19,12 @@ Requires: pip install ir_datasets
 
 from __future__ import annotations
 
-import sys
-from dataclasses import dataclass
+import argparse
+import json
+from datetime import datetime, timezone
 
 import bm25s
-import ir_datasets
 import numpy as np
-
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from bayesian_bm25.probability import BayesianProbabilityTransform, sigmoid
 from bayesian_bm25.scorer import BayesianBM25Scorer
@@ -36,89 +34,13 @@ from benchmarks.metrics import (
     ndcg_at_k,
     precision_at_k,
 )
-
-
-# ---------------------------------------------------------------------------
-# Dataset loading
-# ---------------------------------------------------------------------------
-
-@dataclass
-class IRDataset:
-    name: str
-    corpus_tokens: list[list[str]]
-    doc_ids: list[str]
-    queries: list[tuple[str, list[str]]]   # (query_id, tokens)
-    qrels: dict[str, dict[str, int]]       # query_id -> {doc_id -> relevance}
-
-
-def load_beir_dataset(dataset_name: str, split: str = "test") -> IRDataset:
-    """Load a BEIR dataset via ir_datasets."""
-    ds_id = f"beir/{dataset_name}/{split}"
-    print(f"  Loading {ds_id}...")
-    ds = ir_datasets.load(ds_id)
-
-    # Documents
-    doc_id_list = []
-    corpus_tokens = []
-    for doc in ds.docs_iter():
-        doc_id_list.append(doc.doc_id)
-        text = doc.text
-        if hasattr(doc, "title") and doc.title:
-            text = doc.title + " " + text
-        corpus_tokens.append(text.lower().split())
-
-    # Queries
-    queries = []
-    for q in ds.queries_iter():
-        queries.append((q.query_id, q.text.lower().split()))
-
-    # Relevance judgments
-    qrels: dict[str, dict[str, int]] = {}
-    for qrel in ds.qrels_iter():
-        if qrel.query_id not in qrels:
-            qrels[qrel.query_id] = {}
-        qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
-
-    # Filter queries that have qrels
-    queries = [(qid, qtokens) for qid, qtokens in queries if qid in qrels]
-
-    print(f"    {len(corpus_tokens)} docs, {len(queries)} queries, "
-          f"{sum(len(v) for v in qrels.values())} qrels")
-
-    return IRDataset(
-        name=dataset_name,
-        corpus_tokens=corpus_tokens,
-        doc_ids=doc_id_list,
-        queries=queries,
-        qrels=qrels,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-
-def doc_id_to_idx(doc_ids: list[str]) -> dict[str, int]:
-    return {did: i for i, did in enumerate(doc_ids)}
-
-
-def get_relevance_vector(
-    ranked_doc_ids: list[str],
-    qrel: dict[str, int],
-    binary_threshold: int = 1,
-) -> np.ndarray:
-    """Convert ranked doc IDs to a relevance vector."""
-    return np.array([
-        float(qrel.get(did, 0) >= binary_threshold) for did in ranked_doc_ids
-    ])
-
-
-def get_graded_relevance_vector(
-    ranked_doc_ids: list[str],
-    qrel: dict[str, int],
-) -> np.ndarray:
-    """Convert ranked doc IDs to graded relevance vector."""
-    return np.array([float(qrel.get(did, 0)) for did in ranked_doc_ids])
+from benchmarks.utils import (
+    IRDataset,
+    doc_id_to_idx,
+    get_graded_relevance_vector,
+    get_relevance_vector,
+    load_beir_dataset,
+)
 
 
 def evaluate_bm25_raw(
@@ -307,8 +229,8 @@ def evaluate_threshold_transfer(
 # Main benchmark
 # ---------------------------------------------------------------------------
 
-def run_single_dataset(dataset: IRDataset, k: int = 10) -> None:
-    """Run the full benchmark on one dataset."""
+def run_single_dataset(dataset: IRDataset, k: int = 10) -> dict:
+    """Run the full benchmark on one dataset. Returns result dict."""
     print(f"\n{'=' * 72}")
     print(f"Dataset: {dataset.name.upper()}")
     print(f"{'=' * 72}")
@@ -466,6 +388,25 @@ def run_single_dataset(dataset: IRDataset, k: int = 10) -> None:
           f"{bay_tr_f1 - bay_te_f1:>+8.4f}")
     print(f"  (Smaller gap = threshold generalises better across queries)")
 
+    return {
+        "Raw BM25": raw_results,
+        "Bayesian (auto)": auto_results,
+        "Bayesian (batch fit)": fit_results,
+        "Bayesian (online)": online_results,
+        "threshold_transfer": {
+            "Raw BM25": {
+                "train_f1": bm25_tr_f1,
+                "test_f1": bm25_te_f1,
+                "gap": bm25_tr_f1 - bm25_te_f1,
+            },
+            "Bayesian (online)": {
+                "train_f1": bay_tr_f1,
+                "test_f1": bay_te_f1,
+                "gap": bay_tr_f1 - bay_te_f1,
+            },
+        },
+    }
+
 
 def print_results(results: dict[str, float]) -> None:
     for key, val in results.items():
@@ -473,6 +414,15 @@ def print_results(results: dict[str, float]) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Bayesian BM25 benchmark on standard IR datasets"
+    )
+    parser.add_argument(
+        "-o", "--output", type=str, default=None,
+        help="Path to write JSON results",
+    )
+    args = parser.parse_args()
+
     print("=" * 72)
     print("Bayesian BM25 Benchmark -- Standard IR Datasets")
     print("=" * 72)
@@ -482,10 +432,21 @@ def main() -> None:
         ("scifact", "test"),
     ]
 
+    all_results = {}
     for ds_name, split in datasets_to_run:
         print(f"\nLoading {ds_name}...")
         dataset = load_beir_dataset(ds_name, split)
-        run_single_dataset(dataset, k=10)
+        all_results[ds_name] = run_single_dataset(dataset, k=10)
+
+    if args.output:
+        output = {
+            "benchmark": "bayesian_bm25",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "results": all_results,
+        }
+        with open(args.output, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"\nResults written to {args.output}")
 
 
 if __name__ == "__main__":

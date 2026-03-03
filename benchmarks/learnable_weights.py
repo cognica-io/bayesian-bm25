@@ -17,12 +17,12 @@ Demonstrates:
 
 from __future__ import annotations
 
-import sys
+import argparse
+import json
 import time
+from datetime import datetime, timezone
 
 import numpy as np
-
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from bayesian_bm25.fusion import LearnableLogOddsWeights, log_odds_conjunction
 from bayesian_bm25.probability import logit, sigmoid
@@ -76,11 +76,13 @@ def evaluate_fusion(
     return {"BCE": bce, "MSE": mse, "Spearman": spearman}
 
 
-def run_weight_recovery(rng: np.random.Generator) -> None:
+def run_weight_recovery(rng: np.random.Generator) -> dict:
     """Test whether learned weights converge to oracle weights."""
     print("=" * 72)
     print("Weight Recovery: Learned vs Oracle Weights")
     print("=" * 72)
+
+    recovery_results = []
 
     configs = [
         ([0.5, 2.0], "2 signals: reliable + noisy"),
@@ -111,13 +113,23 @@ def run_weight_recovery(rng: np.random.Generator) -> None:
             f"  {desc:<{col_s}}  {fmt_w(oracle_w):>20}  "
             f"{fmt_w(learned_w):>20}  {l1_error:>8.4f}"
         )
+        recovery_results.append({
+            "scenario": desc,
+            "oracle_weights": oracle_w.tolist(),
+            "learned_weights": learned_w.tolist(),
+            "l1_error": l1_error,
+        })
+
+    return {"scenarios": recovery_results}
 
 
-def run_fusion_quality(rng: np.random.Generator) -> None:
+def run_fusion_quality(rng: np.random.Generator) -> dict:
     """Compare fusion quality across methods and noise scenarios."""
     print("\n" + "=" * 72)
     print("Fusion Quality: Uniform vs Oracle vs Learned Weights")
     print("=" * 72)
+
+    fusion_results = []
 
     scenarios = [
         ([0.5, 2.0], "Signal 0 reliable, 1 noisy"),
@@ -177,10 +189,18 @@ def run_fusion_quality(rng: np.random.Generator) -> None:
                 f"  {scenario_label:<{col_s}}  {method:<16}  "
                 f"{r['BCE']:>7.4f}  {r['MSE']:>7.4f}  {r['Spearman']:>8.4f}"
             )
+        fusion_results.append({
+            "scenario": desc,
+            "uniform": r_uniform,
+            "oracle": r_oracle,
+            "learned": r_learned,
+        })
         print()
 
+    return {"scenarios": fusion_results}
 
-def run_online_convergence(rng: np.random.Generator) -> None:
+
+def run_online_convergence(rng: np.random.Generator) -> dict:
     """Track online weight learning convergence against batch fit."""
     print("=" * 72)
     print("Online Convergence: update() vs fit() Target")
@@ -260,12 +280,20 @@ def run_online_convergence(rng: np.random.Generator) -> None:
     else:
         print(f"  Avg did not converge within {max_epochs} epochs")
 
+    return {
+        "target_weights": target_w.tolist(),
+        "raw_converged_epoch": raw_converged,
+        "avg_converged_epoch": avg_converged,
+    }
 
-def run_timing(rng: np.random.Generator) -> None:
+
+def run_timing(rng: np.random.Generator) -> dict:
     """Measure wall-clock time for fit() and update() at various scales."""
     print("\n" + "=" * 72)
     print("Timing: fit() and update() Performance")
     print("=" * 72)
+
+    timing_results = []
 
     configs = [
         (2, 1000),
@@ -302,16 +330,79 @@ def run_timing(rng: np.random.Generator) -> None:
         print(
             f"  {desc:<{col_c}}  {fit_ms:>10.1f}  {upd_ms:>12.1f}  {speedup:>7.1f}x"
         )
+        timing_results.append({
+            "n_signals": n_sig,
+            "n_docs": n_docs,
+            "fit_ms": fit_ms,
+            "update_ms": upd_ms,
+            "speedup": speedup,
+        })
+
+    return {"configs": timing_results}
 
 
 def main() -> None:
-    rng = np.random.default_rng(42)
+    parser = argparse.ArgumentParser(
+        description="Learnable log-odds weights benchmark"
+    )
+    parser.add_argument(
+        "-o", "--output", type=str, default=None,
+        help="Path to write JSON results",
+    )
+    parser.add_argument(
+        "--seeds", type=int, default=1,
+        help="Number of random seeds for statistical reporting",
+    )
+    args = parser.parse_args()
 
-    run_weight_recovery(rng)
-    print()
-    run_fusion_quality(rng)
-    run_online_convergence(rng)
-    run_timing(rng)
+    all_seed_results = []
+    for seed_idx in range(args.seeds):
+        seed = 42 + seed_idx
+        if args.seeds > 1:
+            print(f"\n{'#' * 72}")
+            print(f"# Seed {seed} ({seed_idx + 1}/{args.seeds})")
+            print(f"{'#' * 72}")
+
+        rng = np.random.default_rng(seed)
+
+        weight_recovery = run_weight_recovery(rng)
+        print()
+        fusion_quality = run_fusion_quality(rng)
+        online_convergence = run_online_convergence(rng)
+        timing = run_timing(rng)
+
+        all_seed_results.append({
+            "seed": seed,
+            "weight_recovery": weight_recovery,
+            "fusion_quality": fusion_quality,
+            "online_convergence": online_convergence,
+            "timing": timing,
+        })
+
+    if args.seeds > 1:
+        l1_errors = []
+        for sr in all_seed_results:
+            for s in sr["weight_recovery"]["scenarios"]:
+                l1_errors.append(s["l1_error"])
+        mean_l1 = float(np.mean(l1_errors))
+        std_l1 = float(np.std(l1_errors))
+        print(f"\n{'=' * 72}")
+        print(f"Aggregate ({args.seeds} seeds):")
+        print(f"  Weight recovery L1 error: {mean_l1:.4f} +/- {std_l1:.4f}")
+
+    if args.output:
+        results_payload = (
+            all_seed_results[0] if args.seeds == 1 else all_seed_results
+        )
+        output = {
+            "benchmark": "learnable_weights",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "seeds": args.seeds,
+            "results": results_payload,
+        }
+        with open(args.output, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"\nResults written to {args.output}")
 
 
 if __name__ == "__main__":

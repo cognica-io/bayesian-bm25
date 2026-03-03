@@ -13,38 +13,17 @@ parameters against the batch fit target.
 
 from __future__ import annotations
 
-import sys
+import argparse
+import json
+from datetime import datetime, timezone
 
 import bm25s
-import ir_datasets
 import numpy as np
-
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from bayesian_bm25.probability import BayesianProbabilityTransform, sigmoid
 from bayesian_bm25.scorer import BayesianBM25Scorer
 from benchmarks.metrics import expected_calibration_error
-
-
-def load_nfcorpus():
-    ds = ir_datasets.load("beir/nfcorpus/test")
-    doc_ids = []
-    corpus_tokens = []
-    for doc in ds.docs_iter():
-        doc_ids.append(doc.doc_id)
-        text = (doc.title + " " + doc.text) if hasattr(doc, "title") and doc.title else doc.text
-        corpus_tokens.append(text.lower().split())
-
-    queries = []
-    for q in ds.queries_iter():
-        queries.append((q.query_id, q.text.lower().split()))
-
-    qrels: dict[str, dict[str, int]] = {}
-    for qrel in ds.qrels_iter():
-        qrels.setdefault(qrel.query_id, {})[qrel.doc_id] = qrel.relevance
-
-    queries = [(qid, qt) for qid, qt in queries if qid in qrels]
-    return corpus_tokens, doc_ids, queries, qrels
+from benchmarks.utils import load_beir_dataset
 
 
 def compute_ece(
@@ -106,7 +85,7 @@ def run_online_experiment(
     corpus_tokens,
     rng,
     max_epochs: int = 30,
-) -> None:
+) -> dict:
     """Run one online learning config, comparing raw vs averaged ECE."""
     print(f"\n{'--' * 30}")
     print(f"Config: {label}")
@@ -175,6 +154,22 @@ def run_online_experiment(
                   f"{transform.averaged_alpha:>8.4f}  {transform.averaged_beta:>8.4f}  "
                   f"{ece_avg:>8.4f}  {ece_avg - batch_ece:>+8.4f}{marker}")
 
+    epochs_data = []
+    for epoch_num in range(1, max_epochs + 1):
+        ece_raw_val = compute_ece(
+            transform.alpha, transform.beta,
+            bm25_model, eval_queries, doc_ids, qrels, corpus_tokens,
+        )
+        ece_avg_val = compute_ece(
+            transform.averaged_alpha, transform.averaged_beta,
+            bm25_model, eval_queries, doc_ids, qrels, corpus_tokens,
+        )
+        epochs_data.append({
+            "epoch": epoch_num,
+            "raw_ece": ece_raw_val,
+            "avg_ece": ece_avg_val,
+        })
+
     print()
     if raw_converged:
         print(f"  Raw converged at epoch {raw_converged} "
@@ -188,15 +183,39 @@ def run_online_experiment(
     else:
         print(f"  Avg did not converge within {max_epochs} epochs")
 
+    return {
+        "label": label,
+        "raw_converged_epoch": raw_converged,
+        "avg_converged_epoch": avg_converged,
+        "epochs": epochs_data,
+    }
+
 
 def main():
-    print("Loading NFCorpus...")
-    corpus_tokens, doc_ids, queries, qrels = load_nfcorpus()
+    parser = argparse.ArgumentParser(
+        description="Online convergence benchmark"
+    )
+    parser.add_argument(
+        "-o", "--output", type=str, default=None,
+        help="Path to write JSON results",
+    )
+    parser.add_argument(
+        "--seeds", type=int, default=1,
+        help="Number of random seeds for statistical reporting",
+    )
+    args = parser.parse_args()
 
-    # Split queries
-    rng = np.random.default_rng(42)
+    print("Loading NFCorpus...")
+    ds = load_beir_dataset("nfcorpus", "test")
+    corpus_tokens = ds.corpus_tokens
+    doc_ids = ds.doc_ids
+    queries = ds.queries
+    qrels = ds.qrels
+
+    # Split queries (deterministic split, seed only affects online training)
+    split_rng = np.random.default_rng(42)
     all_qids = [qid for qid, _ in queries]
-    rng.shuffle(all_qids)
+    split_rng.shuffle(all_qids)
     mid = len(all_qids) // 2
     train_qids = set(all_qids[:mid])
     eval_qids = set(all_qids[mid:])
@@ -244,26 +263,6 @@ def main():
     print(f"Batch fit target: alpha={batch_transform.alpha:.4f}, "
           f"beta={batch_transform.beta:.4f}, ECE={batch_ece:.4f}")
 
-    common_args = dict(
-        train_batches=train_batches,
-        n_samples=n_samples,
-        batch_ece=batch_ece,
-        bm25_model=bm25_model,
-        eval_queries=eval_queries,
-        doc_ids=doc_ids,
-        qrels=qrels,
-        corpus_tokens=corpus_tokens,
-        rng=rng,
-        max_epochs=30,
-    )
-
-    # ================================================================
-    # Warm start with Polyak averaging (the realistic scenario)
-    # ================================================================
-    print(f"\n{'=' * 60}")
-    print("Warm start + Polyak averaging: raw vs averaged ECE")
-    print(f"{'=' * 60}")
-
     configs = [
         ("lr=0.10, tau=1000, avg=0.99",
          auto_alpha, auto_beta, 0.10, 0.9, 1000.0, 1.0, 0.99),
@@ -275,8 +274,47 @@ def main():
          auto_alpha, auto_beta, 1.00, 0.9, 2000.0, 1.0, 0.995),
     ]
 
-    for label, a, b, lr, mom, tau, mg, ad in configs:
-        run_online_experiment(label, a, b, lr, mom, tau, mg, ad, **common_args)
+    all_seed_results = []
+    for seed_idx in range(args.seeds):
+        seed = 42 + seed_idx
+        if args.seeds > 1:
+            print(f"\n{'#' * 72}")
+            print(f"# Seed {seed} ({seed_idx + 1}/{args.seeds})")
+            print(f"{'#' * 72}")
+
+        rng = np.random.default_rng(seed)
+
+        common_args = dict(
+            train_batches=train_batches,
+            n_samples=n_samples,
+            batch_ece=batch_ece,
+            bm25_model=bm25_model,
+            eval_queries=eval_queries,
+            doc_ids=doc_ids,
+            qrels=qrels,
+            corpus_tokens=corpus_tokens,
+            rng=rng,
+            max_epochs=30,
+        )
+
+        # ================================================================
+        # Warm start with Polyak averaging (the realistic scenario)
+        # ================================================================
+        print(f"\n{'=' * 60}")
+        print("Warm start + Polyak averaging: raw vs averaged ECE")
+        print(f"{'=' * 60}")
+
+        config_results = []
+        for label, a, b, lr, mom, tau, mg, ad in configs:
+            result = run_online_experiment(
+                label, a, b, lr, mom, tau, mg, ad, **common_args,
+            )
+            config_results.append(result)
+
+        all_seed_results.append({
+            "seed": seed,
+            "configs": config_results,
+        })
 
     # --- Summary ---
     print(f"\n{'=' * 60}")
@@ -285,6 +323,20 @@ def main():
           f"= {n_samples * 5000:,} gradient steps, ECE = {batch_ece:.4f}")
     print(f"  Online: {len(train_batches)} query batches per epoch, "
           f"{n_samples:,} samples per epoch")
+
+    if args.output:
+        results_payload = (
+            all_seed_results[0] if args.seeds == 1 else all_seed_results
+        )
+        output = {
+            "benchmark": "convergence",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "seeds": args.seeds,
+            "results": results_payload,
+        }
+        with open(args.output, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"\nResults written to {args.output}")
 
 
 if __name__ == "__main__":

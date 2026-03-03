@@ -47,7 +47,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import time
 import urllib.request
 import zipfile
@@ -55,8 +54,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bm25s
 import Stemmer
