@@ -172,8 +172,6 @@ class FusionDebugger:
         score: float,
         tf: float,
         doc_len_ratio: float,
-        *,
-        doc_id: str | int | None = None,
     ) -> BM25SignalTrace:
         """Trace a single BM25 score through the full probability pipeline."""
         t = self._transform
@@ -212,8 +210,6 @@ class FusionDebugger:
     def trace_vector(
         self,
         cosine_score: float,
-        *,
-        doc_id: str | int | None = None,
     ) -> VectorSignalTrace:
         """Trace a cosine similarity through probability conversion."""
         prob_val = float(cosine_to_probability(cosine_score))
@@ -475,13 +471,13 @@ class FusionDebugger:
                 raise ValueError(
                     "tf and doc_len_ratio are required when bm25_score is provided"
                 )
-            bm25_trace = self.trace_bm25(bm25_score, tf, doc_len_ratio, doc_id=doc_id)
+            bm25_trace = self.trace_bm25(bm25_score, tf, doc_len_ratio)
             signals["BM25"] = bm25_trace
             probs.append(bm25_trace.posterior)
             names.append("BM25")
 
         if has_vector:
-            vec_trace = self.trace_vector(cosine_score, doc_id=doc_id)
+            vec_trace = self.trace_vector(cosine_score)
             signals["Vector"] = vec_trace
             probs.append(vec_trace.probability)
             names.append("Vector")

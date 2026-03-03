@@ -19,6 +19,7 @@ import numpy as np
 
 
 _EPSILON = 1e-10
+_ALPHA_MIN = 0.01
 
 
 def _clamp_probability(p: np.ndarray | float) -> np.ndarray | float:
@@ -457,7 +458,6 @@ class BayesianProbabilityTransform:
         self.beta -= effective_lr * corrected_grad_beta
 
         # Alpha must stay positive (steepness cannot be inverted)
-        _ALPHA_MIN = 0.01
         if self.alpha < _ALPHA_MIN:
             self.alpha = _ALPHA_MIN
 

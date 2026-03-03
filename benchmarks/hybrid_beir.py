@@ -37,6 +37,9 @@ Usage:
     python hybrid_beir.py -d ../../beir --datasets arguana scifact
     python hybrid_beir.py -d ../../beir --model all-MiniLM-L6-v2 -o results.json
     python hybrid_beir.py -d ../../beir --datasets scifact --tune
+    python hybrid_beir.py -d ../../beir --download --datasets scifact
+    python hybrid_beir.py -d ../../beir --cache-dir /tmp/emb_cache
+    python hybrid_beir.py -d ../../beir --no-cache
 """
 
 from __future__ import annotations
@@ -46,6 +49,8 @@ import json
 import os
 import sys
 import time
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -65,6 +70,79 @@ from bayesian_bm25.probability import BayesianProbabilityTransform, logit
 from bayesian_bm25.scorer import BayesianBM25Scorer
 
 STEMMER = Stemmer.Stemmer("english")
+
+BEIR_BASE_URL = (
+    "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets"
+)
+
+
+# ---------------------------------------------------------------------------
+# BEIR data download
+# ---------------------------------------------------------------------------
+
+def download_beir_dataset(dataset_name: str, beir_dir: str) -> str:
+    """Download and extract a BEIR dataset from the official CDN.
+
+    Downloads ``{dataset_name}.zip`` from the BEIR public repository and
+    extracts it into *beir_dir*.  If the dataset directory already exists,
+    this is a no-op.
+
+    Parameters
+    ----------
+    dataset_name : str
+        Name of the BEIR dataset (e.g. "scifact", "arguana").
+    beir_dir : str
+        Root directory where datasets are stored.  The dataset will be
+        extracted to ``{beir_dir}/{dataset_name}/``.
+
+    Returns
+    -------
+    str
+        Path to the extracted dataset directory.
+    """
+    dataset_dir = os.path.join(beir_dir, dataset_name)
+    if os.path.isdir(dataset_dir):
+        print(f"  {dataset_name}: already exists at {dataset_dir}")
+        return dataset_dir
+
+    url = f"{BEIR_BASE_URL}/{dataset_name}.zip"
+    os.makedirs(beir_dir, exist_ok=True)
+    zip_path = os.path.join(beir_dir, f"{dataset_name}.zip")
+
+    print(f"  Downloading {dataset_name} from {url} ...")
+
+    def _progress(block_num: int, block_size: int, total_size: int) -> None:
+        downloaded = block_num * block_size
+        if total_size > 0:
+            pct = min(100, downloaded * 100 // total_size)
+            mb_down = downloaded / (1024 * 1024)
+            mb_total = total_size / (1024 * 1024)
+            print(
+                f"\r  [{pct:3d}%] {mb_down:.1f} / {mb_total:.1f} MB",
+                end="",
+                flush=True,
+            )
+
+    try:
+        urllib.request.urlretrieve(url, zip_path, reporthook=_progress)
+    except urllib.error.HTTPError as exc:
+        print(f"\n  ERROR: failed to download {url} ({exc})")
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        raise SystemExit(1)
+    print()  # newline after progress
+
+    print(f"  Extracting to {beir_dir} ...")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(beir_dir)
+    os.remove(zip_path)
+
+    if not os.path.isdir(dataset_dir):
+        print(f"  WARNING: expected {dataset_dir} after extraction, not found")
+    else:
+        print(f"  Done: {dataset_dir}")
+
+    return dataset_dir
 
 
 # ---------------------------------------------------------------------------
@@ -184,16 +262,45 @@ def encode_dense(
     """Encode texts with sentence-transformers, with .npz caching.
 
     Returns L2-normalized embeddings of shape (len(texts), dim).
+
+    When *cache_path* is given, the function first checks for a cached
+    array under *cache_key*.  A cache hit requires both the key to exist
+    and the row count to match ``len(texts)``.
+
+    Parameters
+    ----------
+    texts : list of str
+        Texts to encode.
+    model_name : str
+        Sentence-transformers model identifier.
+    cache_path : str or None
+        Path to an ``.npz`` file for reading/writing cached embeddings.
+        Multiple keys (e.g. ``"corpus"`` and ``"queries"``) coexist in
+        the same file.  ``None`` disables caching.
+    cache_key : str
+        Key inside the ``.npz`` archive (default ``"embeddings"``).
+    batch_size : int
+        Encoding batch size passed to sentence-transformers.
+
+    Returns
+    -------
+    np.ndarray
+        L2-normalized embeddings of shape ``(len(texts), dim)``.
     """
     if cache_path and os.path.exists(cache_path):
         data = np.load(cache_path)
         if cache_key in data:
             emb = data[cache_key]
             if emb.shape[0] == len(texts):
+                print(f"    {cache_key}: cache hit "
+                      f"({emb.shape[0]} x {emb.shape[1]}, {cache_path})")
                 return emb
+            print(f"    {cache_key}: cache stale "
+                  f"(cached {emb.shape[0]} != current {len(texts)}), re-encoding")
 
     from sentence_transformers import SentenceTransformer
 
+    print(f"    {cache_key}: encoding {len(texts)} texts with {model_name} ...")
     model = SentenceTransformer(model_name)
     emb = model.encode(
         texts,
@@ -211,6 +318,7 @@ def encode_dense(
             np.savez(cache_path, **existing)
         else:
             np.savez(cache_path, **{cache_key: emb})
+        print(f"    {cache_key}: saved to cache ({cache_path})")
 
     return emb
 
@@ -708,6 +816,7 @@ def run_dataset(
     k: int = 10,
     retrieve_k: int = 1000,
     tune: bool = False,
+    cache_dir: str | None = None,
 ) -> dict[str, dict[str, float]]:
     """Run all fusion methods on a single BEIR dataset.
 
@@ -716,6 +825,25 @@ def run_dataset(
 
     When tune=True, additionally runs auto-estimation, supervised learning
     (if train qrels exist), grid search, and evaluates tuned configurations.
+
+    Parameters
+    ----------
+    dataset_dir : str
+        Path to the dataset directory (containing corpus.jsonl, etc.).
+    dataset_name : str
+        Human-readable name for logging and cache key.
+    model_name : str
+        Sentence-transformers model identifier.
+    k : int
+        Evaluation depth.
+    retrieve_k : int
+        Number of candidates per signal.
+    tune : bool
+        Whether to run auto-tuning after baseline evaluation.
+    cache_dir : str or None
+        Root directory for embedding cache.  Embeddings are stored at
+        ``{cache_dir}/{dataset_name}/{model}.npz``.  ``None`` disables
+        caching entirely.
     """
     print(f"\n{'=' * 70}")
     print(f"  {dataset_name}")
@@ -751,10 +879,11 @@ def run_dataset(
     scorer_br.index(corpus_tokens, show_progress=False)
     print(f"  BM25 indexed (base_rate={scorer_br.base_rate:.6f}) ({time.time() - t0:.1f}s)")
 
-    # 4. Encode dense embeddings (with cache)
-    cache_dir = os.path.join(dataset_dir, "embedding_cache")
-    safe_model = model_name.replace("/", "_")
-    cache_path = os.path.join(cache_dir, f"{safe_model}.npz")
+    # 4. Encode dense embeddings
+    cache_path: str | None = None
+    if cache_dir is not None:
+        safe_model = model_name.replace("/", "_")
+        cache_path = os.path.join(cache_dir, dataset_name, f"{safe_model}.npz")
 
     t0 = time.time()
     corpus_emb = encode_dense(
@@ -947,7 +1076,10 @@ def run_dataset(
             train_qids = [all_query_ids[i] for i in train_indices]
             train_tokens = tokenize_texts(train_texts)
             train_emb = encode_dense(
-                train_texts, model_name, None, batch_size=128,
+                train_texts, model_name,
+                cache_path=cache_path,
+                cache_key="train_queries",
+                batch_size=128,
             )
 
             train_tune_cache: dict[str, dict] = {}
@@ -1139,15 +1271,48 @@ def main() -> None:
         "--tune", action="store_true",
         help="Enable auto-tuning of parameters (base_rate, fusion_weight, hybrid_alpha)",
     )
+    parser.add_argument(
+        "--download", action="store_true",
+        help="Download missing BEIR datasets automatically from the official CDN",
+    )
+    parser.add_argument(
+        "--cache-dir", default=None,
+        help=(
+            "Directory for embedding cache.  Defaults to {beir-dir}/.cache/embeddings. "
+            "Pass --no-cache to disable caching entirely."
+        ),
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Disable embedding cache (always re-encode)",
+    )
     args = parser.parse_args()
 
+    # Resolve cache directory
+    if args.no_cache:
+        effective_cache_dir: str | None = None
+    elif args.cache_dir is not None:
+        effective_cache_dir = args.cache_dir
+    else:
+        effective_cache_dir = os.path.join(args.beir_dir, ".cache", "embeddings")
+
     tune_label = " [TUNE]" if args.tune else ""
+    cache_label = "disabled" if effective_cache_dir is None else effective_cache_dir
     print("=" * 70)
     print(f"  BEIR Hybrid Search Benchmark -- Bayesian BM25{tune_label}")
     print(f"  Model: {args.model}")
     print(f"  Datasets: {', '.join(args.datasets)}")
     print(f"  k={args.top_k}, R={args.retrieve_k}")
+    print(f"  Cache: {cache_label}")
+    if args.download:
+        print(f"  Download: enabled")
     print("=" * 70)
+
+    # Download datasets if requested
+    if args.download:
+        print("\n--- Checking / downloading datasets ---")
+        for ds_name in args.datasets:
+            download_beir_dataset(ds_name, args.beir_dir)
 
     all_results: dict[str, dict[str, dict[str, float]]] = {}
 
@@ -1155,11 +1320,13 @@ def main() -> None:
         ds_dir = os.path.join(args.beir_dir, ds_name)
         if not os.path.isdir(ds_dir):
             print(f"\nWARNING: Dataset directory not found: {ds_dir}, skipping")
+            print(f"  Hint: use --download to fetch missing datasets automatically")
             continue
         all_results[ds_name] = run_dataset(
             ds_dir, ds_name, args.model,
             k=args.top_k, retrieve_k=args.retrieve_k,
             tune=args.tune,
+            cache_dir=effective_cache_dir,
         )
 
     print_results_table(all_results, k=args.top_k)

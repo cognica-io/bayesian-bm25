@@ -6,11 +6,15 @@
 
 """Tests for bayesian_bm25.fusion module."""
 
+import copy
+import pickle
+
 import numpy as np
 import pytest
 
 from bayesian_bm25.fusion import (
     LearnableLogOddsWeights,
+    balanced_log_odds_fusion,
     cosine_to_probability,
     log_odds_conjunction,
     prob_and,
@@ -71,6 +75,30 @@ class TestCosineToProbability:
         scores = np.linspace(-1.0, 1.0, 20)
         result = cosine_to_probability(scores)
         assert np.all(np.diff(result) > 0)
+
+    def test_boundary_negative_one(self):
+        """cos=-1 maps to approximately 0 (epsilon)."""
+        result = cosine_to_probability(-1.0)
+        assert result > 0
+        assert result < 0.01
+
+    def test_boundary_zero(self):
+        """cos=0 maps to exactly 0.5."""
+        result = cosine_to_probability(0.0)
+        assert result == pytest.approx(0.5)
+
+    def test_boundary_positive_one(self):
+        """cos=1 maps to approximately 1 (1-epsilon)."""
+        result = cosine_to_probability(1.0)
+        assert result > 0.99
+        assert result < 1.0
+
+    def test_strict_monotonicity(self):
+        """Strictly increasing over [-1, 1] with fine granularity."""
+        scores = np.linspace(-1.0, 1.0, 1000)
+        result = cosine_to_probability(scores)
+        diffs = np.diff(result)
+        assert np.all(diffs > 0), "cosine_to_probability must be strictly increasing"
 
 
 class TestProbNot:
@@ -605,3 +633,106 @@ class TestLearnableLogOddsWeights:
             fd_grad[j] = (loss_plus - loss_minus) / (2 * eps)
 
         np.testing.assert_allclose(analytical_grad, fd_grad, atol=1e-4)
+
+    def test_pickle_roundtrip(self):
+        """Pickle round-trip preserves logits, weights, and online state."""
+        learner = LearnableLogOddsWeights(n_signals=3, alpha=0.5)
+        learner._logits = np.array([1.0, -0.5, 0.3])
+        learner._n_updates = 5
+        learner._grad_logits_ema = np.array([0.1, -0.2, 0.05])
+        learner._weights_avg = learner._softmax(learner._logits).copy()
+
+        restored = pickle.loads(pickle.dumps(learner))
+
+        assert restored.n_signals == learner.n_signals
+        assert restored.alpha == learner.alpha
+        np.testing.assert_allclose(restored._logits, learner._logits)
+        np.testing.assert_allclose(restored.weights, learner.weights)
+        np.testing.assert_allclose(restored.averaged_weights, learner.averaged_weights)
+        assert restored._n_updates == learner._n_updates
+        np.testing.assert_allclose(restored._grad_logits_ema, learner._grad_logits_ema)
+
+
+class TestBalancedLogOddsFusion:
+    """Tests for balanced_log_odds_fusion (hybrid sparse-dense retrieval)."""
+
+    def test_equal_weight(self):
+        """weight=0.5 gives equal contribution from sparse and dense."""
+        sparse = np.array([0.8, 0.6, 0.3])
+        dense = np.array([0.5, 0.7, 0.9])
+        result = balanced_log_odds_fusion(sparse, dense, weight=0.5)
+        assert result.shape == (3,)
+        assert np.all(np.isfinite(result))
+
+    def test_sparse_only_weight(self):
+        """weight=0.0 means only sparse contributes."""
+        sparse = np.array([0.8, 0.6, 0.3])
+        dense = np.array([0.5, 0.7, 0.9])
+        result = balanced_log_odds_fusion(sparse, dense, weight=0.0)
+        # Result should depend only on sparse signal
+        result_diff_dense = balanced_log_odds_fusion(
+            sparse, np.array([0.1, 0.2, 0.3]), weight=0.0
+        )
+        np.testing.assert_allclose(result, result_diff_dense)
+
+    def test_dense_only_weight(self):
+        """weight=1.0 means only dense contributes."""
+        sparse = np.array([0.8, 0.6, 0.3])
+        dense = np.array([0.5, 0.7, 0.9])
+        result = balanced_log_odds_fusion(sparse, dense, weight=1.0)
+        # Result should depend only on dense signal
+        result_diff_sparse = balanced_log_odds_fusion(
+            np.array([0.1, 0.2, 0.3]), dense, weight=1.0
+        )
+        np.testing.assert_allclose(result, result_diff_sparse)
+
+    def test_monotonicity_sparse(self):
+        """Within a single call, higher sparse probs produce higher fusion scores.
+
+        Since _min_max_normalize is range-relative (removing absolute scale),
+        monotonicity is tested within a single call: a document with higher
+        sparse probability should receive a higher fusion score.
+        """
+        sparse = np.array([0.3, 0.6, 0.9])
+        dense = np.array([0.5, 0.5, 0.5])  # uniform -> contributes zeros
+        result = balanced_log_odds_fusion(sparse, dense, weight=0.3)
+        # Sparse drives ranking because dense is uniform (normalized to zeros)
+        assert np.all(np.diff(result) >= 0)
+
+    def test_monotonicity_dense(self):
+        """Within a single call, higher dense sims produce higher fusion scores.
+
+        Since _min_max_normalize is range-relative (removing absolute scale),
+        monotonicity is tested within a single call: a document with higher
+        dense similarity should receive a higher fusion score.
+        """
+        sparse = np.array([0.5, 0.5, 0.5])  # uniform -> contributes zeros
+        dense = np.array([-0.5, 0.0, 0.8])
+        result = balanced_log_odds_fusion(sparse, dense, weight=0.7)
+        # Dense drives ranking because sparse is uniform (normalized to zeros)
+        assert np.all(np.diff(result) >= 0)
+
+    def test_identical_sparse_scores(self):
+        """All-same sparse scores produce zeros from _min_max_normalize."""
+        sparse = np.array([0.5, 0.5, 0.5])
+        dense = np.array([0.3, 0.6, 0.9])
+        result = balanced_log_odds_fusion(sparse, dense, weight=0.5)
+        # Sparse contributes zero; only dense drives the result
+        assert result.shape == (3,)
+        # Ranking should follow dense signal
+        assert result[2] > result[1] > result[0]
+
+    def test_scalar_input(self):
+        """Single float inputs produce a finite float result."""
+        result = balanced_log_odds_fusion(
+            np.float64(0.7), np.float64(0.5), weight=0.5
+        )
+        assert isinstance(result, float)
+        assert np.isfinite(result)
+
+    def test_output_is_numeric(self):
+        """Result is always finite."""
+        sparse = np.array([0.01, 0.5, 0.99])
+        dense = np.array([-0.99, 0.0, 0.99])
+        result = balanced_log_odds_fusion(sparse, dense)
+        assert np.all(np.isfinite(result))

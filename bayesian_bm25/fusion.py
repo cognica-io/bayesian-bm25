@@ -210,6 +210,13 @@ def balanced_log_odds_fusion(
     Returns
     -------
     Fusion scores (not probabilities).  Higher is more relevant.
+
+    Notes
+    -----
+    When all values in a signal are identical (zero variance), the
+    ``_min_max_normalize`` step maps that signal to all zeros.  This
+    means a zero-variance signal contributes nothing to the fusion
+    result -- only the other signal determines the final ranking.
     """
     sparse_probs = np.asarray(sparse_probs, dtype=np.float64)
     dense_similarities = np.asarray(dense_similarities, dtype=np.float64)

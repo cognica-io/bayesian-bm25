@@ -16,6 +16,17 @@ from __future__ import annotations
 import numpy as np
 
 
+def _bin_mask(probabilities: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Create a boolean mask for probabilities falling in a bin (lo, hi].
+
+    The first bin is inclusive on both sides: [0, hi].
+    All other bins are left-exclusive, right-inclusive: (lo, hi].
+    """
+    if lo == 0:
+        return (probabilities >= lo) & (probabilities <= hi)
+    return (probabilities > lo) & (probabilities <= hi)
+
+
 def expected_calibration_error(
     probabilities: np.ndarray,
     labels: np.ndarray,
@@ -34,9 +45,7 @@ def expected_calibration_error(
     total = len(probabilities)
 
     for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (probabilities > lo) & (probabilities <= hi)
-        if lo == 0:
-            mask = (probabilities >= lo) & (probabilities <= hi)
+        mask = _bin_mask(probabilities, lo, hi)
         count = np.sum(mask)
         if count == 0:
             continue
@@ -75,9 +84,7 @@ def reliability_diagram(
     bin_edges = np.linspace(0, 1, n_bins + 1)
     bins = []
     for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (probabilities > lo) & (probabilities <= hi)
-        if lo == 0:
-            mask = (probabilities >= lo) & (probabilities <= hi)
+        mask = _bin_mask(probabilities, lo, hi)
         count = int(np.sum(mask))
         if count == 0:
             continue

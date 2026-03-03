@@ -189,3 +189,116 @@ class TestNoIndexError:
         s = BayesianBM25Scorer()
         with pytest.raises(RuntimeError, match="index"):
             _ = s.avgdl
+
+
+class TestEstimateBaseRate:
+    """Tests for the _estimate_base_rate private method."""
+
+    def test_empty_scores_returns_minimum(self, scorer):
+        """Empty per_query_scores list returns the lower clamp 1e-6."""
+        result = scorer._estimate_base_rate([], n_docs=100)
+        assert result == pytest.approx(1e-6)
+
+    def test_known_distribution(self, scorer, small_corpus):
+        """Synthetic scores with known 95th percentile produce a sensible rate."""
+        # Create a single set of scores where 5% are above the 95th pct
+        scores = np.concatenate([
+            np.ones(95) * 1.0,  # 95 docs scoring 1.0
+            np.ones(5) * 10.0,  # 5 docs scoring 10.0
+        ])
+        per_query_scores = [scores]
+        n_docs = len(small_corpus)
+        result = scorer._estimate_base_rate(per_query_scores, n_docs)
+        assert 0.0 < result <= 0.5
+
+    def test_clamp_upper(self, scorer):
+        """Extreme input that would yield high base rate is clamped to 0.5."""
+        # All scores above any percentile -- ratio ~= 1.0
+        scores = np.ones(100) * 5.0
+        per_query_scores = [scores]
+        result = scorer._estimate_base_rate(per_query_scores, n_docs=1)
+        assert result <= 0.5
+
+    def test_clamp_lower(self, scorer):
+        """Tiny fraction above 95th pct is clamped to 1e-6."""
+        # Only 1 score above threshold in a huge corpus
+        scores = np.concatenate([np.zeros(999), np.array([100.0])])
+        per_query_scores = [scores]
+        result = scorer._estimate_base_rate(per_query_scores, n_docs=1_000_000)
+        assert result >= 1e-6
+
+
+class TestEmptyAndOOVQueries:
+    """Tests for edge cases with empty or out-of-vocabulary queries."""
+
+    def test_retrieve_empty_query(self, scorer):
+        """Empty query returns zero probabilities."""
+        doc_ids, probs = scorer.retrieve([[]], k=3)
+        assert probs.shape == (1, 3)
+        assert np.all(probs == 0.0)
+
+    def test_retrieve_oov_query(self, scorer):
+        """Query with only out-of-vocabulary tokens returns zero probs."""
+        doc_ids, probs = scorer.retrieve([["xyznonexistent"]], k=3)
+        assert probs.shape == (1, 3)
+        assert np.all(probs == 0.0)
+
+    def test_get_probabilities_oov(self, scorer, small_corpus):
+        """get_probabilities with all OOV tokens returns zero probs."""
+        probs = scorer.get_probabilities(["xyznonexistent_token"])
+        assert probs.shape == (len(small_corpus),)
+        assert np.all(probs == 0.0)
+
+
+class TestSingleDocCorpus:
+    """Tests for a single-document corpus edge case."""
+
+    def test_single_doc_index_and_retrieve(self):
+        """A 1-document corpus can be indexed and retrieved from."""
+        corpus = [["hello", "world"]]
+        s = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene")
+        s.index(corpus, show_progress=False)
+        assert s.num_docs == 1
+
+        doc_ids, probs = s.retrieve([["hello"]], k=1)
+        assert doc_ids.shape == (1, 1)
+        assert probs.shape == (1, 1)
+        assert probs[0, 0] >= 0.0
+
+    def test_single_doc_auto_estimate(self):
+        """Single-document corpus with std=0 falls back to alpha=1.0."""
+        corpus = [["hello", "world"]]
+        s = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene")
+        s.index(corpus, show_progress=False)
+        # With only one document, std of scores is 0, so alpha defaults to 1.0
+        # The scorer should still function without errors
+        probs = s.get_probabilities(["hello"])
+        assert probs.shape == (1,)
+        assert np.all(np.isfinite(probs))
+
+
+class TestComputeTFBatch:
+    """Direct tests for the _compute_tf_batch private method."""
+
+    def test_known_counts(self, scorer):
+        """Known corpus + query gives exact TF counts."""
+        # Doc 0: ["the", "cat", "sat", "on", "the", "mat"]
+        # Query: ["cat", "the"] -> intersection has "cat" and "the" = 2 unique
+        doc_ids = np.array([0])
+        result = scorer._compute_tf_batch(doc_ids, ["cat", "the"])
+        assert result[0] == pytest.approx(2.0)
+
+    def test_no_overlap(self, scorer):
+        """All OOV query tokens produce zero TF."""
+        doc_ids = np.array([0, 1, 2])
+        result = scorer._compute_tf_batch(doc_ids, ["xyznonexistent"])
+        np.testing.assert_array_equal(result, [0.0, 0.0, 0.0])
+
+    def test_empty_document(self):
+        """Document with zero tokens produces TF of 0."""
+        corpus = [[], ["hello", "world"]]
+        s = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene")
+        s.index(corpus, show_progress=False)
+        doc_ids = np.array([0])
+        result = s._compute_tf_batch(doc_ids, ["hello"])
+        assert result[0] == pytest.approx(0.0)

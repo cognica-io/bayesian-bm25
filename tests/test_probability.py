@@ -6,6 +6,9 @@
 
 """Tests for bayesian_bm25.probability module."""
 
+import copy
+import pickle
+
 import numpy as np
 import pytest
 
@@ -315,16 +318,18 @@ class TestOnlineUpdate:
         """Online updates should converge to similar parameters as batch fit."""
         rng = np.random.default_rng(123)
         true_alpha, true_beta = 2.0, 1.0
-        scores = rng.uniform(0, 3, size=500)
+        scores = rng.uniform(0, 3, size=2000)
         prob_relevant = sigmoid(true_alpha * (scores - true_beta))
-        labels = (rng.random(500) < prob_relevant).astype(float)
+        labels = (rng.random(2000) < prob_relevant).astype(float)
 
         t = BayesianProbabilityTransform(alpha=0.5, beta=0.0)
-        for s, l in zip(scores, labels):
-            t.update(s, l, learning_rate=0.05, momentum=0.9)
+        n_epochs = 3
+        for _ in range(n_epochs):
+            for s, l in zip(scores, labels):
+                t.update(s, l, learning_rate=0.05, momentum=0.9)
 
-        assert abs(t.alpha - true_alpha) < 1.5
-        assert abs(t.beta - true_beta) < 1.0
+        assert abs(t.alpha - true_alpha) < 0.5
+        assert abs(t.beta - true_beta) < 0.5
 
     def test_single_updates_move_parameters(self):
         """Each update should move parameters in the right direction."""
@@ -388,3 +393,73 @@ class TestOnlineUpdate:
         var_low = np.var(np.diff(alphas_low))
         var_high = np.var(np.diff(alphas_high))
         assert var_high < var_low
+
+
+class TestSerialization:
+    """Tests for pickle and deepcopy round-trip of BayesianProbabilityTransform."""
+
+    def test_pickle_transform(self):
+        """Pickle round-trip preserves all state."""
+        t = BayesianProbabilityTransform(alpha=2.5, beta=1.3, base_rate=0.05)
+        t._training_mode = "prior_aware"
+        t._n_updates = 10
+        t._grad_alpha_ema = 0.42
+        t._grad_beta_ema = -0.15
+        t._alpha_avg = 2.4
+        t._beta_avg = 1.2
+
+        restored = pickle.loads(pickle.dumps(t))
+
+        assert restored.alpha == pytest.approx(t.alpha)
+        assert restored.beta == pytest.approx(t.beta)
+        assert restored.base_rate == pytest.approx(t.base_rate)
+        assert restored._logit_base_rate == pytest.approx(t._logit_base_rate)
+        assert restored._training_mode == t._training_mode
+        assert restored._n_updates == t._n_updates
+        assert restored._grad_alpha_ema == pytest.approx(t._grad_alpha_ema)
+        assert restored._grad_beta_ema == pytest.approx(t._grad_beta_ema)
+        assert restored._alpha_avg == pytest.approx(t._alpha_avg)
+        assert restored._beta_avg == pytest.approx(t._beta_avg)
+
+        # Functional equivalence: same score -> same probability
+        score_result = t.score_to_probability(2.0, tf=5, doc_len_ratio=0.5)
+        restored_result = restored.score_to_probability(2.0, tf=5, doc_len_ratio=0.5)
+        assert restored_result == pytest.approx(score_result)
+
+    def test_pickle_learnable_weights(self):
+        """Pickle round-trip preserves logits, weights, and online state."""
+        from bayesian_bm25.fusion import LearnableLogOddsWeights
+
+        learner = LearnableLogOddsWeights(n_signals=3, alpha=0.5)
+        # Simulate some training
+        rng = np.random.RandomState(42)
+        for _ in range(10):
+            probs = rng.uniform(0.2, 0.8, size=3)
+            label = float(rng.randint(0, 2))
+            learner.update(probs, label, learning_rate=0.05)
+
+        restored = pickle.loads(pickle.dumps(learner))
+
+        assert restored.n_signals == learner.n_signals
+        assert restored.alpha == learner.alpha
+        np.testing.assert_allclose(restored._logits, learner._logits)
+        np.testing.assert_allclose(restored.weights, learner.weights)
+        np.testing.assert_allclose(restored.averaged_weights, learner.averaged_weights)
+        assert restored._n_updates == learner._n_updates
+
+    def test_deepcopy_independence(self):
+        """Deepcopy produces independent objects that do not share state."""
+        t = BayesianProbabilityTransform(alpha=1.5, beta=0.5, base_rate=0.1)
+        t._n_updates = 5
+
+        t_copy = copy.deepcopy(t)
+
+        # Modify the copy
+        t_copy.alpha = 99.0
+        t_copy.beta = 99.0
+        t_copy._n_updates = 999
+
+        # Original should be unaffected
+        assert t.alpha == pytest.approx(1.5)
+        assert t.beta == pytest.approx(0.5)
+        assert t._n_updates == 5

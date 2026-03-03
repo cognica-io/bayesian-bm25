@@ -71,6 +71,7 @@ class BayesianBM25Scorer:
         self._doc_lengths: np.ndarray | None = None
         self._avgdl: float | None = None
         self._corpus_tokens: list[list[str]] | None = None
+        self._doc_token_sets: list[set[str]] | None = None
 
     @property
     def num_docs(self) -> int:
@@ -109,6 +110,7 @@ class BayesianBM25Scorer:
             Whether to show progress bars during indexing.
         """
         self._corpus_tokens = corpus_tokens
+        self._doc_token_sets = [set(tokens) for tokens in corpus_tokens]
         self._bm25.index(corpus_tokens, show_progress=show_progress)
 
         self._doc_lengths = np.array(
@@ -278,9 +280,9 @@ class BayesianBM25Scorer:
     ) -> np.ndarray:
         """Compute total term frequencies for multiple documents against a query."""
         query_set = set(query_tokens)
-        corpus_tokens = self._corpus_tokens
+        doc_token_sets = self._doc_token_sets
         return np.array(
-            [sum(1 for t in corpus_tokens[did] if t in query_set) for did in doc_ids],
+            [len(query_set & doc_token_sets[did]) for did in doc_ids],
             dtype=np.float64,
         )
 
@@ -291,9 +293,13 @@ class BayesianBM25Scorer:
         query_tokens_batch: list[list[str]],
     ) -> np.ndarray:
         """Convert raw BM25 scores to probabilities for given doc IDs."""
-        assert self._transform is not None
-        assert self._doc_lengths is not None
-        assert self._corpus_tokens is not None
+        if (
+            self._transform is None
+            or self._doc_lengths is None
+            or self._corpus_tokens is None
+            or self._doc_token_sets is None
+        ):
+            raise RuntimeError("index() must be called before scoring")
 
         probabilities = np.zeros_like(bm25_scores, dtype=np.float64)
 

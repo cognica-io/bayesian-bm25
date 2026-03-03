@@ -279,3 +279,76 @@ class TestConvergenceComparison:
             assert t.alpha != 0.5 or t.beta != 0.0, (
                 f"mode={mode_name}: parameters did not move"
             )
+
+
+class TestModeComparison:
+    """Compare all three training modes on identical data."""
+
+    def test_all_modes_converge_on_same_data(self):
+        """fit() with balanced/prior_aware/prior_free on identical data.
+
+        All modes should converge (parameters move from initial values),
+        but learned parameters should differ between modes because the
+        training objectives are different.
+        """
+        rng = np.random.default_rng(42)
+        n = 500
+        scores = rng.uniform(0, 5, size=n)
+        tfs = rng.uniform(0, 15, size=n)
+        doc_len_ratios = rng.uniform(0.2, 2.0, size=n)
+
+        # Generate labels from a known posterior model
+        true_alpha, true_beta = 1.5, 2.0
+        likelihoods = sigmoid(true_alpha * (scores - true_beta))
+        priors = BayesianProbabilityTransform.composite_prior(tfs, doc_len_ratios)
+        posteriors = likelihoods * priors / (
+            likelihoods * priors + (1.0 - likelihoods) * (1.0 - priors)
+        )
+        labels = (rng.random(n) < posteriors).astype(float)
+
+        results = {}
+        initial_alpha, initial_beta = 0.5, 0.0
+
+        for mode_name in ["balanced", "prior_aware", "prior_free"]:
+            t = BayesianProbabilityTransform(
+                alpha=initial_alpha, beta=initial_beta
+            )
+            kwargs = dict(
+                learning_rate=0.01,
+                max_iterations=5000,
+                mode=mode_name,
+            )
+            if mode_name == "prior_aware":
+                kwargs["tfs"] = tfs
+                kwargs["doc_len_ratios"] = doc_len_ratios
+
+            t.fit(scores, labels, **kwargs)
+            results[mode_name] = (t.alpha, t.beta)
+
+            # All modes should converge (parameters moved)
+            assert t.alpha != initial_alpha or t.beta != initial_beta, (
+                f"mode={mode_name}: parameters did not move"
+            )
+            assert t.alpha > 0, f"mode={mode_name}: alpha should be positive"
+
+        # prior_aware trains on a different objective (posterior vs likelihood),
+        # so its parameters should differ from balanced
+        alpha_b, beta_b = results["balanced"]
+        alpha_pa, beta_pa = results["prior_aware"]
+        params_differ = (
+            abs(alpha_b - alpha_pa) > 0.01 or abs(beta_b - beta_pa) > 0.01
+        )
+        assert params_differ, (
+            f"balanced ({alpha_b:.4f}, {beta_b:.4f}) and "
+            f"prior_aware ({alpha_pa:.4f}, {beta_pa:.4f}) should differ"
+        )
+
+        # balanced and prior_free should learn the SAME parameters
+        # (they use the same training objective; only inference differs)
+        alpha_pf, beta_pf = results["prior_free"]
+        assert alpha_b == pytest.approx(alpha_pf), (
+            f"balanced alpha={alpha_b:.4f} vs prior_free alpha={alpha_pf:.4f}"
+        )
+        assert beta_b == pytest.approx(beta_pf), (
+            f"balanced beta={beta_b:.4f} vs prior_free beta={beta_pf:.4f}"
+        )
