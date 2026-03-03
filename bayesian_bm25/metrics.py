@@ -13,6 +13,8 @@ relevance rates.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 
@@ -92,3 +94,72 @@ def reliability_diagram(
         avg_actual = float(np.mean(labels[mask]))
         bins.append((avg_pred, avg_actual, count))
     return bins
+
+
+@dataclass
+class CalibrationReport:
+    """One-call calibration diagnostic report.
+
+    Bundles ECE, Brier score, and reliability diagram data into a single
+    object with a human-readable ``summary()`` method.
+    """
+
+    ece: float
+    brier: float
+    reliability: list[tuple[float, float, int]]
+    n_samples: int
+    n_bins: int
+
+    def summary(self) -> str:
+        """Formatted text summary of calibration metrics."""
+        lines = [
+            "Calibration Report",
+            "==================",
+            f"  Samples : {self.n_samples}",
+            f"  Bins    : {self.n_bins}",
+            f"  ECE     : {self.ece:.6f}",
+            f"  Brier   : {self.brier:.6f}",
+            "",
+            "  Reliability Diagram",
+            "  -------------------",
+            f"  {'Predicted':>10}  {'Actual':>10}  {'Count':>6}",
+        ]
+        for avg_pred, avg_actual, count in self.reliability:
+            lines.append(f"  {avg_pred:>10.4f}  {avg_actual:>10.4f}  {count:>6}")
+        return "\n".join(lines)
+
+
+def calibration_report(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    n_bins: int = 10,
+) -> CalibrationReport:
+    """Compute a full calibration diagnostic report in one call.
+
+    Parameters
+    ----------
+    probabilities : ndarray
+        Predicted probabilities.
+    labels : ndarray
+        Binary relevance labels (0 or 1).
+    n_bins : int
+        Number of bins for ECE and reliability diagram.
+
+    Returns
+    -------
+    CalibrationReport with ECE, Brier score, and reliability diagram data.
+    """
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.float64)
+
+    ece = expected_calibration_error(probabilities, labels, n_bins=n_bins)
+    brier = brier_score(probabilities, labels)
+    reliability = reliability_diagram(probabilities, labels, n_bins=n_bins)
+
+    return CalibrationReport(
+        ece=ece,
+        brier=brier,
+        reliability=reliability,
+        n_samples=len(probabilities),
+        n_bins=n_bins,
+    )

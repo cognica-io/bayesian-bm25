@@ -9,6 +9,7 @@
 from importlib.metadata import version as _metadata_version
 
 from bayesian_bm25.fusion import (
+    AttentionLogOddsWeights,
     LearnableLogOddsWeights,
     balanced_log_odds_fusion,
     cosine_to_probability,
@@ -18,7 +19,9 @@ from bayesian_bm25.fusion import (
     prob_or,
 )
 from bayesian_bm25.metrics import (
+    CalibrationReport,
     brier_score,
+    calibration_report,
     expected_calibration_error,
     reliability_diagram,
 )
@@ -28,10 +31,13 @@ __version__ = _metadata_version("bayesian-bm25")
 
 __all__ = [
     "__version__",
+    "AttentionLogOddsWeights",
     "BayesianProbabilityTransform",
+    "CalibrationReport",
     "LearnableLogOddsWeights",
     "balanced_log_odds_fusion",
     "brier_score",
+    "calibration_report",
     "cosine_to_probability",
     "expected_calibration_error",
     "log_odds_conjunction",
@@ -46,6 +52,12 @@ def __getattr__(name: str):
     if name == "BayesianBM25Scorer":
         from bayesian_bm25.scorer import BayesianBM25Scorer
         return BayesianBM25Scorer
+    if name == "RetrievalResult":
+        from bayesian_bm25.scorer import RetrievalResult
+        return RetrievalResult
+    if name == "MultiFieldScorer":
+        from bayesian_bm25.multi_field import MultiFieldScorer
+        return MultiFieldScorer
     if name == "FusionDebugger":
         from bayesian_bm25.debug import FusionDebugger
         return FusionDebugger

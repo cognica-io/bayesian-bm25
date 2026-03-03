@@ -9,7 +9,7 @@
 import numpy as np
 import pytest
 
-from bayesian_bm25.scorer import BayesianBM25Scorer
+from bayesian_bm25.scorer import BayesianBM25Scorer, RetrievalResult
 
 
 @pytest.fixture
@@ -228,6 +228,100 @@ class TestEstimateBaseRate:
         assert result >= 1e-6
 
 
+class TestBaseRateMethod:
+    """Tests for the base_rate_method parameter (percentile, mixture, elbow)."""
+
+    def test_invalid_method_raises(self):
+        """Invalid base_rate_method raises ValueError."""
+        with pytest.raises(ValueError, match="base_rate_method"):
+            BayesianBM25Scorer(base_rate_method="invalid")
+
+    def test_percentile_default(self, small_corpus):
+        """Default method is 'percentile' and produces valid base rate."""
+        s = BayesianBM25Scorer(method="lucene", base_rate="auto")
+        s.index(small_corpus, show_progress=False)
+        assert s.base_rate is not None
+        assert 0.0 < s.base_rate < 1.0
+
+    def test_mixture_method(self, small_corpus):
+        """mixture method produces valid base rate in (0, 1)."""
+        s = BayesianBM25Scorer(
+            method="lucene", base_rate="auto", base_rate_method="mixture"
+        )
+        s.index(small_corpus, show_progress=False)
+        assert s.base_rate is not None
+        assert 0.0 < s.base_rate <= 0.5
+
+    def test_elbow_method(self, small_corpus):
+        """elbow method produces valid base rate in (0, 1)."""
+        s = BayesianBM25Scorer(
+            method="lucene", base_rate="auto", base_rate_method="elbow"
+        )
+        s.index(small_corpus, show_progress=False)
+        assert s.base_rate is not None
+        assert 0.0 < s.base_rate <= 0.5
+
+    def test_mixture_bimodal_distribution(self):
+        """Mixture EM recovers a sensible base rate from bimodal data."""
+        # Low-scoring (non-relevant) population: mean=1, std=0.5
+        # High-scoring (relevant) population: mean=5, std=0.5
+        rng = np.random.default_rng(42)
+        low = rng.normal(1.0, 0.5, size=900)
+        high = rng.normal(5.0, 0.5, size=100)
+        scores = np.concatenate([low, high])
+        scores = scores[scores > 0]  # keep positive
+        per_query_scores = [scores]
+
+        result = BayesianBM25Scorer._base_rate_mixture(per_query_scores)
+        # True proportion is 100/1000 = 0.1; EM should be in the ballpark
+        assert 0.01 < result < 0.5
+
+    def test_elbow_clear_knee(self):
+        """Elbow method finds a knee in a clearly kinked distribution."""
+        # Sharp drop: 10 high scores, then 90 low scores
+        high = np.ones(10) * 10.0
+        low = np.linspace(2.0, 0.1, 90)
+        scores = np.concatenate([high, low])
+        per_query_scores = [scores]
+
+        result = BayesianBM25Scorer._base_rate_elbow(per_query_scores)
+        assert 0.01 < result < 0.5
+
+    def test_mixture_empty_returns_minimum(self):
+        """Mixture with < 2 scores returns 1e-6."""
+        result = BayesianBM25Scorer._base_rate_mixture([np.array([1.0])])
+        assert result == pytest.approx(1e-6)
+
+    def test_elbow_too_few_scores(self):
+        """Elbow with < 3 scores returns 1e-6."""
+        result = BayesianBM25Scorer._base_rate_elbow([np.array([1.0, 2.0])])
+        assert result == pytest.approx(1e-6)
+
+    def test_method_only_used_when_auto(self, small_corpus):
+        """base_rate_method is irrelevant when base_rate is not 'auto'."""
+        s = BayesianBM25Scorer(
+            method="lucene", base_rate=0.01, base_rate_method="mixture"
+        )
+        s.index(small_corpus, show_progress=False)
+        # Explicit base_rate wins over method
+        assert s.base_rate == pytest.approx(0.01)
+
+    def test_all_methods_produce_bounded_results(self):
+        """All three methods produce results in [1e-6, 0.5]."""
+        rng = np.random.default_rng(123)
+        scores = rng.exponential(2.0, size=500)
+        scores = scores[scores > 0]
+        per_query_scores = [scores]
+
+        for method_fn in [
+            lambda pqs: BayesianBM25Scorer._base_rate_percentile(pqs, n_docs=1000),
+            BayesianBM25Scorer._base_rate_mixture,
+            BayesianBM25Scorer._base_rate_elbow,
+        ]:
+            result = method_fn(per_query_scores)
+            assert 1e-6 <= result <= 0.5, f"Out of bounds: {result}"
+
+
 class TestEmptyAndOOVQueries:
     """Tests for edge cases with empty or out-of-vocabulary queries."""
 
@@ -275,6 +369,88 @@ class TestSingleDocCorpus:
         probs = s.get_probabilities(["hello"])
         assert probs.shape == (1,)
         assert np.all(np.isfinite(probs))
+
+
+class TestRetrievalResult:
+    def test_retrieve_default_returns_tuple(self, scorer):
+        """Default retrieve() returns a tuple for backward compatibility."""
+        result = scorer.retrieve([["cat"]], k=3)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        doc_ids, probs = result
+        assert doc_ids.shape == (1, 3)
+        assert probs.shape == (1, 3)
+
+    def test_retrieve_explain_returns_result(self, scorer):
+        """explain=True returns a RetrievalResult."""
+        result = scorer.retrieve([["cat"]], k=3, explain=True)
+        assert isinstance(result, RetrievalResult)
+        assert result.doc_ids.shape == (1, 3)
+        assert result.probabilities.shape == (1, 3)
+        assert result.explanations is not None
+
+    def test_result_has_explanations(self, scorer):
+        """explanations list has correct shape: [num_queries][k]."""
+        result = scorer.retrieve([["cat"], ["dog"]], k=3, explain=True)
+        assert len(result.explanations) == 2
+        for q_explanations in result.explanations:
+            assert len(q_explanations) == 3
+
+    def test_explanation_traces_match_probabilities(self, scorer):
+        """trace posteriors match result probabilities for nonzero docs."""
+        result = scorer.retrieve([["cat"]], k=6, explain=True)
+        for rank in range(6):
+            prob = result.probabilities[0, rank]
+            trace = result.explanations[0][rank]
+            if prob > 0:
+                assert trace is not None
+                assert abs(trace.posterior - prob) < 1e-6
+            else:
+                assert trace is None
+
+
+class TestAddDocuments:
+    def test_add_documents_increases_count(self, scorer, small_corpus):
+        """num_docs grows after adding documents."""
+        original_count = scorer.num_docs
+        scorer.add_documents(
+            [["new", "document", "here"]], show_progress=False
+        )
+        assert scorer.num_docs == original_count + 1
+
+    def test_add_documents_before_index_raises(self):
+        """RuntimeError if add_documents is called before index()."""
+        s = BayesianBM25Scorer()
+        with pytest.raises(RuntimeError, match="index"):
+            s.add_documents([["hello"]])
+
+    def test_add_documents_preserves_search(self, small_corpus):
+        """Old documents are still retrievable after adding new ones."""
+        s = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene")
+        s.index(small_corpus, show_progress=False)
+        probs_before = s.get_probabilities(["cat"])
+        cat_docs_before = set(np.where(probs_before > 0)[0].tolist())
+
+        s.add_documents(
+            [["completely", "unrelated", "tokens"]], show_progress=False
+        )
+        probs_after = s.get_probabilities(["cat"])
+        cat_docs_after = set(np.where(probs_after > 0)[0].tolist())
+
+        # Original cat docs (0, 1, 5) should still appear
+        assert cat_docs_before.issubset(cat_docs_after)
+
+    def test_add_documents_finds_new_docs(self, small_corpus):
+        """Newly added documents appear in results."""
+        s = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene")
+        s.index(small_corpus, show_progress=False)
+        new_doc_id = len(small_corpus)  # index of the new doc
+
+        s.add_documents(
+            [["cat", "cat", "cat", "cat", "cat"]], show_progress=False
+        )
+        probs = s.get_probabilities(["cat"])
+        assert probs[new_doc_id] > 0
 
 
 class TestComputeTFBatch:

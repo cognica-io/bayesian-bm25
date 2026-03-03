@@ -10,7 +10,9 @@ import numpy as np
 import pytest
 
 from bayesian_bm25.metrics import (
+    CalibrationReport,
     brier_score,
+    calibration_report,
     expected_calibration_error,
     reliability_diagram,
 )
@@ -140,6 +142,55 @@ class TestReliabilityDiagram:
             bins = reliability_diagram(probs, labels, n_bins=n_bins)
             assert len(bins) > 0
             assert len(bins) <= n_bins
+
+
+class TestCalibrationReport:
+    def test_report_fields(self):
+        """All fields present and correct types."""
+        probs = np.array([0.1, 0.2, 0.8, 0.9])
+        labels = np.array([0.0, 0.0, 1.0, 1.0])
+        report = calibration_report(probs, labels, n_bins=5)
+        assert isinstance(report, CalibrationReport)
+        assert isinstance(report.ece, float)
+        assert isinstance(report.brier, float)
+        assert isinstance(report.reliability, list)
+        assert report.n_samples == 4
+        assert report.n_bins == 5
+
+    def test_report_matches_individual(self):
+        """ECE and Brier match individual function calls."""
+        rng = np.random.default_rng(42)
+        probs = rng.uniform(0, 1, size=200)
+        labels = (rng.random(200) < 0.3).astype(float)
+
+        report = calibration_report(probs, labels, n_bins=10)
+
+        assert report.ece == pytest.approx(
+            expected_calibration_error(probs, labels, n_bins=10)
+        )
+        assert report.brier == pytest.approx(brier_score(probs, labels))
+        assert report.reliability == reliability_diagram(
+            probs, labels, n_bins=10
+        )
+
+    def test_summary_format(self):
+        """summary() returns non-empty string with expected sections."""
+        probs = np.array([0.1, 0.5, 0.9])
+        labels = np.array([0.0, 1.0, 1.0])
+        report = calibration_report(probs, labels, n_bins=5)
+        text = report.summary()
+        assert isinstance(text, str)
+        assert len(text) > 0
+        assert "ECE" in text
+        assert "Brier" in text
+        assert "Reliability" in text
+
+    def test_report_from_main_package(self):
+        """CalibrationReport and calibration_report importable from bayesian_bm25."""
+        import bayesian_bm25
+
+        assert hasattr(bayesian_bm25, "CalibrationReport")
+        assert hasattr(bayesian_bm25, "calibration_report")
 
 
 class TestMainPackageExport:

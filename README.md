@@ -11,14 +11,16 @@ Standard BM25 produces unbounded scores that lack consistent meaning across quer
 Key capabilities:
 
 - **Score-to-probability transform** — convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
-- **Base rate calibration** — corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68–77% without relevance labels
+- **Base rate calibration** — corpus-level base rate prior estimated from score distribution (95th percentile, mixture model, or elbow detection) decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68–77% without relevance labels
 - **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
-- **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling and optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
+- **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling, optional per-signal reliability weights (Log-OP), and sparse signal gating (ReLU/Swish activations from Paper 2, Theorems 6.5.3/6.7.4)
 - **Learnable fusion weights** — `LearnableLogOddsWeights` learns per-signal reliability from labeled data via a Hebbian gradient that is backprop-free, starting from Naive Bayes uniform initialization (Remark 5.3.2)
+- **Attention-based fusion** — `AttentionLogOddsWeights` learns query-dependent signal weights via attention mechanism (Paper 2, Section 8), replacing static weights with query-adaptive weighting
 - **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
 - **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
-- **Calibration metrics** — `expected_calibration_error()`, `brier_score()`, and `reliability_diagram()` for evaluating probability quality
+- **Calibration metrics** — `expected_calibration_error()`, `brier_score()`, `reliability_diagram()`, and `calibration_report()` for evaluating probability quality, with `CalibrationReport` bundling all metrics into a single diagnostic
 - **Fusion debugger** — `FusionDebugger` records every intermediate value through the full pipeline (likelihood, prior, posterior, fusion) for transparent inspection, document comparison, and crossover detection; supports hierarchical fusion tracing with AND/OR/NOT composition
+- **Multi-field search** — `MultiFieldScorer` maintains separate BM25 indexes per field and fuses field-level probabilities via log-odds conjunction with configurable per-field weights
 - **Search integration** — drop-in scorer wrapping [bm25s](https://github.com/xhluca/bm25s) that returns probabilities instead of raw scores
 
 ## Adoption
@@ -72,6 +74,26 @@ scorer.index(corpus_tokens, show_progress=False)
 doc_ids, probabilities = scorer.retrieve([["machine", "learning"]], k=3)
 ```
 
+### Multi-Field Search
+
+```python
+from bayesian_bm25 import MultiFieldScorer
+
+documents = [
+    {"title": ["bayesian", "bm25"], "body": ["probabilistic", "framework", "search"]},
+    {"title": ["neural", "networks"], "body": ["deep", "learning", "models"]},
+    {"title": ["information", "retrieval"], "body": ["search", "ranking", "relevance"]},
+]
+
+scorer = MultiFieldScorer(
+    fields=["title", "body"],
+    field_weights={"title": 0.4, "body": 0.6},
+    k1=1.2, b=0.75, method="lucene",
+)
+scorer.index(documents, show_progress=False)
+doc_ids, probabilities = scorer.retrieve(["bayesian", "search"], k=3)
+```
+
 ### Combining Multiple Signals
 
 ```python
@@ -107,6 +129,10 @@ fused = log_odds_conjunction(stacked, weights=np.array([0.6, 0.4]))
 
 # Fuse with weights and confidence scaling (alpha + weights compose)
 fused = log_odds_conjunction(stacked, alpha=0.5, weights=np.array([0.6, 0.4]))
+
+# Gated fusion: ReLU/Swish activation in logit space (Paper 2, Theorems 6.5.3/6.7.4)
+fused_relu = log_odds_conjunction(stacked, gating="relu")    # MAP estimation
+fused_swish = log_odds_conjunction(stacked, gating="swish")  # Bayes estimation
 ```
 
 ### Learning Fusion Weights from Data
@@ -129,6 +155,24 @@ for probs, label in feedback_stream:
 
 # Inference with Polyak-averaged weights for stability
 fused = learner(test_probs, use_averaged=True)
+```
+
+### Attention-Based Fusion
+
+```python
+import numpy as np
+from bayesian_bm25 import AttentionLogOddsWeights
+
+# 2 retrieval signals, 3 query features
+attn = AttentionLogOddsWeights(n_signals=2, n_query_features=3, alpha=0.5)
+
+# Train on labeled data with query features
+# training_probs: (m, 2), training_labels: (m,), query_features: (m, 3)
+attn.fit(training_probs, training_labels, query_features,
+         learning_rate=0.01, max_iterations=500)
+
+# Query-dependent fusion: weights adapt per query
+fused = attn(test_probs, test_features, use_averaged=True)
 ```
 
 ### WAND Pruning with Bayesian Upper Bounds
@@ -182,7 +226,9 @@ step3 = debugger.trace_fusion(
 
 ```python
 import numpy as np
-from bayesian_bm25 import expected_calibration_error, brier_score, reliability_diagram
+from bayesian_bm25 import (
+    expected_calibration_error, brier_score, reliability_diagram, calibration_report,
+)
 
 probabilities = np.array([0.9, 0.8, 0.3, 0.1, 0.7, 0.2])
 labels = np.array([1.0, 1.0, 0.0, 0.0, 1.0, 0.0])
@@ -190,6 +236,10 @@ labels = np.array([1.0, 1.0, 0.0, 0.0, 1.0, 0.0])
 ece = expected_calibration_error(probabilities, labels)   # lower is better
 bs = brier_score(probabilities, labels)                   # lower is better
 bins = reliability_diagram(probabilities, labels, n_bins=5)  # (avg_pred, avg_actual, count)
+
+# One-call diagnostic report
+report = calibration_report(probabilities, labels)
+print(report.summary())   # formatted text with ECE, Brier, and reliability table
 ```
 
 ### Online Learning from User Feedback
@@ -234,9 +284,7 @@ transform.fit(scores, labels, mode="prior_free")
 
 Evaluated on 5 [BEIR](https://github.com/beir-cellar/beir) datasets using the retrieve-then-evaluate protocol (top-1000 per signal, union candidates, pytrec_eval). Dense encoder: all-MiniLM-L6-v2. BM25: k1=1.2, b=0.75, Lucene variant with Snowball English stemmer.
 
-#### NDCG@10 -- Zero-shot
-
-No relevance labels required. All parameters are fixed or auto-estimated from corpus statistics.
+#### NDCG@10
 
 | Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | Average |
 |---|---|---|---|---|---|---|
@@ -244,15 +292,66 @@ No relevance labels required. All parameters are fixed or auto-estimated from co
 | Dense | 36.98 | 36.87 | 31.59 | 21.64 | 64.51 | 38.32 |
 | Convex | 40.03 | 37.10 | 35.61 | 19.65 | 73.38 | 41.15 |
 | RRF | 39.61 | 36.85 | 34.43 | 20.09 | 71.43 | 40.48 |
-| **Bayesian-Balanced** | **37.28** | **40.57** | **35.63** | **21.55** | **71.75** | **41.36** |
-| LogOdds-Symmetric | 39.63 | 37.20 | 34.10 | 19.50 | 73.81 | 40.85 |
-| Bayesian-LogOdds | 37.17 | 33.12 | 35.25 | 18.52 | 72.25 | 39.26 |
+| Bayesian-OR | 0.06 | 25.54 | 33.47 | 15.88 | 66.97 | 28.38 |
+| Bayesian-LogOdds | 37.16 | 32.93 | 35.32 | 18.54 | 72.68 | 39.33 |
+| LO-Local | 39.63 | 37.20 | 34.10 | 19.50 | 73.81 | 40.85 |
+| Bayesian-LO-BR | 37.16 | 32.92 | 30.92 | 18.50 | 72.15 | 38.33 |
+| **Bayesian-Balanced** | **37.27** | **40.59** | **35.73** | **21.40** | **72.47** | **41.50** |
+| Balanced-Mix | 37.29 | 40.66 | 35.70 | 21.52 | 72.33 | 41.50 |
+| Balanced-Elbow | 37.29 | 40.59 | 35.76 | 21.41 | 72.46 | 41.50 |
+| Gated-ReLU | 35.17 | 27.52 | 32.42 | 17.07 | 69.02 | 36.24 |
+| Gated-Swish | 36.20 | 27.39 | 28.67 | 16.80 | 68.63 | 35.54 |
+| Attention | 37.05 | 38.86 | 34.40 | 21.05 | 70.44 | 40.36 |
+| MultiField | 7.40 | -- | 31.16 | 15.68 | 59.93 | 28.55\* |
+| MF-Balanced | 38.42 | -- | 34.51 | 20.92 | 66.84 | 40.17\* |
 
-#### NDCG@10 -- Trained
-
-Uses train qrels (FiQA, NFCorpus, SciFact) or test qrels (ArguAna, SciDocs) for supervised parameter learning and grid search over base_rate, fusion_weight, and hybrid_alpha.
+#### MAP@10
 
 | Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | Average |
+|---|---|---|---|---|---|---|
+| BM25 | 23.84 | 19.11 | 11.77 | 9.16 | 63.22 | 25.42 |
+| Dense | 24.46 | 29.14 | 11.05 | 12.94 | 59.59 | 27.44 |
+| Convex | 26.77 | 29.21 | 13.46 | 11.78 | 69.13 | 30.07 |
+| RRF | 26.30 | 28.85 | 12.84 | 11.96 | 66.58 | 29.30 |
+| Bayesian-OR | 0.03 | 19.10 | 12.41 | 9.19 | 61.72 | 20.49 |
+| Bayesian-LogOdds | 24.54 | 25.58 | 13.40 | 11.01 | 68.15 | 28.54 |
+| LO-Local | 26.40 | 29.32 | 12.31 | 11.69 | 69.30 | 29.80 |
+| Bayesian-LO-BR | 24.54 | 25.58 | 11.47 | 10.98 | 67.66 | 28.05 |
+| **Bayesian-Balanced** | **24.61** | **32.74** | **13.80** | **12.83** | **68.03** | **30.40** |
+| Balanced-Mix | 24.62 | 32.77 | 13.79 | 12.92 | 67.84 | 30.39 |
+| Balanced-Elbow | 24.62 | 32.74 | 13.80 | 12.84 | 68.02 | 30.40 |
+| Gated-ReLU | 22.98 | 20.97 | 11.66 | 10.01 | 64.11 | 25.95 |
+| Gated-Swish | 23.87 | 20.88 | 10.23 | 9.85 | 63.81 | 25.73 |
+| Attention | 24.49 | 30.93 | 12.68 | 12.59 | 65.80 | 29.30 |
+| MultiField | 4.76 | -- | 11.45 | 9.04 | 55.18 | 20.11\* |
+| MF-Balanced | 25.47 | -- | 13.04 | 12.57 | 63.22 | 28.57\* |
+
+#### Recall@10
+
+| Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | Average |
+|---|---|---|---|---|---|---|
+| BM25 | 75.18 | 31.98 | 14.47 | 16.36 | 80.78 | 43.75 |
+| Dense | 76.53 | 44.13 | 15.50 | 23.09 | 78.33 | 47.52 |
+| Convex | 81.72 | 45.04 | 17.06 | 20.60 | 84.89 | 49.86 |
+| RRF | 81.65 | 45.03 | 16.87 | 21.11 | 84.76 | 49.88 |
+| Bayesian-OR | 0.14 | 32.74 | 15.98 | 16.74 | 81.37 | 29.39 |
+| Bayesian-LogOdds | 77.03 | 40.67 | 17.24 | 19.36 | 84.96 | 47.85 |
+| LO-Local | 81.37 | 45.24 | 16.29 | 20.40 | 86.22 | 49.90 |
+| Bayesian-LO-BR | 77.03 | 40.67 | 15.00 | 19.28 | 84.29 | 47.26 |
+| **Bayesian-Balanced** | **77.31** | **47.66** | **17.23** | **22.59** | **84.83** | **49.93** |
+| Balanced-Mix | 77.38 | 47.61 | 17.26 | 22.71 | 84.83 | 49.96 |
+| Balanced-Elbow | 77.38 | 47.66 | 17.24 | 22.61 | 84.83 | 49.95 |
+| Gated-ReLU | 74.04 | 34.39 | 16.00 | 17.76 | 82.58 | 44.95 |
+| Gated-Swish | 75.32 | 34.21 | 13.88 | 17.40 | 81.91 | 44.55 |
+| Attention | 76.74 | 46.76 | 17.10 | 22.23 | 83.04 | 49.17 |
+| MultiField | 16.43 | -- | 14.64 | 16.68 | 72.87 | 30.16\* |
+| MF-Balanced | 79.30 | -- | 16.85 | 22.03 | 76.63 | 48.70\* |
+
+\*MultiField/MF-Balanced average over 4 datasets (FiQA corpus lacks title field).
+
+All methods above are zero-shot (no relevance labels required). With `--tune`, additional supervised methods are evaluated:
+
+| Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | NDCG@10 Avg |
 |---|---|---|---|---|---|---|
 | **Balanced-Tuned** | **37.29** | **40.49** | **35.65** | **22.03** | **72.70** | **41.63** |
 | Hybrid-AND-Tuned | 37.13 | 28.37 | 34.44 | 16.82 | 69.34 | 37.22 |
@@ -263,34 +362,63 @@ Uses train qrels (FiQA, NFCorpus, SciFact) or test qrels (ArguAna, SciDocs) for 
 | Method | Type | Delta |
 |---|---|---|
 | **Balanced-Tuned** | **trained** | **+6.26** |
-| Bayesian-Balanced | zero-shot | +5.98 |
+| Balanced-Elbow | zero-shot | +6.13 |
+| Bayesian-Balanced | zero-shot | +6.12 |
+| Balanced-Mix | zero-shot | +6.12 |
 | Convex | zero-shot | +5.78 |
-| LogOdds-Symmetric | zero-shot | +5.47 |
+| LO-Local | zero-shot | +5.47 |
 | RRF | zero-shot | +5.10 |
-| Bayesian-LogOdds | zero-shot | +3.88 |
+| Attention | zero-shot | +4.98 |
+| Bayesian-LogOdds | zero-shot | +3.95 |
+| Bayesian-LO-BR | zero-shot | +2.95 |
 | Dense | zero-shot | +2.94 |
+| MF-Balanced | zero-shot | +2.28\* |
 | Hybrid-AND-Tuned | trained | +1.84 |
+| Gated-ReLU | zero-shot | +0.86 |
+| Gated-Swish | zero-shot | +0.16 |
+
+\*MF-Balanced delta computed over 4 datasets (FiQA corpus lacks title field).
 
 **Method descriptions:**
 
 | Method | Description |
 |---|---|
-| Convex | `w * dense + (1-w) * sparse` with grid-searched weight |
-| RRF | Reciprocal Rank Fusion (k=60) |
-| **Bayesian-Balanced** | Bayesian BM25 probs and dense sims to logit space, min-max normalize each, combine with equal weights |
-| LogOdds-Symmetric | Both raw BM25 and dense calibrated symmetrically via `logit = alpha * (score - median)`, then weighted sum |
-| Bayesian-LogOdds | Bayesian BM25 probs to logit, dense calibrated via `logit = alpha * (sim - median)`, then combined |
+| BM25 | Sparse retrieval via bm25s (Lucene variant) |
+| Dense | Cosine similarity via sentence-transformers |
+| Convex | `w * dense_norm + (1-w) * bm25_norm`, w=0.5 |
+| RRF | Reciprocal Rank Fusion, `sum(1/(k + rank))`, k=60 |
+| Bayesian-OR | Bayesian BM25 probs + cosine probs via `prob_or` |
+| Bayesian-LogOdds | Bayesian BM25 probs to logit, dense calibrated via `logit = alpha * (sim - median)`, combined |
+| LO-Local | Both raw BM25 and dense calibrated symmetrically via `logit = alpha * (score - median)`, combined |
+| Bayesian-LO-BR | Bayesian-LogOdds with base rate prior |
+| **Bayesian-Balanced** | `balanced_log_odds_fusion`: Bayesian BM25 probs and dense sims to logit space, min-max normalize each, combine with equal weights |
+| Balanced-Mix | Bayesian-Balanced with mixture-model base rate estimation |
+| Balanced-Elbow | Bayesian-Balanced with elbow-detection base rate estimation |
+| Gated-ReLU | `log_odds_conjunction` with ReLU gating in logit space (Paper 2, Theorem 6.5.3) |
+| Gated-Swish | `log_odds_conjunction` with Swish gating in logit space (Paper 2, Theorem 6.7.4) |
+| Attention | Query-dependent signal weighting via `AttentionLogOddsWeights` (Paper 2, Section 8) |
+| MultiField | `MultiFieldScorer` (title + body) with `log_odds_conjunction`, sparse-only |
+| MF-Balanced | MultiField probs + dense via `balanced_log_odds_fusion` |
 | Balanced-Tuned | Bayesian-Balanced + supervised `BayesianProbabilityTransform.fit()` + grid search over base_rate and fusion_weight |
 | Hybrid-AND-Tuned | `log_odds_conjunction` of Bayesian BM25 and dense probs with tuned alpha |
 | Bayesian-Tuned | Sparse-only Bayesian BM25 with tuned alpha, beta, and base_rate (no dense signal) |
 
+**Why include underperforming methods?** The tables above deliberately include methods that underperform BM25. Each failure mode is informative:
+
+- **Bayesian-OR** (NDCG@10 avg 28.38) — Probabilistic OR assumes signal independence and catastrophically fails on ArguAna (0.06%). This demonstrates *why* the log-odds conjunction framework (Paper 2, Section 4) is needed: naive probability combination without logit-space calibration collapses when signal distributions differ.
+- **Gated-ReLU / Gated-Swish** (36.24 / 35.54) — Sparse gating (Paper 2, Theorems 6.5.3 / 6.7.4) is too aggressive for the BEIR hybrid fusion task. ReLU zeros out negative logits entirely, discarding useful weak signals; Swish softens the gate but still suppresses too much. These gates are designed for high-dimensional signal spaces where most inputs are noise — in a two-signal (sparse + dense) setting, there is no noise to suppress.
+- **MultiField** (28.55 over 4 datasets) — Sparse-only multi-field search loses to concatenated BM25 because field separation fragments term statistics (smaller per-field document frequency, shorter effective document lengths). However, **MF-Balanced** (40.17) recovers most of the gap by fusing with dense embeddings, confirming that field-level BM25 signals are complementary to dense vectors even when they are individually weaker.
+
 Reproduce:
 ```bash
-# Zero-shot only
+# Zero-shot (16 methods)
 python benchmarks/hybrid_beir.py -d <beir-data-dir>
 
 # With tuning (auto-estimation + supervised learning + grid search)
 python benchmarks/hybrid_beir.py -d <beir-data-dir> --tune
+
+# Download BEIR datasets automatically
+python benchmarks/hybrid_beir.py -d <beir-data-dir> --download
 ```
 
 Requires `pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5 PyStemmer`.

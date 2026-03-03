@@ -15,18 +15,25 @@ EnglishAnalyzer with Porter stemmer).
 
 Methods compared:
 
-  1. BM25         -- Sparse retrieval via bm25s
-  2. Dense        -- Cosine similarity via sentence-transformers
-  3. Convex       -- w * dense_norm + (1-w) * bm25_norm, w=0.5
-  4. RRF          -- sum(1/(k + rank_i)), k=60
+  1. BM25             -- Sparse retrieval via bm25s
+  2. Dense            -- Cosine similarity via sentence-transformers
+  3. Convex           -- w * dense_norm + (1-w) * bm25_norm, w=0.5
+  4. RRF              -- sum(1/(k + rank_i)), k=60
   5. Bayesian-OR      -- Bayesian BM25 probs + probabilistic OR
   6. Bayesian-LogOdds -- Per-query calibrated log-odds fusion
+  7. Balanced-Mix     -- balanced fusion with mixture base_rate estimation
+  8. Balanced-Elbow   -- balanced fusion with elbow base_rate estimation
+  9. Gated-ReLU       -- log-odds conjunction with ReLU gating (Theorem 6.5.3)
+ 10. Gated-Swish      -- log-odds conjunction with Swish gating (Theorem 6.7.4)
+ 11. Attention        -- query-dependent attention weights (Paper 2, Section 8)
+ 12. MultiField       -- MultiFieldScorer (title + body), sparse-only
+ 13. MF-Balanced      -- MultiField probs + dense via balanced_log_odds_fusion
 
 With --tune, additional tuned methods are evaluated:
 
-  7. Bayesian-Tuned     -- BayesianBM25 with tuned alpha, beta, base_rate
-  8. Balanced-Tuned     -- balanced_log_odds_fusion with tuned weight
-  9. Hybrid-AND-Tuned   -- log-odds conjunction with tuned alpha
+ 14. Bayesian-Tuned     -- BayesianBM25 with tuned alpha, beta, base_rate
+ 15. Balanced-Tuned     -- balanced_log_odds_fusion with tuned weight
+ 16. Hybrid-AND-Tuned   -- log-odds conjunction with tuned alpha
 
 Dependencies:
     pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5
@@ -56,10 +63,13 @@ import numpy as np
 import Stemmer
 
 from bayesian_bm25.fusion import (
+    AttentionLogOddsWeights,
     balanced_log_odds_fusion,
     cosine_to_probability,
     log_odds_conjunction,
 )
+from bayesian_bm25.metrics import calibration_report
+from bayesian_bm25.multi_field import MultiFieldScorer
 from bayesian_bm25.probability import BayesianProbabilityTransform, logit
 from bayesian_bm25.scorer import BayesianBM25Scorer
 
@@ -157,12 +167,16 @@ def load_beir_dataset(dataset_dir: str) -> dict:
 
     corpus_ids = []
     corpus_texts = []
+    corpus_titles: list[str] = []
+    corpus_bodies: list[str] = []
     with open(corpus_path, encoding="utf-8") as f:
         for line in f:
             doc = json.loads(line)
             corpus_ids.append(str(doc["_id"]))
             title = doc.get("title", "")
             text = doc.get("text", "")
+            corpus_titles.append(title)
+            corpus_bodies.append(text)
             if title:
                 corpus_texts.append(title + " " + text)
             else:
@@ -202,6 +216,8 @@ def load_beir_dataset(dataset_dir: str) -> dict:
     return {
         "corpus_ids": corpus_ids,
         "corpus_texts": corpus_texts,
+        "corpus_titles": corpus_titles,
+        "corpus_bodies": corpus_bodies,
         "query_ids": filtered_qids,
         "query_texts": filtered_qtexts,
         "qrels": qrels,
@@ -796,6 +812,10 @@ def evaluate_pytrec(
 BASELINE_METHODS = [
     "BM25", "Dense", "Convex", "RRF",
     "Bayesian-OR", "Bayesian-LogOdds", "LO-Local", "Bayesian-LO-BR", "Bayesian-Balanced",
+    "Balanced-Mix", "Balanced-Elbow",
+    "Gated-ReLU", "Gated-Swish",
+    "Attention",
+    "MultiField", "MF-Balanced",
 ]
 
 TUNED_METHODS = [
@@ -848,6 +868,8 @@ def run_dataset(
     data = load_beir_dataset(dataset_dir)
     corpus_ids = data["corpus_ids"]
     corpus_texts = data["corpus_texts"]
+    corpus_titles = data["corpus_titles"]
+    corpus_bodies = data["corpus_bodies"]
     query_ids = data["query_ids"]
     query_texts = data["query_texts"]
     qrels = data["qrels"]
@@ -871,7 +893,46 @@ def run_dataset(
     scorer.index(corpus_tokens, show_progress=False)
     scorer_br = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene", base_rate="auto")
     scorer_br.index(corpus_tokens, show_progress=False)
-    print(f"  BM25 indexed (base_rate={scorer_br.base_rate:.6f}) ({time.time() - t0:.1f}s)")
+    scorer_br_mix = BayesianBM25Scorer(
+        k1=1.2, b=0.75, method="lucene",
+        base_rate="auto", base_rate_method="mixture",
+    )
+    scorer_br_mix.index(corpus_tokens, show_progress=False)
+    scorer_br_elbow = BayesianBM25Scorer(
+        k1=1.2, b=0.75, method="lucene",
+        base_rate="auto", base_rate_method="elbow",
+    )
+    scorer_br_elbow.index(corpus_tokens, show_progress=False)
+    print(
+        f"  BM25 indexed -- base_rate: percentile={scorer_br.base_rate:.6f}, "
+        f"mixture={scorer_br_mix.base_rate:.6f}, "
+        f"elbow={scorer_br_elbow.base_rate:.6f} ({time.time() - t0:.1f}s)"
+    )
+
+    # 3b. Build multi-field BM25 index (title + body as separate fields)
+    t0 = time.time()
+    title_tokens = tokenize_texts(corpus_titles)
+    body_tokens = tokenize_texts(corpus_bodies)
+
+    # Check whether the title field has any actual tokens.  Some BEIR
+    # datasets (e.g. FiQA) have empty titles for most/all documents,
+    # which causes bm25s to fail on an empty vocabulary.
+    has_title_tokens = any(len(t) > 0 for t in title_tokens)
+
+    mf_scorer: MultiFieldScorer | None = None
+    if has_title_tokens:
+        mf_docs = [
+            {"title": title_tokens[i], "body": body_tokens[i]}
+            for i in range(len(corpus_titles))
+        ]
+        mf_scorer = MultiFieldScorer(
+            fields=["title", "body"],
+            k1=1.2, b=0.75, method="lucene",
+        )
+        mf_scorer.index(mf_docs, show_progress=False)
+        print(f"  MultiField indexed (title + body) ({time.time() - t0:.1f}s)")
+    else:
+        print(f"  MultiField skipped (no title tokens in corpus) ({time.time() - t0:.1f}s)")
 
     # 4. Encode dense embeddings
     cache_path: str | None = None
@@ -896,6 +957,8 @@ def run_dataset(
         qrels_pytrec[qid] = {did: score for did, score in rels.items()}
 
     methods = list(BASELINE_METHODS)
+    if mf_scorer is None:
+        methods = [m for m in methods if m not in ("MultiField", "MF-Balanced")]
     runs: dict[str, dict[str, dict[str, float]]] = {m: {} for m in methods}
 
     # Pre-allocate rank arrays (reused per query, reset after each)
@@ -906,6 +969,9 @@ def run_dataset(
 
     # Per-query cache for tuning
     tune_cache: dict[str, dict] = {}
+
+    # Per-query cache for attention model training
+    attn_cache: dict[str, dict] = {}
 
     for q_idx in range(n_queries):
         qid = query_ids[q_idx]
@@ -955,8 +1021,16 @@ def run_dataset(
 
         # Bayesian BM25 probs with base rate prior for union candidates
         cand_bayesian_probs_br = np.zeros(len(union_idx), dtype=np.float64)
+        cand_bayesian_probs_mix = np.zeros(len(union_idx), dtype=np.float64)
+        cand_bayesian_probs_elbow = np.zeros(len(union_idx), dtype=np.float64)
         if np.any(active):
             cand_bayesian_probs_br[active] = scorer_br._transform.score_to_probability(
+                active_scores, tfs, doc_len_ratios,
+            )
+            cand_bayesian_probs_mix[active] = scorer_br_mix._transform.score_to_probability(
+                active_scores, tfs, doc_len_ratios,
+            )
+            cand_bayesian_probs_elbow[active] = scorer_br_elbow._transform.score_to_probability(
                 active_scores, tfs, doc_len_ratios,
             )
 
@@ -1003,7 +1077,26 @@ def run_dataset(
             "Bayesian-Balanced": balanced_log_odds_fusion(
                 cand_bayesian_probs_br, cand_dense,
             ),
+            "Balanced-Mix": balanced_log_odds_fusion(
+                cand_bayesian_probs_mix, cand_dense,
+            ),
+            "Balanced-Elbow": balanced_log_odds_fusion(
+                cand_bayesian_probs_elbow, cand_dense,
+            ),
         }
+
+        # Gated log-odds conjunction: BM25 probs + dense probs (Phase 5.3)
+        # Stacks two probability signals and applies gating in logit space
+        dense_probs_cand = np.asarray(
+            cosine_to_probability(cand_dense), dtype=np.float64,
+        )
+        gated_input = np.column_stack([cand_bayesian_probs_br, dense_probs_cand])
+        hybrid_scores["Gated-ReLU"] = log_odds_conjunction(
+            gated_input, gating="relu",
+        )
+        hybrid_scores["Gated-Swish"] = log_odds_conjunction(
+            gated_input, gating="swish",
+        )
 
         for method_name, scores in hybrid_scores.items():
             runs[method_name][qid] = {
@@ -1011,13 +1104,146 @@ def run_dataset(
                 for j in range(len(union_idx))
             }
 
+        # MultiField: dense probabilities over all docs, take top-R
+        if mf_scorer is not None:
+            mf_probs_full = mf_scorer.get_probabilities(qtokens)
+            mf_topR = np.argsort(-mf_probs_full)[:effective_R]
+            runs["MultiField"][qid] = {
+                corpus_ids[i]: float(mf_probs_full[i]) for i in mf_topR
+            }
+
+            # MF-Balanced: MultiField probs + dense via balanced_log_odds_fusion
+            # Union of MultiField top-R and Dense top-R
+            mf_union_set = set(mf_topR.tolist()) | set(dense_topR.tolist())
+            mf_union_idx = np.array(sorted(mf_union_set))
+            mf_cand_probs = mf_probs_full[mf_union_idx]
+            mf_cand_dense = dense_sim[mf_union_idx]
+            mf_balanced_scores = balanced_log_odds_fusion(mf_cand_probs, mf_cand_dense)
+            runs["MF-Balanced"][qid] = {
+                corpus_ids[mf_union_idx[j]]: float(mf_balanced_scores[j])
+                for j in range(len(mf_union_idx))
+            }
+
+        # Cache for attention model: query features + candidate signals
+        qlen = len(qtokens)
+        bm25_hit_ratio = float(np.count_nonzero(raw_bm25)) / n_docs
+        max_bm25_log = float(np.log1p(np.max(raw_bm25))) if np.any(raw_bm25 > 0) else 0.0
+        attn_cache[qid] = {
+            "union_idx": union_idx,
+            "cand_probs_br": cand_bayesian_probs_br.copy(),
+            "cand_dense": cand_dense.copy(),
+            "features": np.array(
+                [np.log1p(qlen), bm25_hit_ratio, max_bm25_log],
+                dtype=np.float64,
+            ),
+        }
+
     print(f"  Scored {n_queries} queries x {len(methods)} methods, "
           f"R={effective_R} ({time.time() - t0:.1f}s)")
+
+    # 5b. Train and score AttentionLogOddsWeights (Paper 2, Section 8)
+    # Collect (probability_pair, label, query_features) from qrels.
+    # BEIR qrels typically only list relevant documents, so we also sample
+    # negative candidates (unjudged docs from the retrieval union set) to
+    # provide the model with both classes.
+    t0 = time.time()
+    attn_train_probs: list[list[float]] = []
+    attn_train_labels: list[float] = []
+    attn_train_features: list[np.ndarray] = []
+    attn_rng = np.random.default_rng(42)
+
+    for qid, cache in attn_cache.items():
+        qrel_map = qrels.get(qid)
+        if not qrel_map:
+            continue
+        ui = cache["union_idx"]
+        probs_br = cache["cand_probs_br"]
+        dense_probs_arr = np.asarray(
+            cosine_to_probability(cache["cand_dense"]), dtype=np.float64,
+        )
+        feats = cache["features"]
+
+        # Positive examples: judged relevant documents in the candidate set
+        pos_count = 0
+        neg_indices: list[int] = []
+        for j in range(len(ui)):
+            doc_id = corpus_ids[ui[j]]
+            if doc_id in qrel_map:
+                attn_train_probs.append([probs_br[j], dense_probs_arr[j]])
+                attn_train_labels.append(1.0 if qrel_map[doc_id] > 0 else 0.0)
+                attn_train_features.append(feats)
+                if qrel_map[doc_id] > 0:
+                    pos_count += 1
+            else:
+                neg_indices.append(j)
+
+        # Negative sampling: sample up to pos_count unjudged candidates
+        n_neg = min(pos_count, len(neg_indices))
+        if n_neg > 0:
+            sampled = attn_rng.choice(neg_indices, size=n_neg, replace=False)
+            for j in sampled:
+                attn_train_probs.append([probs_br[j], dense_probs_arr[j]])
+                attn_train_labels.append(0.0)
+                attn_train_features.append(feats)
+
+    n_attn_train = len(attn_train_probs)
+    attn_labels_arr = np.array(attn_train_labels, dtype=np.float64)
+    has_both_classes = (
+        n_attn_train >= 10
+        and float(np.sum(attn_labels_arr)) > 0
+        and float(np.sum(1.0 - attn_labels_arr)) > 0
+    )
+
+    if has_both_classes:
+        attn_model = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=3, alpha=0.5,
+        )
+        attn_model.fit(
+            np.array(attn_train_probs, dtype=np.float64),
+            attn_labels_arr,
+            np.array(attn_train_features, dtype=np.float64),
+            learning_rate=0.01,
+            max_iterations=500,
+        )
+
+        for qid, cache in attn_cache.items():
+            ui = cache["union_idx"]
+            probs_br = cache["cand_probs_br"]
+            dense_probs_arr = np.asarray(
+                cosine_to_probability(cache["cand_dense"]), dtype=np.float64,
+            )
+            probs_matrix = np.column_stack([probs_br, dense_probs_arr])
+            feats = cache["features"]
+
+            # Compute query-dependent attention weights
+            w = attn_model._compute_weights(
+                feats.reshape(1, -1), use_averaged=True,
+            ).squeeze(0)
+            attn_scores = log_odds_conjunction(
+                probs_matrix, alpha=attn_model.alpha, weights=w,
+            )
+            runs["Attention"][qid] = {
+                corpus_ids[ui[j]]: float(attn_scores[j])
+                for j in range(len(ui))
+            }
+
+        print(f"  Attention trained on {n_attn_train} judged pairs ({time.time() - t0:.1f}s)")
+    else:
+        # Not enough training data -- remove Attention from methods
+        methods = [m for m in methods if m != "Attention"]
+        if "Attention" in runs:
+            del runs["Attention"]
+        print(f"  Attention skipped (insufficient training data: {n_attn_train} pairs)")
 
     # 6. Evaluate baselines
     results: dict[str, dict[str, float]] = {}
     for method_name in methods:
         results[method_name] = evaluate_pytrec(qrels_pytrec, runs[method_name], k=k)
+
+    # 6b. Calibration diagnostics for probability-producing methods
+    calib_methods = [m for m in CALIBRATION_METHODS if m in runs]
+    if calib_methods:
+        print_calibration_section(runs, qrels, calib_methods)
 
     # 7. Tuning (if enabled)
     if tune:
@@ -1155,6 +1381,61 @@ def run_dataset(
             results["Hybrid-AND-Tuned"] = evaluate_pytrec(qrels_pytrec, run_hybrid, k=k)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Calibration diagnostics
+# ---------------------------------------------------------------------------
+
+CALIBRATION_METHODS = [
+    "Bayesian-OR", "Bayesian-LO-BR", "Bayesian-Balanced",
+    "Balanced-Mix", "Balanced-Elbow",
+    "Gated-ReLU", "Gated-Swish",
+    "Attention",
+    "MultiField", "MF-Balanced",
+]
+
+
+def print_calibration_section(
+    runs: dict[str, dict[str, dict[str, float]]],
+    qrels: dict[str, dict[str, int]],
+    methods: list[str],
+) -> None:
+    """Print calibration diagnostics for probability-producing methods."""
+    print("\n  --- Calibration Diagnostics ---")
+    print(f"  {'Method':<22}  {'ECE':>10}  {'Brier':>10}  {'Samples':>8}")
+    print(f"  {'-' * 22}  {'-' * 10}  {'-' * 10}  {'-' * 8}")
+
+    for method in methods:
+        if method not in runs:
+            continue
+        method_run = runs[method]
+
+        probs_list: list[float] = []
+        labels_list: list[float] = []
+
+        for qid, doc_scores in method_run.items():
+            qrel_map = qrels.get(qid)
+            if qrel_map is None:
+                continue
+            # Only include doc_ids that appear in qrels for this query
+            # to avoid negative bias from unjudged documents
+            for doc_id, score in doc_scores.items():
+                if doc_id in qrel_map:
+                    probs_list.append(score)
+                    labels_list.append(1.0 if qrel_map[doc_id] > 0 else 0.0)
+
+        if len(probs_list) < 2:
+            print(f"  {method:<22}  {'n/a':>10}  {'n/a':>10}  {len(probs_list):>8}")
+            continue
+
+        probs_arr = np.array(probs_list, dtype=np.float64)
+        labels_arr = np.array(labels_list, dtype=np.float64)
+        report = calibration_report(probs_arr, labels_arr)
+        print(
+            f"  {method:<22}  {report.ece:>10.6f}  {report.brier:>10.6f}"
+            f"  {report.n_samples:>8}"
+        )
 
 
 # ---------------------------------------------------------------------------

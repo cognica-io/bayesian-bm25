@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from bayesian_bm25.fusion import (
+    AttentionLogOddsWeights,
     LearnableLogOddsWeights,
     balanced_log_odds_fusion,
     cosine_to_probability,
@@ -738,3 +739,295 @@ class TestBalancedLogOddsFusion:
         dense = np.array([-0.99, 0.0, 0.99])
         result = balanced_log_odds_fusion(sparse, dense)
         assert np.all(np.isfinite(result))
+
+
+class TestAlphaAuto:
+    """Tests for alpha='auto' (sqrt(n) scaling, Theorem 4.2.1)."""
+
+    def test_auto_matches_half_unweighted(self):
+        """alpha='auto' produces same result as alpha=0.5 in unweighted mode."""
+        probs = np.array([0.8, 0.9])
+        auto = log_odds_conjunction(probs, alpha="auto")
+        explicit = log_odds_conjunction(probs, alpha=0.5)
+        assert auto == pytest.approx(explicit, abs=1e-12)
+
+    def test_auto_matches_half_weighted(self):
+        """alpha='auto' produces same result as alpha=0.5 in weighted mode."""
+        probs = np.array([0.8, 0.9])
+        w = np.array([0.6, 0.4])
+        auto = log_odds_conjunction(probs, alpha="auto", weights=w)
+        explicit = log_odds_conjunction(probs, alpha=0.5, weights=w)
+        assert auto == pytest.approx(explicit, abs=1e-12)
+
+    def test_auto_amplifies_agreement(self):
+        """alpha='auto' amplifies agreement like alpha=0.5."""
+        probs = np.array([0.9, 0.9])
+        result = log_odds_conjunction(probs, alpha="auto")
+        assert result > 0.9  # Agreement amplification
+
+    def test_auto_batched(self):
+        """alpha='auto' works with batched inputs."""
+        probs = np.array([[0.9, 0.9], [0.3, 0.3]])
+        result = log_odds_conjunction(probs, alpha="auto")
+        assert result.shape == (2,)
+        assert result[0] > 0.9
+        assert result[1] < 0.5
+
+    def test_invalid_alpha_string_raises(self):
+        """Non-'auto' string raises ValueError."""
+        with pytest.raises(ValueError, match="alpha must be"):
+            log_odds_conjunction(np.array([0.5, 0.5]), alpha="invalid")
+
+    def test_learnable_alpha_auto(self):
+        """LearnableLogOddsWeights accepts alpha='auto'."""
+        learner = LearnableLogOddsWeights(n_signals=3, alpha="auto")
+        assert learner.alpha == 0.5
+
+    def test_learnable_alpha_auto_call(self):
+        """LearnableLogOddsWeights with alpha='auto' produces valid output."""
+        learner = LearnableLogOddsWeights(n_signals=2, alpha="auto")
+        probs = np.array([0.8, 0.7])
+        result = learner(probs)
+        assert 0 < result < 1
+
+    def test_none_defaults_preserved(self):
+        """alpha=None still uses 0.5 unweighted, 0.0 weighted (backward compat)."""
+        probs = np.array([0.8, 0.9])
+        none_unweighted = log_odds_conjunction(probs, alpha=None)
+        half_unweighted = log_odds_conjunction(probs, alpha=0.5)
+        assert none_unweighted == pytest.approx(half_unweighted, abs=1e-12)
+
+        w = np.array([0.6, 0.4])
+        none_weighted = log_odds_conjunction(probs, alpha=None, weights=w)
+        zero_weighted = log_odds_conjunction(probs, alpha=0.0, weights=w)
+        assert none_weighted == pytest.approx(zero_weighted, abs=1e-12)
+
+
+class TestGating:
+    """Tests for sparse signal gating (ReLU/Swish, Theorems 6.5.3, 6.7.4)."""
+
+    def test_none_gating_identity(self):
+        """gating='none' gives same result as no gating."""
+        probs = np.array([0.8, 0.9])
+        result_none = log_odds_conjunction(probs, gating="none")
+        result_default = log_odds_conjunction(probs)
+        assert result_none == pytest.approx(result_default, abs=1e-12)
+
+    def test_relu_zeros_weak_evidence(self):
+        """ReLU gating ignores signals below 0.5 (negative logits)."""
+        # 0.3 has logit < 0, so ReLU zeroes it out
+        probs = np.array([0.9, 0.3])
+        result_relu = log_odds_conjunction(probs, gating="relu")
+        result_none = log_odds_conjunction(probs, gating="none")
+        # With ReLU, the 0.3 signal is zeroed: effectively only 0.9 contributes
+        # so the result should be higher than without gating
+        assert result_relu > result_none
+
+    def test_relu_all_above_half(self):
+        """ReLU gating on all-above-0.5 signals is close to no gating."""
+        probs = np.array([0.8, 0.9, 0.7])
+        result_relu = log_odds_conjunction(probs, gating="relu")
+        result_none = log_odds_conjunction(probs, gating="none")
+        # All logits are positive, so ReLU does not change them
+        assert result_relu == pytest.approx(result_none, abs=1e-12)
+
+    def test_swish_soft_gate(self):
+        """Swish gating is between 'none' and 'relu' for mixed signals."""
+        probs = np.array([0.9, 0.3])
+        result_none = log_odds_conjunction(probs, gating="none")
+        result_swish = log_odds_conjunction(probs, gating="swish")
+        result_relu = log_odds_conjunction(probs, gating="relu")
+        # Swish is a soft version of ReLU: result should be between none and relu
+        assert result_none < result_swish < result_relu
+
+    def test_swish_all_above_half(self):
+        """Swish with all signals > 0.5 is close to (but below) no gating."""
+        probs = np.array([0.8, 0.9])
+        result_swish = log_odds_conjunction(probs, gating="swish")
+        result_none = log_odds_conjunction(probs, gating="none")
+        # Swish(x) = x*sigmoid(x) < x for all finite x > 0, so swish
+        # gating always attenuates positive logits slightly
+        assert result_swish < result_none
+        # But it should be close (within 6%) for moderate positive logits
+        assert abs(result_swish - result_none) < 0.06
+
+    def test_gating_with_weights(self):
+        """Gating works with weighted mode."""
+        probs = np.array([0.9, 0.3])
+        w = np.array([0.5, 0.5])
+        result_none = log_odds_conjunction(probs, weights=w, gating="none")
+        result_relu = log_odds_conjunction(probs, weights=w, gating="relu")
+        # ReLU zeroes the 0.3 signal (negative logit), boosting the result
+        assert result_relu > result_none
+
+    def test_gating_with_alpha_auto(self):
+        """Gating works together with alpha='auto'."""
+        probs = np.array([0.9, 0.3, 0.8])
+        result = log_odds_conjunction(probs, alpha="auto", gating="relu")
+        assert 0 < result < 1
+
+    def test_invalid_gating_raises(self):
+        """Invalid gating value raises ValueError."""
+        with pytest.raises(ValueError, match="gating must be"):
+            log_odds_conjunction(np.array([0.5, 0.5]), gating="invalid")
+
+    def test_relu_batched(self):
+        """ReLU gating works with batched inputs."""
+        probs = np.array([[0.9, 0.3], [0.3, 0.9]])
+        result = log_odds_conjunction(probs, gating="relu")
+        assert result.shape == (2,)
+        # Both batches have one signal zeroed out, result should be similar
+        assert result[0] == pytest.approx(result[1], abs=1e-12)
+
+    def test_swish_batched(self):
+        """Swish gating works with batched inputs."""
+        probs = np.array([[0.9, 0.3], [0.8, 0.8]])
+        result = log_odds_conjunction(probs, gating="swish")
+        assert result.shape == (2,)
+        assert np.all(np.isfinite(result))
+        assert np.all(result > 0)
+        assert np.all(result < 1)
+
+
+class TestAttentionLogOddsWeights:
+    """Tests for AttentionLogOddsWeights (Paper 2, Section 8)."""
+
+    def test_init_shapes(self):
+        """Weight matrix and bias have correct shapes."""
+        attn = AttentionLogOddsWeights(n_signals=3, n_query_features=5)
+        assert attn.n_signals == 3
+        assert attn.n_query_features == 5
+        assert attn.weights_matrix.shape == (3, 5)
+        assert attn.alpha == 0.5
+
+    def test_init_alpha_auto(self):
+        """alpha='auto' resolves to 0.5."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=3, alpha="auto")
+        assert attn.alpha == 0.5
+
+    def test_init_invalid_n_signals(self):
+        with pytest.raises(ValueError, match="n_signals"):
+            AttentionLogOddsWeights(n_signals=0, n_query_features=3)
+
+    def test_init_invalid_n_query_features(self):
+        with pytest.raises(ValueError, match="n_query_features"):
+            AttentionLogOddsWeights(n_signals=2, n_query_features=0)
+
+    def test_call_single_sample(self):
+        """Single-sample call returns a float in (0, 1)."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=3)
+        probs = np.array([0.8, 0.7])
+        qf = np.array([1.0, 0.5, -0.3])
+        result = attn(probs, qf)
+        assert isinstance(result, float)
+        assert 0 < result < 1
+
+    def test_call_batched(self):
+        """Batched call returns array of correct shape."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=3)
+        probs = np.array([[0.8, 0.7], [0.3, 0.9]])
+        qf = np.array([[1.0, 0.5, -0.3], [0.2, -0.1, 0.8]])
+        result = attn(probs, qf)
+        assert result.shape == (2,)
+        assert np.all(result > 0)
+        assert np.all(result < 1)
+
+    def test_different_queries_produce_different_weights(self):
+        """Different query features lead to different fusion results."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=3)
+        probs = np.array([0.9, 0.3])
+        qf1 = np.array([1.0, 0.0, 0.0])
+        qf2 = np.array([0.0, 0.0, 1.0])
+        r1 = attn(probs, qf1)
+        r2 = attn(probs, qf2)
+        # With random init, different features produce different weights
+        assert r1 != pytest.approx(r2, abs=1e-6)
+
+    def test_fit_learns_informative_features(self):
+        """fit() should learn to use informative query features."""
+        rng = np.random.RandomState(42)
+        m = 300
+        n_signals = 2
+        n_qf = 3
+
+        labels = rng.randint(0, 2, size=m).astype(np.float64)
+
+        # Signal 0: reliable, Signal 1: noisy
+        signal_0 = np.where(labels == 1, 0.85, 0.15)
+        signal_1 = rng.uniform(0.3, 0.7, size=m)
+        probs = np.column_stack([signal_0, signal_1])
+
+        # Query features: feature 0 indicates which signal is reliable
+        query_features = rng.randn(m, n_qf)
+        query_features[:, 0] = 1.0  # constant feature favoring signal 0
+
+        attn = AttentionLogOddsWeights(n_signals=n_signals, n_query_features=n_qf, alpha=0.0)
+        attn.fit(
+            probs, labels, query_features,
+            learning_rate=0.1, max_iterations=2000,
+        )
+
+        # After training, fusion should produce high probs for relevant docs
+        test_qf = np.array([1.0, 0.0, 0.0])
+        result_high = attn(np.array([0.9, 0.5]), test_qf)
+        result_low = attn(np.array([0.1, 0.5]), test_qf)
+        assert result_high > result_low
+
+    def test_update_moves_parameters(self):
+        """update() changes internal parameters from initial state."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=2)
+        W_before = attn.weights_matrix.copy()
+
+        for _ in range(50):
+            probs = np.array([0.9, 0.1])
+            qf = np.array([1.0, 0.0])
+            attn.update(probs, 1.0, qf, learning_rate=0.05)
+
+        W_after = attn.weights_matrix
+        assert not np.allclose(W_before, W_after)
+
+    def test_use_averaged(self):
+        """use_averaged=True uses Polyak-averaged parameters."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=2, alpha=0.0)
+        probs = np.array([0.8, 0.7])
+        qf = np.array([1.0, 0.5])
+
+        # At init, averaged = raw
+        r_raw = attn(probs, qf, use_averaged=False)
+        r_avg = attn(probs, qf, use_averaged=True)
+        assert r_raw == pytest.approx(r_avg, abs=1e-10)
+
+    def test_weights_matrix_returns_copy(self):
+        """weights_matrix returns a copy, not a reference."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=3)
+        w1 = attn.weights_matrix
+        w2 = attn.weights_matrix
+        assert w1 is not w2
+        w1[0, 0] = 999.0
+        assert attn.weights_matrix[0, 0] != 999.0
+
+    def test_fit_resets_online_state(self):
+        """fit() resets online state."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=2)
+        # Simulate some online updates
+        attn.update(np.array([0.8, 0.2]), 1.0, np.array([1.0, 0.0]))
+        assert attn._n_updates == 1
+
+        probs = np.array([[0.8, 0.2], [0.3, 0.7]])
+        labels = np.array([1.0, 0.0])
+        qf = np.array([[1.0, 0.0], [0.0, 1.0]])
+        attn.fit(probs, labels, qf)
+
+        assert attn._n_updates == 0
+        np.testing.assert_allclose(attn._grad_W_ema, 0.0)
+        np.testing.assert_allclose(attn._grad_b_ema, 0.0)
+
+    def test_softmax_numerical_stability(self):
+        """Softmax handles large values without overflow."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=2)
+        z = np.array([[1000.0, -1000.0], [0.0, 0.0]])
+        result = attn._softmax(z)
+        assert np.all(np.isfinite(result))
+        np.testing.assert_allclose(result.sum(axis=-1), 1.0, atol=1e-10)
+        assert result[0, 0] == pytest.approx(1.0, abs=1e-10)
+        assert result[0, 1] == pytest.approx(0.0, abs=1e-10)

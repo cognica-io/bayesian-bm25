@@ -1,5 +1,52 @@
 # History
 
+## 0.7.0 (2026-03-04)
+
+- Add `alpha="auto"` to `log_odds_conjunction` for automatic confidence scaling
+  - Resolves to `alpha=0.5` implementing the sqrt(n) scaling law (Paper 2, Section 4.2)
+  - Available in both `log_odds_conjunction()` and `LearnableLogOddsWeights`
+- Add `AttentionLogOddsWeights` for query-dependent signal weighting (Paper 2, Section 8)
+  - Learns a linear projection from query features to softmax attention weights
+  - Supports batch `fit()` and online `update()` with Polyak averaging
+  - Relaxes the static-weight assumption of `LearnableLogOddsWeights`
+- Add ReLU/Swish gating to `log_odds_conjunction` (Paper 2, Theorems 6.5.3/6.7.4)
+  - `gating="relu"`: MAP estimation under sparse non-negative prior
+  - `gating="swish"`: Bayes estimation under sparse non-negative prior
+  - Applied in logit space before aggregation
+- Add `base_rate_method` parameter to `BayesianBM25Scorer` for alternative base rate
+  estimation strategies
+  - `"percentile"` (default): existing 95th percentile heuristic
+  - `"mixture"`: 2-component Gaussian EM fitting to separate relevant/non-relevant
+    score distributions
+  - `"elbow"`: knee point detection in sorted score curve
+- Add `MultiFieldScorer` for first-class multi-field search (`bayesian_bm25.multi_field`)
+  - Manages per-field `BayesianBM25Scorer` instances and fuses field-level
+    probabilities via `log_odds_conjunction` with configurable per-field weights
+  - `index()` builds separate BM25 indexes for each field, validates documents
+    contain all declared fields
+  - `get_probabilities()` returns dense fused probabilities across all documents
+  - `retrieve()` returns top-k documents by fused probability
+  - `add_documents()` for incremental document addition
+  - Supports `alpha`, `base_rate`, `k1`, `b`, `method` pass-through to per-field scorers
+- Add `RetrievalResult` dataclass for explainable retrieval
+  - `retrieve(explain=True)` returns a `RetrievalResult` with per-document
+    `BM25SignalTrace` explanations via `FusionDebugger`
+  - Default `retrieve()` remains backward compatible, returning `(doc_ids, probabilities)`
+  - Each explanation traces raw score through likelihood, prior, and posterior
+- Add `add_documents()` to `BayesianBM25Scorer` for incremental indexing
+  - Appends new documents and rebuilds the full index (IDF recomputation required)
+  - Re-estimates all BM25 statistics (alpha, beta, base_rate) from the updated corpus
+- Add `CalibrationReport` dataclass and `calibration_report()` one-call diagnostic
+  - Bundles ECE, Brier score, and reliability diagram data in a single call
+  - `summary()` method returns a formatted text report with reliability table
+- Update hybrid BEIR benchmark (`benchmarks/hybrid_beir.py`) with 16 fusion methods
+  - Add Balanced-Mix, Balanced-Elbow (base rate method variants)
+  - Add Gated-ReLU, Gated-Swish (Paper 2 sparse signal gating)
+  - Add Attention (Paper 2 query-dependent weights with negative sampling)
+  - Add MultiField, MF-Balanced (multi-field search + dense hybrid)
+  - Add calibration diagnostics (ECE, Brier score) for probability-producing methods
+  - Graceful handling of datasets with empty field vocabularies (e.g., FiQA titles)
+
 ## 0.6.0 (2026-02-28)
 
 - Add `balanced_log_odds_fusion()` for hybrid sparse-dense retrieval
