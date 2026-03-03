@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 import bm25s
 import numpy as np
 
-from bayesian_bm25.probability import BayesianProbabilityTransform, sigmoid
+from bayesian_bm25.probability import sigmoid
 from bayesian_bm25.scorer import BayesianBM25Scorer
 from benchmarks.metrics import (
     brier_score,
@@ -31,7 +31,6 @@ from benchmarks.metrics import (
     reliability_diagram,
 )
 from benchmarks.utils import load_beir_dataset
-
 
 # ---------------------------------------------------------------------------
 # Score collection
@@ -241,7 +240,7 @@ def run_verification(dataset_name: str) -> dict:
     bayesian_brier = brier_score(test_probs, test_prob_labels)
     bayesian_bins = reliability_diagram(test_probs, test_prob_labels)
 
-    print(f"\n  Bayesian BM25 (auto-estimated):")
+    print("\n  Bayesian BM25 (auto-estimated):")
     print(f"    ECE   = {bayesian_ece:.4f}")
     print(f"    Brier = {bayesian_brier:.4f}")
     print(f"\n    {'Predicted':>10}  {'Actual':>8}  {'Count':>7}  {'Gap':>8}")
@@ -280,7 +279,7 @@ def run_verification(dataset_name: str) -> dict:
     fit_brier = brier_score(fit_probs, fit_labels)
     fit_bins = reliability_diagram(fit_probs, fit_labels)
 
-    print(f"\n  Bayesian BM25 (batch fit on train queries):")
+    print("\n  Bayesian BM25 (batch fit on train queries):")
     print(f"    ECE   = {fit_ece:.4f}")
     print(f"    Brier = {fit_brier:.4f}")
     print(f"\n    {'Predicted':>10}  {'Actual':>8}  {'Count':>7}  {'Gap':>8}")
@@ -295,7 +294,7 @@ def run_verification(dataset_name: str) -> dict:
     minmax_brier = brier_score(minmax_probs, test_labels)
     minmax_bins = reliability_diagram(minmax_probs, test_labels)
 
-    print(f"\n  Min-max normalization (baseline):")
+    print("\n  Min-max normalization (baseline):")
     print(f"    ECE   = {minmax_ece:.4f}")
     print(f"    Brier = {minmax_brier:.4f}")
     print(f"\n    {'Predicted':>10}  {'Actual':>8}  {'Count':>7}  {'Gap':>8}")
@@ -405,10 +404,10 @@ def run_verification(dataset_name: str) -> dict:
         brier_s = f"{brier:8.4f}" if brier is not None else "     n/a"
         print(f"  {name:<20}  {ece_s}  {brier_s}  {thr_gap:+8.4f}")
 
-    print(f"\n  Interpretation:")
-    print(f"    ECE: lower = better calibrated (predicted prob matches actual rate)")
-    print(f"    Brier: lower = better (calibration + discrimination combined)")
-    print(f"    Thr.Gap: lower = threshold generalizes across queries")
+    print("\n  Interpretation:")
+    print("    ECE: lower = better calibrated (predicted prob matches actual rate)")
+    print("    Brier: lower = better (calibration + discrimination combined)")
+    print("    Thr.Gap: lower = threshold generalizes across queries")
     print(f"    Brier reference (no discrimination): {constant_brier:.4f}")
 
     return {

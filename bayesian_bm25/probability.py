@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import numpy as np
 
-
 _EPSILON = 1e-10
 _ALPHA_MIN = 0.01
 
@@ -75,11 +74,10 @@ class BayesianProbabilityTransform:
         beta: float = 0.0,
         base_rate: float | None = None,
     ) -> None:
-        if base_rate is not None:
-            if not (0.0 < base_rate < 1.0):
-                raise ValueError(
-                    f"base_rate must be in (0, 1), got {base_rate}"
-                )
+        if base_rate is not None and not (0.0 < base_rate < 1.0):
+            raise ValueError(
+                f"base_rate must be in (0, 1), got {base_rate}"
+            )
         self.alpha = alpha
         self.beta = beta
         self.base_rate = base_rate
@@ -272,11 +270,10 @@ class BayesianProbabilityTransform:
             raise ValueError(
                 f"mode must be one of {self._VALID_MODES}, got {mode!r}"
             )
-        if mode == "prior_aware":
-            if tfs is None or doc_len_ratios is None:
-                raise ValueError(
-                    "tfs and doc_len_ratios are required when mode='prior_aware'"
-                )
+        if mode == "prior_aware" and (tfs is None or doc_len_ratios is None):
+            raise ValueError(
+                "tfs and doc_len_ratios are required when mode='prior_aware'"
+            )
 
         scores = np.asarray(scores, dtype=np.float64)
         labels = np.asarray(labels, dtype=np.float64)
@@ -400,11 +397,10 @@ class BayesianProbabilityTransform:
             raise ValueError(
                 f"mode must be one of {self._VALID_MODES}, got {effective_mode!r}"
             )
-        if effective_mode == "prior_aware":
-            if tf is None or doc_len_ratio is None:
-                raise ValueError(
-                    "tf and doc_len_ratio are required when mode='prior_aware'"
-                )
+        if effective_mode == "prior_aware" and (tf is None or doc_len_ratio is None):
+            raise ValueError(
+                "tf and doc_len_ratio are required when mode='prior_aware'"
+            )
 
         score = np.atleast_1d(np.asarray(score, dtype=np.float64))
         label = np.atleast_1d(np.asarray(label, dtype=np.float64))

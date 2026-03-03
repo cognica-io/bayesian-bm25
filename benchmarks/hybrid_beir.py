@@ -50,12 +50,9 @@ import os
 import time
 import urllib.request
 import zipfile
-from pathlib import Path
-from typing import Optional
-
-import numpy as np
 
 import bm25s
+import numpy as np
 import Stemmer
 
 from bayesian_bm25.fusion import (
@@ -126,7 +123,7 @@ def download_beir_dataset(dataset_name: str, beir_dir: str) -> str:
         print(f"\n  ERROR: failed to download {url} ({exc})")
         if os.path.exists(zip_path):
             os.remove(zip_path)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
     print()  # newline after progress
 
     print(f"  Extracting to {beir_dir} ...")
@@ -197,7 +194,7 @@ def load_beir_dataset(dataset_dir: str) -> dict:
     filtered_qids = []
     filtered_qtexts = []
     qid_set = set(qrels.keys())
-    for qid, qtext in zip(query_ids, query_texts):
+    for qid, qtext in zip(query_ids, query_texts, strict=True):
         if qid in qid_set:
             filtered_qids.append(qid)
             filtered_qtexts.append(qtext)
@@ -588,7 +585,7 @@ def learn_parameters_from_qrels(
     all_scores: list[float] = []
     all_labels: list[float] = []
 
-    for qid, qtokens in zip(train_qids, train_tokens):
+    for qid, qtokens in zip(train_qids, train_tokens, strict=True):
         rel_map = train_qrels.get(qid)
         if not rel_map:
             continue
@@ -634,7 +631,7 @@ def grid_search_tuned(
     beta: float,
     auto_base_rate: float,
     k: int,
-) -> dict[str, Optional[float]]:
+) -> dict[str, float | None]:
     """Grid search over base_rate, fusion_weight, and hybrid_alpha.
 
     Uses cached per-query data from the main scoring loop.
@@ -646,11 +643,11 @@ def grid_search_tuned(
     has_dense = any("cand_dense" in c and c["cand_dense"] is not None for c in eval_cache.values())
 
     # -- Phase B: base_rate grid search --
-    base_rate_candidates: list[Optional[float]] = [
+    base_rate_candidates: list[float | None] = [
         None, 0.001, 0.005, 0.01, 0.05, 0.1, auto_base_rate,
     ]
     seen: set = set()
-    unique_candidates: list[Optional[float]] = []
+    unique_candidates: list[float | None] = []
     for c in base_rate_candidates:
         key = round(c, 10) if c is not None else None
         if key not in seen:
@@ -658,7 +655,7 @@ def grid_search_tuned(
             unique_candidates.append(c)
     base_rate_candidates = unique_candidates
 
-    best_base_rate: Optional[float] = None
+    best_base_rate: float | None = None
     best_base_rate_ndcg = -1.0
 
     print(f"  Grid search: base_rate ({len(base_rate_candidates)} candidates)...")
@@ -674,7 +671,7 @@ def grid_search_tuned(
             best_base_rate = br
 
     # -- Phase C: fusion_weight grid search --
-    best_fusion_weight: Optional[float] = None
+    best_fusion_weight: float | None = None
     if has_dense:
         fusion_candidates = [round(w * 0.1, 1) for w in range(11)]
         best_fusion_ndcg = -1.0
@@ -693,7 +690,7 @@ def grid_search_tuned(
                 best_fusion_weight = fw
 
     # -- Phase D: hybrid_alpha grid search --
-    best_hybrid_alpha: Optional[float] = None
+    best_hybrid_alpha: float | None = None
     if has_dense:
         hybrid_alpha_candidates = [0.0, 0.25, 0.5, 0.75, 1.0]
         best_hybrid_ndcg = -1.0
@@ -721,7 +718,7 @@ def grid_search_tuned(
 
 
 def print_tuned_summary(
-    tuned: dict[str, Optional[float]],
+    tuned: dict[str, float | None],
     auto_alpha: float,
     auto_beta: float,
     auto_base_rate: float,
@@ -750,7 +747,7 @@ def print_tuned_summary(
     if base_rate is not None:
         print(f"  base_rate:     {base_rate:.4f} (grid search best, 7 candidates)")
     else:
-        print(f"  base_rate:     None (grid search best, 7 candidates)")
+        print("  base_rate:     None (grid search best, 7 candidates)")
 
     if has_dense:
         if fusion_weight is not None:
@@ -1024,17 +1021,17 @@ def run_dataset(
 
     # 7. Tuning (if enabled)
     if tune:
-        print(f"\n  --- Auto-tuning ---")
+        print("\n  --- Auto-tuning ---")
 
         # Step 1: Auto-estimate alpha, beta
-        print(f"  [Tune] Step 1: Auto-estimating alpha, beta from corpus...")
+        print("  [Tune] Step 1: Auto-estimating alpha, beta from corpus...")
         per_query_scores = scorer._sample_pseudo_query_scores(corpus_tokens)
         auto_alpha = scorer._transform.alpha
         auto_beta = scorer._transform.beta
         print(f"    auto alpha={auto_alpha:.4f}, beta={auto_beta:.4f}")
 
         # Step 2: Auto-estimate base_rate
-        print(f"  [Tune] Step 2: Auto-estimating base_rate...")
+        print("  [Tune] Step 2: Auto-estimating base_rate...")
         auto_base_rate = scorer._estimate_base_rate(per_query_scores, n_docs)
         print(f"    auto base_rate={auto_base_rate:.6f}")
 
@@ -1057,7 +1054,7 @@ def run_dataset(
             learned = True
             print(f"    learned alpha={tuned_alpha:.4f}, beta={tuned_beta:.4f}")
         else:
-            print(f"  [Tune] Step 3: Skipped (no train qrels)")
+            print("  [Tune] Step 3: Skipped (no train qrels)")
 
         # Step 4: Grid search
         print(f"  [Tune] Step 4: Grid search (optimizing NDCG@{k})...")
@@ -1080,7 +1077,7 @@ def run_dataset(
             )
 
             train_tune_cache: dict[str, dict] = {}
-            for tq_idx, (tqid, tqtokens) in enumerate(zip(train_qids, train_tokens)):
+            for tq_idx, (tqid, tqtokens) in enumerate(zip(train_qids, train_tokens, strict=True)):
                 if not tqtokens:
                     continue
                 raw_bm25 = scorer._bm25.get_scores(tqtokens)
@@ -1127,7 +1124,7 @@ def run_dataset(
         )
 
         # Step 6: Evaluate tuned configurations on test qrels
-        print(f"  [Tune] Evaluating tuned methods on test qrels...")
+        print("  [Tune] Evaluating tuned methods on test qrels...")
 
         tuned_transform = BayesianProbabilityTransform(
             alpha=tuned["alpha"], beta=tuned["beta"],
@@ -1302,7 +1299,7 @@ def main() -> None:
     print(f"  k={args.top_k}, R={args.retrieve_k}")
     print(f"  Cache: {cache_label}")
     if args.download:
-        print(f"  Download: enabled")
+        print("  Download: enabled")
     print("=" * 70)
 
     # Download datasets if requested
@@ -1317,7 +1314,7 @@ def main() -> None:
         ds_dir = os.path.join(args.beir_dir, ds_name)
         if not os.path.isdir(ds_dir):
             print(f"\nWARNING: Dataset directory not found: {ds_dir}, skipping")
-            print(f"  Hint: use --download to fetch missing datasets automatically")
+            print("  Hint: use --download to fetch missing datasets automatically")
             continue
         all_results[ds_name] = run_dataset(
             ds_dir, ds_name, args.model,

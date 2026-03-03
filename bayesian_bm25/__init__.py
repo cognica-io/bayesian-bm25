@@ -8,7 +8,6 @@
 
 from importlib.metadata import version as _metadata_version
 
-from bayesian_bm25.probability import BayesianProbabilityTransform
 from bayesian_bm25.fusion import (
     LearnableLogOddsWeights,
     balanced_log_odds_fusion,
@@ -23,6 +22,7 @@ from bayesian_bm25.metrics import (
     expected_calibration_error,
     reliability_diagram,
 )
+from bayesian_bm25.probability import BayesianProbabilityTransform
 
 __version__ = _metadata_version("bayesian-bm25")
 

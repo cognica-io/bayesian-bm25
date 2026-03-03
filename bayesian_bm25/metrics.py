@@ -44,7 +44,7 @@ def expected_calibration_error(
     ece = 0.0
     total = len(probabilities)
 
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:], strict=True):
         mask = _bin_mask(probabilities, lo, hi)
         count = np.sum(mask)
         if count == 0:
@@ -83,7 +83,7 @@ def reliability_diagram(
     labels = np.asarray(labels, dtype=np.float64)
     bin_edges = np.linspace(0, 1, n_bins + 1)
     bins = []
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:], strict=True):
         mask = _bin_mask(probabilities, lo, hi)
         count = int(np.sum(mask))
         if count == 0:

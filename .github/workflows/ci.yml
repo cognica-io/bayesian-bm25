@@ -19,11 +19,25 @@ jobs:
       - name: Verify CITATION.cff is in sync with pyproject.toml
         run: python scripts/sync_citation.py --check
 
-  test:
+  lint:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install ruff
+
+      - run: ruff check bayesian_bm25/ tests/ benchmarks/
+
+  test:
     strategy:
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -36,4 +50,29 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Run tests
-        run: pytest tests/
+        run: pytest tests/ --cov=bayesian_bm25 --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -e ".[dev]"
+
+      - name: Run all examples
+        run: |
+          for f in examples/*.py; do
+            echo "=== Running $f ==="
+            python "$f"
+          done

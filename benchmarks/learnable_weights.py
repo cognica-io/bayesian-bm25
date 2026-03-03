@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 from bayesian_bm25.fusion import LearnableLogOddsWeights, log_odds_conjunction
-from bayesian_bm25.probability import logit, sigmoid
+from bayesian_bm25.probability import sigmoid
 
 
 def generate_signals(

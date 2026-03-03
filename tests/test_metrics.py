@@ -155,7 +155,11 @@ class TestMainPackageExport:
         """Backward compatibility: metrics still importable from benchmarks."""
         from benchmarks.metrics import (
             brier_score as bs,
+        )
+        from benchmarks.metrics import (
             expected_calibration_error as ece,
+        )
+        from benchmarks.metrics import (
             reliability_diagram as rd,
         )
 

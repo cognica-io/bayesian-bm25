@@ -320,7 +320,9 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
           f"base_rate=None")
     r = evaluate_bayesian(scorer_fit_no_br, eval_dataset, k=k)
     results.append(("Batch fit (no base rate)", r))
-    tr_f1, te_f1, gap = evaluate_threshold_transfer(scorer_fit_no_br, dataset, train_qids, eval_qids)
+    tr_f1, te_f1, gap = evaluate_threshold_transfer(
+        scorer_fit_no_br, dataset, train_qids, eval_qids
+    )
     threshold_results.append(("Batch fit (no base rate)", tr_f1, te_f1, gap))
 
     # 6. Bayesian (batch fit) -- base_rate="auto"
@@ -336,7 +338,9 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
           f"base_rate={scorer_fit_auto_br.base_rate:.6f}")
     r = evaluate_bayesian(scorer_fit_auto_br, eval_dataset, k=k)
     results.append(("Batch fit (base_rate=auto)", r))
-    tr_f1, te_f1, gap = evaluate_threshold_transfer(scorer_fit_auto_br, dataset, train_qids, eval_qids)
+    tr_f1, te_f1, gap = evaluate_threshold_transfer(
+        scorer_fit_auto_br, dataset, train_qids, eval_qids
+    )
     threshold_results.append(("Batch fit (base_rate=auto)", tr_f1, te_f1, gap))
 
     # 7. Bayesian (batch fit) -- base_rate = actual relevance rate
@@ -353,7 +357,9 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
           f"base_rate={scorer_fit_actual.base_rate:.6f} (actual)")
     r = evaluate_bayesian(scorer_fit_actual, eval_dataset, k=k)
     results.append((f"Batch fit (base_rate={br_actual:.4f})", r))
-    tr_f1, te_f1, gap = evaluate_threshold_transfer(scorer_fit_actual, dataset, train_qids, eval_qids)
+    tr_f1, te_f1, gap = evaluate_threshold_transfer(
+        scorer_fit_actual, dataset, train_qids, eval_qids
+    )
     threshold_results.append((f"Batch fit (base_rate={br_actual:.4f})", tr_f1, te_f1, gap))
 
     # 8. Platt scaling baseline
@@ -383,7 +389,11 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
 
     platt_p_arr = np.array(platt_all_probs) if platt_all_probs else np.array([])
     platt_l_arr = np.array(platt_all_labels) if platt_all_labels else np.array([])
-    platt_ece = expected_calibration_error(platt_p_arr, platt_l_arr) if len(platt_p_arr) > 0 else 1.0
+    platt_ece = (
+        expected_calibration_error(platt_p_arr, platt_l_arr)
+        if len(platt_p_arr) > 0
+        else 1.0
+    )
     platt_brier = brier_score(platt_p_arr, platt_l_arr) if len(platt_p_arr) > 0 else 1.0
     r_platt = {
         f"NDCG@{k}": float(np.mean(platt_ndcgs)),
@@ -398,7 +408,9 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
     platt_train_probs = np.array(sigmoid(platt_A * train_scores + platt_B))
     platt_t, platt_train_f1 = find_best_threshold(platt_train_probs, train_labels)
     _, _, platt_test_f1 = threshold_f1(platt_p_arr, platt_l_arr, platt_t)
-    threshold_results.append(("Platt scaling", platt_train_f1, platt_test_f1, platt_train_f1 - platt_test_f1))
+    threshold_results.append((
+        "Platt scaling", platt_train_f1, platt_test_f1, platt_train_f1 - platt_test_f1
+    ))
 
     # 9. Min-max normalization baseline
     print("9. Min-max normalization (baseline)")
@@ -424,7 +436,11 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
 
     minmax_p_arr = np.array(minmax_all_probs) if minmax_all_probs else np.array([])
     minmax_l_arr = np.array(minmax_all_labels) if minmax_all_labels else np.array([])
-    minmax_ece = expected_calibration_error(minmax_p_arr, minmax_l_arr) if len(minmax_p_arr) > 0 else 1.0
+    minmax_ece = (
+        expected_calibration_error(minmax_p_arr, minmax_l_arr)
+        if len(minmax_p_arr) > 0
+        else 1.0
+    )
     minmax_brier = brier_score(minmax_p_arr, minmax_l_arr) if len(minmax_p_arr) > 0 else 1.0
     r_minmax = {
         f"NDCG@{k}": float(np.mean(minmax_ndcgs)),
@@ -439,7 +455,12 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
     minmax_train = minmax_normalize(train_scores, train_scores)
     minmax_t, minmax_train_f1 = find_best_threshold(minmax_train, train_labels)
     _, _, minmax_test_f1 = threshold_f1(minmax_p_arr, minmax_l_arr, minmax_t)
-    threshold_results.append(("Min-max normalization", minmax_train_f1, minmax_test_f1, minmax_train_f1 - minmax_test_f1))
+    threshold_results.append((
+        "Min-max normalization",
+        minmax_train_f1,
+        minmax_test_f1,
+        minmax_train_f1 - minmax_test_f1,
+    ))
 
     # 10. Batch fit -- prior_aware mode (C2)
     print("10. Batch fit (prior_aware, C2)")
@@ -493,7 +514,9 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
           f"beta={scorer_fit_pf._transform.beta:.4f}, mode=prior_free")
     r = evaluate_bayesian(scorer_fit_pf, eval_dataset, k=k)
     results.append(("Batch fit (prior_free)", r))
-    tr_f1, te_f1, gap = evaluate_threshold_transfer(scorer_fit_pf, dataset, train_qids, eval_qids)
+    tr_f1, te_f1, gap = evaluate_threshold_transfer(
+        scorer_fit_pf, dataset, train_qids, eval_qids
+    )
     threshold_results.append(("Batch fit (prior_free)", tr_f1, te_f1, gap))
 
     # -----------------------------------------------------------------------
@@ -504,8 +527,13 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
     print(f"{'=' * 78}")
 
     col_w = 36
-    print(f"\n  {'Method':<{col_w}}  {'NDCG@10':>8}  {'MAP':>8}  {'P@10':>8}  {'ECE':>8}  {'Brier':>8}")
-    print(f"  {'---' * 12}  {'---' * 3}  {'---' * 3}  {'---' * 3}  {'---' * 3}  {'---' * 3}")
+    hdr = (
+        f"  {'Method':<{col_w}}  {'NDCG@10':>8}  {'MAP':>8}"
+        f"  {'P@10':>8}  {'ECE':>8}  {'Brier':>8}"
+    )
+    print(f"\n{hdr}")
+    print(f"  {'---' * 12}  {'---' * 3}  {'---' * 3}  {'---' * 3}  {'---' * 3}  {'---' * 3}"
+          )
 
     for name, r in results:
         ndcg_str = f"{r[f'NDCG@{k}']:>8.4f}"
@@ -519,8 +547,12 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
     # Deltas vs "no base rate" baseline
     # -----------------------------------------------------------------------
     no_br = results[1][1]  # "Bayesian (no base rate)"
-    print(f"\n  Calibration improvement vs 'no base rate':")
-    print(f"  {'Method':<{col_w}}  {'ECE delta':>10}  {'ECE %':>8}  {'Brier delta':>12}  {'Brier %':>8}")
+    print("\n  Calibration improvement vs 'no base rate':")
+    delta_hdr = (
+        f"  {'Method':<{col_w}}  {'ECE delta':>10}  {'ECE %':>8}"
+        f"  {'Brier delta':>12}  {'Brier %':>8}"
+    )
+    print(delta_hdr)
     print(f"  {'---' * 12}  {'---' * 4}  {'---' * 3}  {'---' * 4}     {'---' * 3}")
 
     for name, r in results[2:]:
@@ -538,18 +570,18 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
     # -----------------------------------------------------------------------
     # Threshold transfer
     # -----------------------------------------------------------------------
-    print(f"\n  Threshold transfer (train threshold -> test queries):")
+    print("\n  Threshold transfer (train threshold -> test queries):")
     print(f"  {'Method':<{col_w}}  {'Train F1':>8}  {'Test F1':>8}  {'Gap':>8}")
     print(f"  {'---' * 12}  {'---' * 3}  {'---' * 3}  {'---' * 3}")
 
     for name, tr_f1, te_f1, gap in threshold_results:
         print(f"  {name:<{col_w}}  {tr_f1:>8.4f}  {te_f1:>8.4f}  {gap:>+8.4f}")
-    print(f"  (Smaller gap = threshold generalises better)")
+    print("  (Smaller gap = threshold generalises better)")
 
     # -----------------------------------------------------------------------
     # Reliability diagram
     # -----------------------------------------------------------------------
-    print(f"\n  Reliability diagram (selected configurations):")
+    print("\n  Reliability diagram (selected configurations):")
     selected = [
         ("Bayesian (no base rate)", scorer_no_br),
         ("Bayesian (base_rate=auto)", scorer_auto_br),
@@ -577,7 +609,10 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
         print(f"    {'Bin':>8}  {'Predicted':>10}  {'Actual':>10}  {'Count':>8}  {'|Error|':>8}")
         for avg_pred, avg_actual, count in bins:
             err = abs(avg_pred - avg_actual)
-            print(f"    {avg_pred:>8.3f}  {avg_pred:>10.4f}  {avg_actual:>10.4f}  {count:>8}  {err:>8.4f}")
+            print(
+                f"    {avg_pred:>8.3f}  {avg_pred:>10.4f}"
+                f"  {avg_actual:>10.4f}  {count:>8}  {err:>8.4f}"
+            )
 
     return {
         name: r for name, r in results

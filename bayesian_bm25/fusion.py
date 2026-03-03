@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from bayesian_bm25.probability import _EPSILON, _clamp_probability, logit, sigmoid
+from bayesian_bm25.probability import _clamp_probability, logit, sigmoid
 
 
 def cosine_to_probability(

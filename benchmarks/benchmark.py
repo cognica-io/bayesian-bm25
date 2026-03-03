@@ -26,7 +26,6 @@ from datetime import datetime, timezone
 import bm25s
 import numpy as np
 
-from bayesian_bm25.probability import BayesianProbabilityTransform, sigmoid
 from bayesian_bm25.scorer import BayesianBM25Scorer
 from benchmarks.metrics import (
     average_precision,
@@ -36,7 +35,6 @@ from benchmarks.metrics import (
 )
 from benchmarks.utils import (
     IRDataset,
-    doc_id_to_idx,
     get_graded_relevance_vector,
     get_relevance_vector,
     load_beir_dataset,
@@ -49,7 +47,6 @@ def evaluate_bm25_raw(
     k: int = 10,
 ) -> dict[str, float]:
     """Evaluate raw BM25 ranking."""
-    did_to_idx = doc_id_to_idx(dataset.doc_ids)
     ndcgs, aps, precisions = [], [], []
 
     for qid, qtokens in dataset.queries:
@@ -197,10 +194,9 @@ def evaluate_threshold_transfer(
         for qid in qids:
             qt = qid_to_tokens[qid]
             qrel = dataset.qrels[qid]
-            if use_probs:
-                scores = scorer.get_probabilities(qt)
-            else:
-                scores = bm25_model.get_scores(qt)
+            scores = (
+                scorer.get_probabilities(qt) if use_probs else bm25_model.get_scores(qt)
+            )
             nz = scores > 0
             if not np.any(nz):
                 continue
@@ -244,7 +240,6 @@ def run_single_dataset(dataset: IRDataset, k: int = 10) -> dict:
     eval_qids = all_qids[mid:]
 
     eval_queries_filtered = [(qid, qt) for qid, qt in dataset.queries if qid in set(eval_qids)]
-    train_queries_filtered = [(qid, qt) for qid, qt in dataset.queries if qid in set(train_qids)]
 
     eval_dataset = IRDataset(
         name=dataset.name,
@@ -253,14 +248,6 @@ def run_single_dataset(dataset: IRDataset, k: int = 10) -> dict:
         queries=eval_queries_filtered,
         qrels=dataset.qrels,
     )
-    train_dataset = IRDataset(
-        name=dataset.name,
-        corpus_tokens=dataset.corpus_tokens,
-        doc_ids=dataset.doc_ids,
-        queries=train_queries_filtered,
-        qrels=dataset.qrels,
-    )
-
     print(f"  Train: {len(train_qids)} queries, Eval: {len(eval_qids)} queries")
 
     # --- 1. Raw BM25 ---
@@ -366,7 +353,7 @@ def run_single_dataset(dataset: IRDataset, k: int = 10) -> dict:
         ece = f"{r['ECE']:>8.4f}" if "ECE" in r else "     n/a"
         print(f"  {name:<35}  {r[f'NDCG@{k}']:>8.4f}  {r['MAP']:>8.4f}  {ece}")
 
-    print(f"\n  vs Raw BM25:")
+    print("\n  vs Raw BM25:")
     for name, r in rows[1:]:
         dn = r[f"NDCG@{k}"] - raw_results[f"NDCG@{k}"]
         dm = r["MAP"] - raw_results["MAP"]
@@ -386,7 +373,7 @@ def run_single_dataset(dataset: IRDataset, k: int = 10) -> dict:
           f"{bm25_tr_f1 - bm25_te_f1:>+8.4f}")
     print(f"  {'Bayesian (online)':<20}  {bay_tr_f1:>8.4f}  {bay_te_f1:>8.4f}  "
           f"{bay_tr_f1 - bay_te_f1:>+8.4f}")
-    print(f"  (Smaller gap = threshold generalises better across queries)")
+    print("  (Smaller gap = threshold generalises better across queries)")
 
     return {
         "Raw BM25": raw_results,

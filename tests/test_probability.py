@@ -325,8 +325,8 @@ class TestOnlineUpdate:
         t = BayesianProbabilityTransform(alpha=0.5, beta=0.0)
         n_epochs = 3
         for _ in range(n_epochs):
-            for s, l in zip(scores, labels):
-                t.update(s, l, learning_rate=0.05, momentum=0.9)
+            for s, label in zip(scores, labels, strict=True):
+                t.update(s, label, learning_rate=0.05, momentum=0.9)
 
         assert abs(t.alpha - true_alpha) < 0.5
         assert abs(t.beta - true_beta) < 0.5
@@ -378,15 +378,15 @@ class TestOnlineUpdate:
         # Low momentum -- more responsive to noise
         t_low = BayesianProbabilityTransform(alpha=1.0, beta=0.0)
         alphas_low = []
-        for s, l in zip(scores, labels):
-            t_low.update(s, l, learning_rate=0.05, momentum=0.5)
+        for s, label in zip(scores, labels, strict=True):
+            t_low.update(s, label, learning_rate=0.05, momentum=0.5)
             alphas_low.append(t_low.alpha)
 
         # High momentum -- smoother trajectory
         t_high = BayesianProbabilityTransform(alpha=1.0, beta=0.0)
         alphas_high = []
-        for s, l in zip(scores, labels):
-            t_high.update(s, l, learning_rate=0.05, momentum=0.95)
+        for s, label in zip(scores, labels, strict=True):
+            t_high.update(s, label, learning_rate=0.05, momentum=0.95)
             alphas_high.append(t_high.alpha)
 
         # High momentum should have lower variance in parameter trajectory

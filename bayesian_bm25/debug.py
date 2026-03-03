@@ -16,23 +16,20 @@ instance.  No dependency on ``bm25s``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
+from bayesian_bm25.fusion import (
+    cosine_to_probability,
+    prob_not,
+)
 from bayesian_bm25.probability import (
     BayesianProbabilityTransform,
     _clamp_probability,
     logit,
     sigmoid,
 )
-from bayesian_bm25.fusion import (
-    cosine_to_probability,
-    prob_and,
-    prob_not,
-    prob_or,
-)
-
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -532,10 +529,13 @@ class FusionDebugger:
             if name == dominant:
                 continue
             # A signal "crosses over" when it favors the opposite document
-            if fused_delta != 0.0 and delta != 0.0:
-                if (fused_delta > 0 and delta < 0) or (fused_delta < 0 and delta > 0):
-                    crossover_stage = name
-                    break
+            if (
+                fused_delta != 0.0
+                and delta != 0.0
+                and ((fused_delta > 0 and delta < 0) or (fused_delta < 0 and delta > 0))
+            ):
+                crossover_stage = name
+                break
 
         return ComparisonResult(
             doc_a=trace_a,
@@ -659,7 +659,7 @@ class FusionDebugger:
         """Compact one-line summary of a document trace."""
         doc_label = trace.doc_id if trace.doc_id is not None else "unknown"
         parts: list[str] = []
-        for name, sig in trace.signals.items():
+        for _name, sig in trace.signals.items():
             if isinstance(sig, BM25SignalTrace):
                 parts.append(f"BM25={sig.posterior:.3f}")
             elif isinstance(sig, VectorSignalTrace):
@@ -722,15 +722,12 @@ class FusionDebugger:
                 f"  Rank order: {b_label} > {a_label} (by +{abs(fused_delta):.3f})"
             )
         else:
-            lines.append(f"  Rank order: tied")
+            lines.append("  Rank order: tied")
 
         # Dominant signal
         dom = comparison.dominant_signal
         dom_delta = comparison.signal_deltas[dom]
-        if dom_delta >= 0:
-            favored = a_label
-        else:
-            favored = b_label
+        favored = a_label if dom_delta >= 0 else b_label
         lines.append(
             f"  Dominant signal: {dom}"
             f" ({dom_delta:+.3f} in {favored}'s favor)"
@@ -740,10 +737,7 @@ class FusionDebugger:
         if comparison.crossover_stage is not None:
             cross = comparison.crossover_stage
             cross_delta = comparison.signal_deltas[cross]
-            if cross_delta >= 0:
-                cross_favored = a_label
-            else:
-                cross_favored = b_label
+            cross_favored = a_label if cross_delta >= 0 else b_label
             lines.append(
                 f"  Note: {cross} favored {cross_favored},"
                 f" but {dom} signal outweighed it"

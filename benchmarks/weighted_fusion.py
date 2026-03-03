@@ -183,8 +183,8 @@ def run_cosine_pipeline_demo(rng: np.random.Generator) -> dict:
         )
 
     print(f"\n  Weights: BM25={weights[0]:.1f}, Vector={weights[1]:.1f}")
-    print(f"  cosine_to_probability maps [-1,1] -> (0,1) via P = (1+cos)/2")
-    print(f"  log_odds_conjunction fuses in log-odds space with reliability weights")
+    print("  cosine_to_probability maps [-1,1] -> (0,1) via P = (1+cos)/2")
+    print("  log_odds_conjunction fuses in log-odds space with reliability weights")
 
     return {
         "n_results": n_results,

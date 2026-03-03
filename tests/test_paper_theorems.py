@@ -20,18 +20,17 @@ import math
 import numpy as np
 import pytest
 
-from bayesian_bm25.probability import (
-    BayesianProbabilityTransform,
-    _clamp_probability,
-    logit,
-    sigmoid,
-)
 from bayesian_bm25.fusion import (
     LearnableLogOddsWeights,
     cosine_to_probability,
     log_odds_conjunction,
     prob_and,
     prob_or,
+)
+from bayesian_bm25.probability import (
+    BayesianProbabilityTransform,
+    logit,
+    sigmoid,
 )
 
 
@@ -2417,12 +2416,10 @@ class TestTokenLevelAttentionPruning:
 
             # Generate value vectors for each query
             all_outputs = []
-            pruned_outputs = []
 
-            for q in range(n_queries):
+            for _q in range(n_queries):
                 probs = rng.uniform(0.1, 0.9, size=n_tokens)
                 values = logit(probs)
-                upper_bounds = values + rng.uniform(0.1, 1.5, size=n_tokens)
 
                 raw_scores = rng.uniform(-2, 2, size=n_tokens)
                 exp_scores = np.exp(raw_scores - np.max(raw_scores))
@@ -2433,7 +2430,6 @@ class TestTokenLevelAttentionPruning:
 
             all_outputs = np.array(all_outputs)
             topk_indices = np.argsort(all_outputs)[-k:]
-            topk_exhaustive = np.sort(all_outputs[topk_indices])
 
             # With pruning: outputs bounded above must include all top-k
             # (simplified: the actual output is always <= bound, so if
@@ -2503,7 +2499,7 @@ class TestHeadLevelAttentionPruning:
             head_outputs = []
             head_upper_bounds = []
 
-            for h in range(n_heads):
+            for _h in range(n_heads):
                 probs = rng.uniform(0.1, 0.9, size=n_tokens)
                 values = logit(probs)
                 ubs = values + rng.uniform(0.1, 2.0, size=n_tokens)
@@ -2527,20 +2523,14 @@ class TestHeadLevelAttentionPruning:
             # Progressive head pruning: if a head's max contribution
             # cannot change the final result significantly, skip it
             a_partial = 0.0
-            evaluated_count = 0
-            for h in np.argsort(-head_upper_bounds):
+            for evaluated_count, h in enumerate(np.argsort(-head_upper_bounds)):
                 # Remaining budget: how much can remaining heads contribute?
                 remaining_heads = n_heads - evaluated_count - 1
                 if remaining_heads > 0:
-                    remaining_ub = np.sum(
-                        np.sort(head_upper_bounds)[-remaining_heads:]
-                    )
-                else:
-                    remaining_ub = 0.0
+                    np.sum(np.sort(head_upper_bounds)[-remaining_heads:])
 
                 # Always evaluate (simplified): just verify bounds
                 a_partial += head_outputs[h]
-                evaluated_count += 1
 
             # Final aggregated output matches
             np.testing.assert_allclose(
@@ -2557,7 +2547,7 @@ class TestHeadLevelAttentionPruning:
             head_outputs = []
             head_ubs = []
 
-            for h in range(n_heads):
+            for _h in range(n_heads):
                 probs = rng.uniform(0.1, 0.9, size=n_tokens)
                 values = logit(probs)
                 ubs = values + rng.uniform(0.1, 2.0, size=n_tokens)

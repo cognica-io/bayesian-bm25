@@ -9,18 +9,6 @@
 import numpy as np
 import pytest
 
-from bayesian_bm25.probability import (
-    BayesianProbabilityTransform,
-    logit,
-    sigmoid,
-)
-from bayesian_bm25.fusion import (
-    cosine_to_probability,
-    log_odds_conjunction,
-    prob_and,
-    prob_not,
-    prob_or,
-)
 from bayesian_bm25.debug import (
     BM25SignalTrace,
     ComparisonResult,
@@ -30,7 +18,17 @@ from bayesian_bm25.debug import (
     NotTrace,
     VectorSignalTrace,
 )
-
+from bayesian_bm25.fusion import (
+    cosine_to_probability,
+    log_odds_conjunction,
+    prob_and,
+    prob_not,
+    prob_or,
+)
+from bayesian_bm25.probability import (
+    BayesianProbabilityTransform,
+    logit,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -278,7 +276,7 @@ class TestTraceFusion:
         assert trace.log_prob_sum is not None
 
         # Verify math: ln(p_i)
-        for p, lp in zip(probs, trace.log_probs):
+        for p, lp in zip(probs, trace.log_probs, strict=True):
             assert lp == pytest.approx(float(np.log(p)))
 
         # sum(ln(p_i))
@@ -304,11 +302,11 @@ class TestTraceFusion:
         assert len(trace.log_complements) == 3
 
         # Verify math: 1-p_i
-        for p, c in zip(probs, trace.complements):
+        for p, c in zip(probs, trace.complements, strict=True):
             assert c == pytest.approx(1.0 - p, abs=1e-9)
 
         # ln(1-p_i)
-        for c, lc in zip(trace.complements, trace.log_complements):
+        for c, lc in zip(trace.complements, trace.log_complements, strict=True):
             assert lc == pytest.approx(float(np.log(c)))
 
         # sum(ln(1-p_i))
@@ -344,11 +342,11 @@ class TestTraceFusion:
         assert trace.log_complement_sum is not None
 
         # Verify math: 1-p_i
-        for p, c in zip(probs, trace.complements):
+        for p, c in zip(probs, trace.complements, strict=True):
             assert c == pytest.approx(1.0 - p, abs=1e-9)
 
         # ln(1-p_i)
-        for c, lc in zip(trace.complements, trace.log_complements):
+        for c, lc in zip(trace.complements, trace.log_complements, strict=True):
             assert lc == pytest.approx(float(np.log(c)))
 
         # sum(ln(1-p_i))
@@ -514,7 +512,7 @@ class TestTraceDocument:
         assert trace.final_probability == trace.fusion.fused_probability
 
     def test_consistency_with_individual_traces(self, debugger):
-        """trace_document should produce same values as calling trace_bm25 + trace_vector + trace_fusion."""
+        """trace_document produces same values as trace_bm25 + trace_vector + trace_fusion."""
         score, tf, dl, cos = 8.42, 5.0, 0.60, 0.74
         doc_trace = debugger.trace_document(
             bm25_score=score, tf=tf, doc_len_ratio=dl,

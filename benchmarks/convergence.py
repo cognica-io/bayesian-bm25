@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 import bm25s
 import numpy as np
 
-from bayesian_bm25.probability import BayesianProbabilityTransform, sigmoid
+from bayesian_bm25.probability import BayesianProbabilityTransform
 from bayesian_bm25.scorer import BayesianBM25Scorer
 from benchmarks.metrics import expected_calibration_error
 from benchmarks.utils import load_beir_dataset

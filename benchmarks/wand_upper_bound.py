@@ -145,7 +145,7 @@ def run_real_corpus_evaluation(dataset_name: str) -> dict:
     n_safe = 0
     n_total = 0
 
-    for qid, qtokens in ds.queries[:50]:  # Limit to 50 queries for speed
+    for _qid, qtokens in ds.queries[:50]:  # Limit to 50 queries for speed
         scores = bm25_model.get_scores(qtokens)
         nonzero_scores = scores[scores > 0]
         if len(nonzero_scores) == 0:
@@ -176,7 +176,7 @@ def run_real_corpus_evaluation(dataset_name: str) -> dict:
 
     # Skip rate analysis with real term upper bounds
     term_ubs = []
-    for qid, qtokens in ds.queries[:50]:
+    for _qid, qtokens in ds.queries[:50]:
         scores = bm25_model.get_scores(qtokens)
         nonzero_scores = scores[scores > 0]
         if len(nonzero_scores) > 0:

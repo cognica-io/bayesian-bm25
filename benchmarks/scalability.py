@@ -169,23 +169,23 @@ def run_scalability_for_size(
     scorer = BayesianBM25Scorer(k1=1.2, b=0.75, method="lucene")
 
     # Index
-    print(f"  Indexing...", end="", flush=True)
+    print("  Indexing...", end="", flush=True)
     index_result = measure_index(scorer, corpus_tokens)
     print(f" {index_result['wall_ms']:.0f} ms, "
           f"{index_result['peak_memory_mb']:.1f} MB peak")
 
     # Retrieve
-    print(f"  Retrieving...", end="", flush=True)
+    print("  Retrieving...", end="", flush=True)
     retrieve_result = measure_retrieve(scorer, queries, k=10)
     print(f" {retrieve_result['mean_ms']:.2f} ms/query (mean)")
 
     # Get probabilities
-    print(f"  get_probabilities...", end="", flush=True)
+    print("  get_probabilities...", end="", flush=True)
     probs_result = measure_get_probabilities(scorer, queries)
     print(f" {probs_result['mean_ms']:.2f} ms/query (mean)")
 
     # Compute TF batch
-    print(f"  _compute_tf_batch...", end="", flush=True)
+    print("  _compute_tf_batch...", end="", flush=True)
     tf_result = measure_compute_tf_batch(scorer, queries)
     print(f" {tf_result['mean_ms']:.2f} ms/query (mean)")
 

@@ -6,7 +6,6 @@
 
 """Tests for bayesian_bm25.fusion module."""
 
-import copy
 import pickle
 
 import numpy as np
@@ -393,7 +392,8 @@ class TestWeightedLogOddsConjunction:
         probs = np.array([0.7, 0.8, 0.6])
         w = np.array([0.4, 0.4, 0.2])
         # Old behavior: sigma(sum(w_i * logit(P_i))) with no n^alpha
-        from bayesian_bm25.probability import logit as _logit, sigmoid as _sigmoid
+        from bayesian_bm25.probability import logit as _logit
+        from bayesian_bm25.probability import sigmoid as _sigmoid
         expected = _sigmoid(np.sum(w * _logit(probs)))
         result = log_odds_conjunction(probs, weights=w)
         assert result == pytest.approx(expected, abs=1e-10)
@@ -588,7 +588,9 @@ class TestLearnableLogOddsWeights:
 
     def test_numerical_gradient(self):
         """Analytical gradient matches finite-difference approximation."""
-        from bayesian_bm25.probability import logit as _logit, sigmoid as _sigmoid, _clamp_probability
+        from bayesian_bm25.probability import _clamp_probability
+        from bayesian_bm25.probability import logit as _logit
+        from bayesian_bm25.probability import sigmoid as _sigmoid
 
         learner = LearnableLogOddsWeights(n_signals=3, alpha=0.0)
         learner._logits = np.array([0.5, -0.3, 0.1])
