@@ -35,7 +35,9 @@ def two_field_docs():
         },
         {
             "title": ["machine", "learning"],
-            "body": ["machine", "learning", "is", "a", "subset", "of", "artificial", "intelligence"],
+            "body": [
+                "machine", "learning", "is", "a", "subset", "of", "artificial", "intelligence",
+            ],
         },
     ]
 
