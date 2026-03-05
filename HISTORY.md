@@ -1,5 +1,30 @@
 # History
 
+## 0.8.0 (2026-03-05)
+
+- Add `normalize` parameter to `AttentionLogOddsWeights` for per-signal logit normalization
+  - When `normalize=True`, applies per-column min-max normalization in logit space
+    before the weighted sum, equalizing signal scales (same scaling as
+    `balanced_log_odds_fusion`)
+  - `__call__`: normalizes logit columns across all candidates for a given query
+  - `fit`: accepts optional `query_ids` parameter to normalize within each query
+    group; without `query_ids`, normalizes the whole batch as a single group
+  - `update`: normalizes logit columns when input is 2D (assumes same query)
+  - Adds `normalize` read-only property and `_normalize_logits` static method
+  - Reuses the existing `_min_max_normalize` function for per-column normalization
+- Fix `AttentionLogOddsWeights.__call__` to broadcast single query features across
+  batched probability inputs (single query vector applied to all candidates)
+- Simplify Attn-NR benchmark variants in `benchmarks/hybrid_beir.py`
+  - Remove external sigmoid trick (`_min_max_norm`, `_prepare_attn_probs`
+    normalization logic) -- normalization is now handled by the model internally
+    via `normalize=True`
+  - `_score_attn_variant` uses `model(...)` instead of manual weight computation
+    and `log_odds_conjunction` calls
+  - Pass per-query `query_ids` to `fit()` so training normalization matches
+    per-query inference normalization
+  - Remove unused imports (`sigmoid`, `_clamp_probability`) from benchmark
+- Update BEIR benchmark results in README with latest 5-dataset run
+
 ## 0.7.0 (2026-03-04)
 
 - Add `alpha="auto"` to `log_odds_conjunction` for automatic confidence scaling

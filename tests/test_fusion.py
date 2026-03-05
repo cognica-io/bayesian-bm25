@@ -1031,3 +1031,191 @@ class TestAttentionLogOddsWeights:
         np.testing.assert_allclose(result.sum(axis=-1), 1.0, atol=1e-10)
         assert result[0, 0] == pytest.approx(1.0, abs=1e-10)
         assert result[0, 1] == pytest.approx(0.0, abs=1e-10)
+
+    def test_normalize_default_false(self):
+        """Default normalize is False."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=3)
+        assert attn.normalize is False
+
+    def test_normalize_property(self):
+        """normalize property reflects constructor argument."""
+        attn = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=3, normalize=True
+        )
+        assert attn.normalize is True
+
+    def test_call_normalize_rescales(self):
+        """Normalize=True produces different results from normalize=False.
+
+        Two signals with very different logit scales: without normalization
+        the high-logit signal dominates; with normalization both contribute
+        equally after per-column min-max rescaling.
+        """
+        # Signal 0: high dynamic range (logits span ~8 units)
+        # Signal 1: low dynamic range (logits span ~0.4 units)
+        probs = np.array([
+            [0.99, 0.55],
+            [0.50, 0.50],
+            [0.01, 0.45],
+        ])
+        # Per-row query features (batched call requires matching rows)
+        qf = np.array([
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ])
+
+        attn_plain = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=3, normalize=False
+        )
+        attn_norm = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=3, normalize=True
+        )
+        # Copy weights so both use the same parameters
+        attn_norm._W = attn_plain._W.copy()
+        attn_norm._b = attn_plain._b.copy()
+        attn_norm._W_avg = attn_plain._W_avg.copy()
+        attn_norm._b_avg = attn_plain._b_avg.copy()
+
+        r_plain = attn_plain(probs, qf)
+        r_norm = attn_norm(probs, qf)
+        # Results should differ due to normalization
+        assert not np.allclose(r_plain, r_norm)
+
+    def test_call_normalize_single_sample_fallthrough(self):
+        """1D probs with normalize=True falls through to non-normalized path."""
+        attn_norm = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=3, normalize=True
+        )
+        attn_plain = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=3, normalize=False
+        )
+        probs = np.array([0.8, 0.7])
+        qf = np.array([1.0, 0.5, -0.3])
+        r_norm = attn_norm(probs, qf)
+        r_plain = attn_plain(probs, qf)
+        # 1D input cannot be normalized (no candidates to normalize across),
+        # so both paths should produce identical results.
+        assert np.isclose(r_norm, r_plain)
+        assert 0 < r_norm < 1
+
+    def test_fit_normalize_with_query_ids(self):
+        """fit with query_ids groups normalization correctly."""
+        rng = np.random.RandomState(42)
+        m = 200
+        n_signals = 2
+        n_qf = 2
+
+        labels = rng.randint(0, 2, size=m).astype(np.float64)
+        signal_0 = np.where(labels == 1, 0.85, 0.15)
+        signal_1 = rng.uniform(0.3, 0.7, size=m)
+        probs = np.column_stack([signal_0, signal_1])
+        query_features = np.ones((m, n_qf), dtype=np.float64)
+        # 10 queries, each with 20 candidates
+        query_ids = np.repeat(np.arange(10), 20)
+
+        attn = AttentionLogOddsWeights(
+            n_signals=n_signals, n_query_features=n_qf,
+            alpha=0.0, normalize=True,
+        )
+        # Should not raise
+        attn.fit(
+            probs, labels, query_features,
+            query_ids=query_ids,
+            learning_rate=0.1, max_iterations=500,
+        )
+        # After training, fusion should produce reasonable results
+        test_probs = np.array([[0.9, 0.5], [0.1, 0.5]])
+        test_qf = np.array([1.0, 0.0])
+        results = attn(test_probs, test_qf)
+        assert results.shape == (2,)
+
+    def test_fit_normalize_without_query_ids(self):
+        """fit without query_ids normalizes whole batch."""
+        rng = np.random.RandomState(42)
+        m = 100
+        labels = rng.randint(0, 2, size=m).astype(np.float64)
+        signal_0 = np.where(labels == 1, 0.85, 0.15)
+        signal_1 = rng.uniform(0.3, 0.7, size=m)
+        probs = np.column_stack([signal_0, signal_1])
+        query_features = np.ones((m, 2), dtype=np.float64)
+
+        attn = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=2,
+            alpha=0.0, normalize=True,
+        )
+        # Should not raise -- normalizes the whole batch as one group
+        attn.fit(
+            probs, labels, query_features,
+            learning_rate=0.1, max_iterations=500,
+        )
+        assert attn._n_updates == 0  # fit resets online state
+
+    def test_fit_normalize_query_ids_vs_global(self):
+        """Per-query normalization (query_ids) produces different weights
+        than global batch normalization when signal scales differ per query."""
+        rng = np.random.RandomState(123)
+        n_per_q = 50
+        n_signals = 2
+        n_qf = 2
+
+        # Query A: signal 0 has logits in [-10, 10], signal 1 in [-1, 1]
+        # Query B: signal 0 has logits in [-1, 1], signal 1 in [-10, 10]
+        # Global normalization mixes these scales; per-query fixes them.
+        labels_a = rng.randint(0, 2, size=n_per_q).astype(np.float64)
+        labels_b = rng.randint(0, 2, size=n_per_q).astype(np.float64)
+
+        from bayesian_bm25.fusion import sigmoid
+        probs_a = np.column_stack([
+            sigmoid(np.where(labels_a == 1, rng.uniform(3, 10, n_per_q),
+                             rng.uniform(-10, -3, n_per_q))),
+            sigmoid(rng.uniform(-1, 1, n_per_q)),
+        ])
+        probs_b = np.column_stack([
+            sigmoid(rng.uniform(-1, 1, n_per_q)),
+            sigmoid(np.where(labels_b == 1, rng.uniform(3, 10, n_per_q),
+                             rng.uniform(-10, -3, n_per_q))),
+        ])
+
+        probs = np.vstack([probs_a, probs_b])
+        labels = np.concatenate([labels_a, labels_b])
+        qf = np.ones((2 * n_per_q, n_qf), dtype=np.float64)
+        query_ids = np.array([0] * n_per_q + [1] * n_per_q)
+
+        attn_global = AttentionLogOddsWeights(
+            n_signals=n_signals, n_query_features=n_qf,
+            alpha=0.0, normalize=True,
+        )
+        attn_global.fit(probs, labels, qf,
+                        learning_rate=0.1, max_iterations=300)
+
+        attn_perq = AttentionLogOddsWeights(
+            n_signals=n_signals, n_query_features=n_qf,
+            alpha=0.0, normalize=True,
+        )
+        attn_perq.fit(probs, labels, qf, query_ids=query_ids,
+                      learning_rate=0.1, max_iterations=300)
+
+        # The learned weight matrices should differ
+        assert not np.allclose(attn_global._W, attn_perq._W, atol=1e-3)
+
+    def test_normalize_uniform_signal_zeros_out(self):
+        """Signal with all-same values normalizes to zeros.
+
+        _min_max_normalize maps constant arrays to all-zeros, so a
+        uniform signal contributes nothing after normalization.
+        """
+        # Signal 0: varied, Signal 1: constant 0.5
+        probs = np.array([
+            [0.9, 0.5],
+            [0.5, 0.5],
+            [0.1, 0.5],
+        ])
+        qf = np.array([1.0, 0.0])
+
+        attn = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=2, normalize=True
+        )
+        result = attn(probs, qf)
+        assert result.shape == (3,)
+        assert np.all(np.isfinite(result))

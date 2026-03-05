@@ -26,14 +26,16 @@ Methods compared:
   9. Gated-ReLU       -- log-odds conjunction with ReLU gating (Theorem 6.5.3)
  10. Gated-Swish      -- log-odds conjunction with Swish gating (Theorem 6.7.4)
  11. Attention        -- query-dependent attention weights (Paper 2, Section 8)
- 12. MultiField       -- MultiFieldScorer (title + body), sparse-only
- 13. MF-Balanced      -- MultiField probs + dense via balanced_log_odds_fusion
+ 12. Attn-NR          -- Attention + logit normalization + 7 features (dense+cross)
+ 13. Attn-NR-CV       -- 5-fold cross-validated Attn-NR
+ 14. MultiField       -- MultiFieldScorer (title + body), sparse-only
+ 15. MF-Balanced      -- MultiField probs + dense via balanced_log_odds_fusion
 
 With --tune, additional tuned methods are evaluated:
 
- 14. Bayesian-Tuned     -- BayesianBM25 with tuned alpha, beta, base_rate
- 15. Balanced-Tuned     -- balanced_log_odds_fusion with tuned weight
- 16. Hybrid-AND-Tuned   -- log-odds conjunction with tuned alpha
+ 16. Bayesian-Tuned     -- BayesianBM25 with tuned alpha, beta, base_rate
+ 17. Balanced-Tuned     -- balanced_log_odds_fusion with tuned weight
+ 18. Hybrid-AND-Tuned   -- log-odds conjunction with tuned alpha
 
 Dependencies:
     pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5
@@ -70,7 +72,10 @@ from bayesian_bm25.fusion import (
 )
 from bayesian_bm25.metrics import calibration_report
 from bayesian_bm25.multi_field import MultiFieldScorer
-from bayesian_bm25.probability import BayesianProbabilityTransform, logit
+from bayesian_bm25.probability import (
+    BayesianProbabilityTransform,
+    logit,
+)
 from bayesian_bm25.scorer import BayesianBM25Scorer
 
 STEMMER = Stemmer.Stemmer("english")
@@ -806,6 +811,266 @@ def evaluate_pytrec(
 
 
 # ---------------------------------------------------------------------------
+# Attention variant helpers
+# ---------------------------------------------------------------------------
+
+
+def _prepare_attn_probs(
+    probs_br: np.ndarray,
+    cand_dense: np.ndarray,
+    probs_no_br: np.ndarray | None = None,
+) -> tuple[np.ndarray, ...]:
+    """Prepare raw probability signals for attention.
+
+    Normalization is handled by the model when ``normalize=True`` is set
+    on the ``AttentionLogOddsWeights`` constructor.
+
+    When probs_no_br is provided, returns 3 signals (BM25-BR, dense,
+    BM25-no-BR).  Otherwise returns 2 signals.
+    """
+    dense_probs = np.asarray(
+        cosine_to_probability(cand_dense), dtype=np.float64,
+    )
+    if probs_no_br is not None:
+        return probs_br, dense_probs, probs_no_br
+    return probs_br, dense_probs
+
+
+def _collect_attn_training_data(
+    attn_cache: dict,
+    corpus_ids: list,
+    qrels: dict,
+    feature_key: str,
+    seed: int = 42,
+    exclude_qids: set | None = None,
+    n_signals: int = 2,
+) -> tuple[list, list, list, list]:
+    """Collect (probs, labels, features, query_ids) for attention training.
+
+    When exclude_qids is set, those queries are skipped (for CV).
+    n_signals=3 includes BM25 probs without base rate as a third signal.
+    Returns query_ids so fit() can normalize logits per-query when normalize=True.
+    """
+    rng = np.random.default_rng(seed)
+    train_probs: list[list[float]] = []
+    train_labels: list[float] = []
+    train_features: list[np.ndarray] = []
+    train_query_ids: list[str] = []
+
+    for qid, cache in attn_cache.items():
+        if exclude_qids and qid in exclude_qids:
+            continue
+        qrel_map = qrels.get(qid)
+        if not qrel_map:
+            continue
+
+        ui = cache["union_idx"]
+        probs_no_br = cache.get("cand_probs") if n_signals == 3 else None
+        signals = _prepare_attn_probs(
+            cache["cand_probs_br"], cache["cand_dense"],
+            probs_no_br=probs_no_br,
+        )
+        feats = cache[feature_key]
+
+        pos_count = 0
+        neg_indices: list[int] = []
+        for j in range(len(ui)):
+            doc_id = corpus_ids[ui[j]]
+            if doc_id in qrel_map:
+                train_probs.append([s[j] for s in signals])
+                train_labels.append(1.0 if qrel_map[doc_id] > 0 else 0.0)
+                train_features.append(feats)
+                train_query_ids.append(qid)
+                if qrel_map[doc_id] > 0:
+                    pos_count += 1
+            else:
+                neg_indices.append(j)
+
+        n_neg = min(pos_count, len(neg_indices))
+        if n_neg > 0:
+            sampled = rng.choice(neg_indices, size=n_neg, replace=False)
+            for j in sampled:
+                train_probs.append([s[j] for s in signals])
+                train_labels.append(0.0)
+                train_features.append(feats)
+                train_query_ids.append(qid)
+
+    return train_probs, train_labels, train_features, train_query_ids
+
+
+def _score_attn_variant(
+    model: AttentionLogOddsWeights,
+    attn_cache: dict,
+    corpus_ids: list,
+    feature_key: str,
+    only_qids: set | None = None,
+    n_signals: int = 2,
+) -> dict[str, dict[str, float]]:
+    """Score queries with a trained attention model. Returns run dict."""
+    run: dict[str, dict[str, float]] = {}
+    for qid, cache in attn_cache.items():
+        if only_qids is not None and qid not in only_qids:
+            continue
+        ui = cache["union_idx"]
+        probs_no_br = cache.get("cand_probs") if n_signals == 3 else None
+        signals = _prepare_attn_probs(
+            cache["cand_probs_br"], cache["cand_dense"],
+            probs_no_br=probs_no_br,
+        )
+        feats = cache[feature_key]
+        probs_matrix = np.column_stack(signals)
+
+        scores = model(probs_matrix, feats, use_averaged=True)
+        run[qid] = {
+            corpus_ids[ui[j]]: float(scores[j])
+            for j in range(len(ui))
+        }
+    return run
+
+
+def _train_and_score_attn(
+    variant_name: str,
+    attn_cache: dict,
+    corpus_ids: list,
+    qrels: dict,
+    feature_key: str,
+    n_features: int,
+    normalize: bool,
+    methods: list[str],
+    runs: dict,
+    alpha: float = 0.5,
+    n_signals: int = 2,
+    lr: float = 0.01,
+    max_iter: int = 500,
+) -> bool:
+    """Train one attention variant and populate its run. Returns success."""
+    tp, tl, tf, tq = _collect_attn_training_data(
+        attn_cache, corpus_ids, qrels, feature_key,
+        n_signals=n_signals,
+    )
+    n_train = len(tp)
+    labels_arr = np.array(tl, dtype=np.float64)
+    has_both = (
+        n_train >= 10
+        and float(np.sum(labels_arr)) > 0
+        and float(np.sum(1.0 - labels_arr)) > 0
+    )
+
+    if not has_both:
+        if variant_name in methods:
+            methods.remove(variant_name)
+        runs.pop(variant_name, None)
+        print(f"  {variant_name} skipped (insufficient data: {n_train} pairs)")
+        return False
+
+    model = AttentionLogOddsWeights(
+        n_signals=n_signals, n_query_features=n_features, alpha=alpha,
+        normalize=normalize,
+    )
+    model.fit(
+        np.array(tp, dtype=np.float64),
+        labels_arr,
+        np.array(tf, dtype=np.float64),
+        learning_rate=lr,
+        max_iterations=max_iter,
+        query_ids=np.array(tq) if normalize else None,
+    )
+    runs[variant_name] = _score_attn_variant(
+        model, attn_cache, corpus_ids, feature_key,
+        n_signals=n_signals,
+    )
+    print(f"  {variant_name} trained ({n_train} pairs)")
+    return True
+
+
+def _train_attn_cv(
+    attn_cache: dict,
+    corpus_ids: list,
+    qrels: dict,
+    feature_key: str,
+    n_features: int,
+    normalize: bool,
+    methods: list[str],
+    runs: dict,
+    n_folds: int = 5,
+    alpha: float = 0.5,
+    n_signals: int = 2,
+    lr: float = 0.01,
+    max_iter: int = 500,
+) -> bool:
+    """Train Attn-NR-CV via k-fold cross-validation."""
+    variant_name = "Attn-NR-CV"
+    cv_qids = [qid for qid in attn_cache if qrels.get(qid)]
+    n_cv = len(cv_qids)
+
+    if n_cv < 10:
+        if variant_name in methods:
+            methods.remove(variant_name)
+        runs.pop(variant_name, None)
+        print(f"  {variant_name} skipped (insufficient queries: {n_cv})")
+        return False
+
+    rng_cv = np.random.default_rng(42)
+    perm = rng_cv.permutation(n_cv)
+    fold_size = n_cv // n_folds
+    cv_run: dict[str, dict[str, float]] = {}
+    total_train = 0
+
+    for fold_i in range(n_folds):
+        start = fold_i * fold_size
+        end = n_cv if fold_i == n_folds - 1 else start + fold_size
+        test_qids = {cv_qids[perm[j]] for j in range(start, end)}
+
+        tp, tl, tf, tq = _collect_attn_training_data(
+            attn_cache, corpus_ids, qrels,
+            feature_key, exclude_qids=test_qids,
+            n_signals=n_signals,
+        )
+        labels_arr = np.array(tl, dtype=np.float64)
+        has_both = (
+            len(tp) >= 10
+            and float(np.sum(labels_arr)) > 0
+            and float(np.sum(1.0 - labels_arr)) > 0
+        )
+        if not has_both:
+            continue
+
+        model = AttentionLogOddsWeights(
+            n_signals=n_signals, n_query_features=n_features, alpha=alpha,
+            normalize=normalize,
+        )
+        model.fit(
+            np.array(tp, dtype=np.float64),
+            labels_arr,
+            np.array(tf, dtype=np.float64),
+            learning_rate=lr,
+            max_iterations=max_iter,
+            query_ids=np.array(tq) if normalize else None,
+        )
+        fold_run = _score_attn_variant(
+            model, attn_cache, corpus_ids, feature_key,
+            only_qids=test_qids,
+            n_signals=n_signals,
+        )
+        cv_run.update(fold_run)
+        total_train += len(tp)
+
+    if cv_run:
+        runs[variant_name] = cv_run
+        print(
+            f"  {variant_name} trained ({n_folds}-fold CV, "
+            f"{n_cv} queries, {total_train} total train pairs)"
+        )
+        return True
+
+    if variant_name in methods:
+        methods.remove(variant_name)
+    runs.pop(variant_name, None)
+    print(f"  {variant_name} skipped (all CV folds had insufficient data)")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Main benchmark pipeline
 # ---------------------------------------------------------------------------
 
@@ -814,7 +1079,7 @@ BASELINE_METHODS = [
     "Bayesian-OR", "Bayesian-LogOdds", "LO-Local", "Bayesian-LO-BR", "Bayesian-Balanced",
     "Balanced-Mix", "Balanced-Elbow",
     "Gated-ReLU", "Gated-Swish",
-    "Attention",
+    "Attention", "Attn-NR", "Attn-NR-CV",
     "MultiField", "MF-Balanced",
 ]
 
@@ -1128,12 +1393,34 @@ def run_dataset(
         qlen = len(qtokens)
         bm25_hit_ratio = float(np.count_nonzero(raw_bm25)) / n_docs
         max_bm25_log = float(np.log1p(np.max(raw_bm25))) if np.any(raw_bm25 > 0) else 0.0
+
+        # Dense-side features (per-query, computed from full score arrays)
+        top10_k = min(10, n_docs)
+        dense_top_scores = np.sort(dense_sim)[-top10_k:]
+        dense_top10_mean = float(np.mean(dense_top_scores))
+        dense_top10_std = float(np.std(dense_top_scores)) if top10_k > 1 else 0.0
+        max_dense_log = float(np.log1p(max(0.0, float(np.max(dense_sim)))))
+
+        # Cross-signal feature: top-100 retrieval overlap (Jaccard)
+        top100_k = min(100, n_docs)
+        bm25_top100 = set(np.argsort(-raw_bm25)[:top100_k].tolist())
+        dense_top100 = set(np.argsort(-dense_sim)[:top100_k].tolist())
+        union_sz = len(bm25_top100 | dense_top100)
+        overlap_ratio = float(len(bm25_top100 & dense_top100)) / union_sz if union_sz > 0 else 0.0
+
         attn_cache[qid] = {
             "union_idx": union_idx,
+            "cand_probs": cand_bayesian_probs.copy(),
             "cand_probs_br": cand_bayesian_probs_br.copy(),
             "cand_dense": cand_dense.copy(),
             "features": np.array(
                 [np.log1p(qlen), bm25_hit_ratio, max_bm25_log],
+                dtype=np.float64,
+            ),
+            "features_rich": np.array(
+                [np.log1p(qlen), bm25_hit_ratio, max_bm25_log,
+                 dense_top10_mean, dense_top10_std, max_dense_log,
+                 overlap_ratio],
                 dtype=np.float64,
             ),
         }
@@ -1234,6 +1521,27 @@ def run_dataset(
         if "Attention" in runs:
             del runs["Attention"]
         print(f"  Attention skipped (insufficient training data: {n_attn_train} pairs)")
+
+    # 5c. Improved attention: normalization + richer features
+    #
+    #   Attn-NR    : logit-space min-max normalization + 7 features
+    #                (3 BM25 + 3 dense + 1 cross-signal overlap)
+    #   Attn-NR-CV : 5-fold cross-validation of Attn-NR
+    #
+    # normalize=True on AttentionLogOddsWeights applies per-signal
+    # column min-max normalization in logit space (same scaling as
+    # balanced_log_odds_fusion).  Rich features add dense-side
+    # statistics (top-10 mean/std, max) and retrieval overlap.
+    t0 = time.time()
+    _train_and_score_attn(
+        "Attn-NR", attn_cache, corpus_ids, qrels,
+        "features_rich", 7, True, methods, runs,
+    )
+    _train_attn_cv(
+        attn_cache, corpus_ids, qrels,
+        "features_rich", 7, True, methods, runs,
+    )
+    print(f"  Attention variants done ({time.time() - t0:.1f}s)")
 
     # 6. Evaluate baselines
     results: dict[str, dict[str, float]] = {}

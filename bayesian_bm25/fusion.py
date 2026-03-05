@@ -580,6 +580,7 @@ class AttentionLogOddsWeights:
         n_signals: int,
         n_query_features: int,
         alpha: float | str = 0.5,
+        normalize: bool = False,
     ) -> None:
         if n_signals < 1:
             raise ValueError(f"n_signals must be >= 1, got {n_signals}")
@@ -590,6 +591,7 @@ class AttentionLogOddsWeights:
         self._n_signals = n_signals
         self._n_query_features = n_query_features
         self._alpha = _resolve_alpha(alpha, default=0.5)
+        self._normalize = normalize
 
         # W: (n_signals, n_query_features), b: (n_signals,)
         # Xavier-style initialization scaled for softmax input
@@ -621,6 +623,29 @@ class AttentionLogOddsWeights:
     def alpha(self) -> float:
         """Confidence scaling exponent (fixed)."""
         return self._alpha
+
+    @property
+    def normalize(self) -> bool:
+        """Whether per-signal logit normalization is enabled."""
+        return self._normalize
+
+    @staticmethod
+    def _normalize_logits(x: np.ndarray) -> np.ndarray:
+        """Per-column min-max normalization on logit array.
+
+        Parameters
+        ----------
+        x : array of shape (m, n)
+            Logit values where each column is a signal.
+
+        Returns
+        -------
+        Array of same shape with each column independently normalized to [0, 1].
+        """
+        result = x.copy()
+        for col in range(x.shape[-1]):
+            result[..., col] = _min_max_normalize(x[..., col])
+        return result
 
     @property
     def weights_matrix(self) -> np.ndarray:
@@ -678,15 +703,31 @@ class AttentionLogOddsWeights:
         w = self._compute_weights(query_features, use_averaged)
 
         if probs.ndim == 1:
-            # Single sample: w is (1, n_signals), squeeze to (n_signals,)
+            # Single sample: normalization cannot apply (no candidates to
+            # normalize across), fall through to original path.
             w_flat = w.squeeze(0)
             return log_odds_conjunction(probs, alpha=self._alpha, weights=w_flat)
 
-        # Batched: each row has its own query-dependent weights
+        if self._normalize:
+            # Normalize logits per-signal column, then weighted sum + sigmoid
+            x = logit(_clamp_probability(probs))
+            x = self._normalize_logits(x)
+            n = self._n_signals
+            scale = n ** self._alpha
+            # w may be (1, n_signals) for single query or (m, n_signals)
+            # for per-row queries; broadcast via numpy
+            l_weighted = scale * np.sum(w * x, axis=-1)
+            result = sigmoid(l_weighted)
+            return np.atleast_1d(np.asarray(result, dtype=np.float64))
+
+        # Batched: each row has its own query-dependent weights.
+        # When w has fewer rows than probs (single query features for all
+        # candidates), broadcast by repeating the single weight vector.
         results = np.empty(probs.shape[0], dtype=np.float64)
         for i in range(probs.shape[0]):
+            wi = w[min(i, w.shape[0] - 1)]
             results[i] = log_odds_conjunction(
-                probs[i], alpha=self._alpha, weights=w[i]
+                probs[i], alpha=self._alpha, weights=wi
             )
         return results
 
@@ -696,6 +737,7 @@ class AttentionLogOddsWeights:
         labels: np.ndarray,
         query_features: np.ndarray,
         *,
+        query_ids: np.ndarray | None = None,
         learning_rate: float = 0.01,
         max_iterations: int = 1000,
         tolerance: float = 1e-6,
@@ -710,6 +752,12 @@ class AttentionLogOddsWeights:
             Binary relevance labels (0 or 1).
         query_features : array of shape (m, n_query_features)
             Query features for each training sample.
+        query_ids : array of shape (m,) or None
+            Query group identifiers for per-query normalization.  When
+            ``normalize=True`` and ``query_ids`` is provided, logit
+            normalization is applied within each query group.  When
+            ``normalize=True`` and ``query_ids`` is None, the whole batch
+            is normalized as a single group.
         learning_rate : float
             Step size for gradient descent.
         max_iterations : int
@@ -730,6 +778,17 @@ class AttentionLogOddsWeights:
         n = self._n_signals
         scale = n ** self._alpha
         x = logit(probs)  # (m, n)
+
+        if self._normalize:
+            if query_ids is not None:
+                query_ids = np.asarray(query_ids)
+                # Boolean indexing copies, so x[mask] = ... writes back safely
+                # without cross-group contamination.
+                for qid in np.unique(query_ids):
+                    mask = query_ids == qid
+                    x[mask] = self._normalize_logits(x[mask])
+            else:
+                x = self._normalize_logits(x)
 
         for _ in range(max_iterations):
             # Compute per-sample attention weights
@@ -823,6 +882,9 @@ class AttentionLogOddsWeights:
         n = self._n_signals
         scale = n ** self._alpha
         x = logit(probs)  # (m, n)
+
+        if self._normalize and x.ndim == 2:
+            x = self._normalize_logits(x)
 
         z = query_features @ self._W.T + self._b  # (m, n)
         w = self._softmax(z)  # (m, n)
