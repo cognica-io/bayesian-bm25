@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Examples &mdash; Bayesian BM25</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ====== Hero ====== -->
+<header class="hero hero-compact">
+  <h1><span>Bayesian BM25</span> Examples</h1>
+  <p class="tagline">Runnable examples covering transforms, fusion, search, and diagnostics.</p>
+</header>
+
+<!-- ====== Nav ====== -->
+<nav>
+  <ul>
+    <li><a href="index.html">Overview</a></li>
+    <li><a href="docs.html">Docs</a></li>
+    <li><a href="examples.html" class="active">Examples</a></li>
+  </ul>
+</nav>
+
+<div class="page-with-toc">
+
+<!-- ====== TOC ====== -->
+<aside class="toc">
+  <ul>
+    <li><a href="#score-to-prob">Score to Probability</a></li>
+    <li><a href="#search">End-to-End Search</a></li>
+    <li><a href="#multi-field">Multi-Field Search</a></li>
+    <li><a href="#signal-fusion">Signal Fusion</a></li>
+    <li><a href="#hybrid">Hybrid Text + Vector</a></li>
+    <li><a href="#learnable">Learnable Weights</a></li>
+    <li><a href="#attention">Attention Fusion</a></li>
+    <li><a href="#wand">WAND Pruning</a></li>
+    <li><a href="#debugging">Debugging Pipeline</a></li>
+    <li><a href="#calibration">Calibration Metrics</a></li>
+    <li><a href="#online">Online Learning</a></li>
+    <li><a href="#training-modes">Training Modes</a></li>
+    <li><a href="#source-files">Source Files</a></li>
+  </ul>
+</aside>
+
+<!-- ====== Content ====== -->
+<div class="content">
+
+<!-- ============ Score to Probability ============ -->
+<section id="score-to-prob">
+  <h2>Score to Probability</h2>
+  <div class="note">
+    <strong>Tip:</strong> All examples are self-contained. Copy any block into a
+    Python file and run it directly. Requires <code>pip install bayesian-bm25</code>.
+  </div>
+
+  <p>Convert raw BM25 scores into calibrated relevance probabilities via the
+    full Bayesian pipeline (sigmoid likelihood + composite prior + posterior).</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">import</span> numpy <span class="kw">as</span> np
+<span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> BayesianProbabilityTransform
+
+transform = BayesianProbabilityTransform(alpha=<span class="mi">1.5</span>, beta=<span class="mi">1.0</span>, base_rate=<span class="mi">0.01</span>)
+
+scores = np.array([<span class="mi">0.5</span>, <span class="mi">1.0</span>, <span class="mi">1.5</span>, <span class="mi">2.0</span>, <span class="mi">3.0</span>])
+tfs = np.array([<span class="mi">1</span>, <span class="mi">2</span>, <span class="mi">3</span>, <span class="mi">5</span>, <span class="mi">8</span>])
+doc_len_ratios = np.array([<span class="mi">0.3</span>, <span class="mi">0.5</span>, <span class="mi">0.8</span>, <span class="mi">1.0</span>, <span class="mi">1.5</span>])
+
+probabilities = transform.score_to_probability(scores, tfs, doc_len_ratios)</code></pre>
+</section>
+
+<!-- ============ End-to-End Search ============ -->
+<section id="search">
+  <h2>End-to-End Search</h2>
+  <p>Drop-in scorer wrapping <code>bm25s</code> that returns calibrated
+    probabilities instead of raw scores.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> BayesianBM25Scorer
+
+corpus_tokens = [
+    [<span class="st">"python"</span>, <span class="st">"machine"</span>, <span class="st">"learning"</span>],
+    [<span class="st">"deep"</span>, <span class="st">"learning"</span>, <span class="st">"neural"</span>, <span class="st">"networks"</span>],
+    [<span class="st">"data"</span>, <span class="st">"visualization"</span>, <span class="st">"tools"</span>],
+]
+
+scorer = BayesianBM25Scorer(k1=<span class="mi">1.2</span>, b=<span class="mi">0.75</span>, method=<span class="st">"lucene"</span>, base_rate=<span class="st">"auto"</span>)
+scorer.index(corpus_tokens, show_progress=<span class="kw">False</span>)
+
+doc_ids, probabilities = scorer.retrieve([[<span class="st">"machine"</span>, <span class="st">"learning"</span>]], k=<span class="mi">3</span>)</code></pre>
+</section>
+
+<!-- ============ Multi-Field Search ============ -->
+<section id="multi-field">
+  <h2>Multi-Field Search</h2>
+  <p>Separate BM25 indexes per field with automatic fusion via log-odds
+    conjunction.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> MultiFieldScorer
+
+documents = [
+    {<span class="st">"title"</span>: [<span class="st">"bayesian"</span>, <span class="st">"bm25"</span>], <span class="st">"body"</span>: [<span class="st">"probabilistic"</span>, <span class="st">"framework"</span>, <span class="st">"search"</span>]},
+    {<span class="st">"title"</span>: [<span class="st">"neural"</span>, <span class="st">"networks"</span>], <span class="st">"body"</span>: [<span class="st">"deep"</span>, <span class="st">"learning"</span>, <span class="st">"models"</span>]},
+    {<span class="st">"title"</span>: [<span class="st">"information"</span>, <span class="st">"retrieval"</span>], <span class="st">"body"</span>: [<span class="st">"search"</span>, <span class="st">"ranking"</span>, <span class="st">"relevance"</span>]},
+]
+
+scorer = MultiFieldScorer(
+    fields=[<span class="st">"title"</span>, <span class="st">"body"</span>],
+    field_weights={<span class="st">"title"</span>: <span class="mi">0.4</span>, <span class="st">"body"</span>: <span class="mi">0.6</span>},
+    k1=<span class="mi">1.2</span>, b=<span class="mi">0.75</span>, method=<span class="st">"lucene"</span>,
+)
+scorer.index(documents, show_progress=<span class="kw">False</span>)
+doc_ids, probabilities = scorer.retrieve([<span class="st">"bayesian"</span>, <span class="st">"search"</span>], k=<span class="mi">3</span>)</code></pre>
+</section>
+
+<!-- ============ Signal Fusion ============ -->
+<section id="signal-fusion">
+  <h2>Signal Fusion</h2>
+  <p>Combine multiple probability signals with Boolean and log-odds operations.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">import</span> numpy <span class="kw">as</span> np
+<span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> log_odds_conjunction, prob_and, prob_not, prob_or
+
+signals = np.array([<span class="mi">0.85</span>, <span class="mi">0.70</span>, <span class="mi">0.60</span>])
+
+prob_and(signals)                <span class="cm"># 0.357 (shrinkage problem)</span>
+log_odds_conjunction(signals)    <span class="cm"># 0.773 (agreement-aware)</span>
+
+<span class="cm"># Exclusion query: "python AND NOT java"</span>
+p_python, p_java = <span class="mi">0.90</span>, <span class="mi">0.75</span>
+prob_and(np.array([p_python, prob_not(p_java)]))  <span class="cm"># 0.225</span></code></pre>
+</section>
+
+<!-- ============ Hybrid Text + Vector ============ -->
+<section id="hybrid">
+  <h2>Hybrid Text + Vector Search</h2>
+  <p>Fuse BM25 probabilities with dense vector similarity scores.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">import</span> numpy <span class="kw">as</span> np
+<span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> cosine_to_probability, log_odds_conjunction
+
+<span class="cm"># BM25 probabilities (from Bayesian BM25)</span>
+bm25_probs = np.array([<span class="mi">0.85</span>, <span class="mi">0.60</span>, <span class="mi">0.40</span>])
+
+<span class="cm"># Vector search cosine similarities -> probabilities</span>
+cosine_scores = np.array([<span class="mi">0.92</span>, <span class="mi">0.35</span>, <span class="mi">0.70</span>])
+vector_probs = cosine_to_probability(cosine_scores)  <span class="cm"># [0.96, 0.675, 0.85]</span>
+
+<span class="cm"># Fuse with reliability weights (BM25 weight=0.6, vector weight=0.4)</span>
+stacked = np.stack([bm25_probs, vector_probs], axis=-<span class="mi">1</span>)
+fused = log_odds_conjunction(stacked, weights=np.array([<span class="mi">0.6</span>, <span class="mi">0.4</span>]))
+
+<span class="cm"># Fuse with weights and confidence scaling (alpha + weights compose)</span>
+fused = log_odds_conjunction(stacked, alpha=<span class="mi">0.5</span>, weights=np.array([<span class="mi">0.6</span>, <span class="mi">0.4</span>]))
+
+<span class="cm"># Gated fusion: ReLU/Swish activation in logit space</span>
+fused_relu = log_odds_conjunction(stacked, gating=<span class="st">"relu"</span>)    <span class="cm"># MAP estimation</span>
+fused_swish = log_odds_conjunction(stacked, gating=<span class="st">"swish"</span>)  <span class="cm"># Bayes estimation</span></code></pre>
+</section>
+
+<!-- ============ Learnable Weights ============ -->
+<section id="learnable">
+  <h2>Learnable Weights</h2>
+  <p>Learn per-signal reliability from labeled data with Hebbian gradients.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">import</span> numpy <span class="kw">as</span> np
+<span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> LearnableLogOddsWeights
+
+<span class="cm"># 3 retrieval signals: BM25, vector search, metadata match</span>
+learner = LearnableLogOddsWeights(n_signals=<span class="mi">3</span>, alpha=<span class="mi">0.0</span>)
+<span class="cm"># Initial weights are uniform: [0.333, 0.333, 0.333]</span>
+
+<span class="cm"># Batch fit from labeled data (probs: m x 3, labels: m)</span>
+learner.fit(training_probs, training_labels, learning_rate=<span class="mi">0.1</span>)
+<span class="cm"># Learned weights reflect signal reliability: [0.70, 0.19, 0.11]</span>
+
+<span class="cm"># Online refinement from streaming feedback</span>
+<span class="kw">for</span> probs, label <span class="kw">in</span> feedback_stream:
+    learner.update(probs, label, learning_rate=<span class="mi">0.05</span>, momentum=<span class="mi">0.9</span>)
+
+<span class="cm"># Inference with Polyak-averaged weights for stability</span>
+fused = learner(test_probs, use_averaged=<span class="kw">True</span>)</code></pre>
+</section>
+
+<!-- ============ Attention Fusion ============ -->
+<section id="attention">
+  <h2>Attention-Based Fusion</h2>
+  <p>Query-dependent signal weights via attention mechanism with optional
+    per-signal logit normalization.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">import</span> numpy <span class="kw">as</span> np
+<span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> AttentionLogOddsWeights
+
+<span class="cm"># 2 retrieval signals, 3 query features, per-signal logit normalization</span>
+attn = AttentionLogOddsWeights(
+    n_signals=<span class="mi">2</span>, n_query_features=<span class="mi">3</span>, alpha=<span class="mi">0.5</span>, normalize=<span class="kw">True</span>,
+)
+
+<span class="cm"># Train on labeled data with query features</span>
+<span class="cm"># training_probs: (m, 2), training_labels: (m,), query_features: (m, 3)</span>
+attn.fit(training_probs, training_labels, query_features,
+         learning_rate=<span class="mi">0.01</span>, max_iterations=<span class="mi">500</span>)
+
+<span class="cm"># Query-dependent fusion: weights adapt per query</span>
+fused = attn(test_probs, test_features, use_averaged=<span class="kw">True</span>)</code></pre>
+</section>
+
+<!-- ============ WAND Pruning ============ -->
+<section id="wand">
+  <h2>WAND Pruning</h2>
+  <p>Compute safe Bayesian probability upper bounds for efficient top-k
+    retrieval with document pruning.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> BayesianProbabilityTransform
+
+transform = BayesianProbabilityTransform(alpha=<span class="mi">1.5</span>, beta=<span class="mi">2.0</span>, base_rate=<span class="mi">0.01</span>)
+
+<span class="cm"># Standard BM25 upper bound per query term</span>
+bm25_upper_bound = <span class="mi">5.0</span>
+
+<span class="cm"># Bayesian upper bound for safe pruning &mdash; any document's actual</span>
+<span class="cm"># probability is guaranteed to be at most this value</span>
+bayesian_bound = transform.wand_upper_bound(bm25_upper_bound)</code></pre>
+</section>
+
+<!-- ============ Debugging Pipeline ============ -->
+<section id="debugging">
+  <h2>Debugging the Fusion Pipeline</h2>
+  <p>Trace every intermediate value through the full pipeline for transparent
+    inspection, document comparison, and crossover detection.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> BayesianProbabilityTransform
+<span class="kw">from</span> bayesian_bm25.debug <span class="kw">import</span> FusionDebugger
+
+transform = BayesianProbabilityTransform(alpha=<span class="mi">0.45</span>, beta=<span class="mi">6.10</span>, base_rate=<span class="mi">0.02</span>)
+debugger = FusionDebugger(transform)
+
+<span class="cm"># Trace a single document through the full pipeline</span>
+trace = debugger.trace_document(
+    bm25_score=<span class="mi">8.42</span>, tf=<span class="mi">5</span>, doc_len_ratio=<span class="mi">0.60</span>,
+    cosine_score=<span class="mi">0.74</span>, doc_id=<span class="st">"doc-42"</span>,
+)
+<span class="kw">print</span>(debugger.format_trace(trace))
+
+<span class="cm"># Compare two documents to see which signal drove the rank difference</span>
+trace_a = debugger.trace_document(bm25_score=<span class="mi">8.42</span>, tf=<span class="mi">5</span>, doc_len_ratio=<span class="mi">0.60</span>, cosine_score=<span class="mi">0.74</span>)
+trace_b = debugger.trace_document(bm25_score=<span class="mi">5.10</span>, tf=<span class="mi">2</span>, doc_len_ratio=<span class="mi">1.20</span>, cosine_score=<span class="mi">0.88</span>)
+comparison = debugger.compare(trace_a, trace_b)
+<span class="kw">print</span>(debugger.format_comparison(comparison))
+
+<span class="cm"># Hierarchical fusion: AND(OR(title, body), vector, NOT(spam))</span>
+step1 = debugger.trace_fusion([<span class="mi">0.85</span>, <span class="mi">0.70</span>], names=[<span class="st">"title"</span>, <span class="st">"body"</span>], method=<span class="st">"prob_or"</span>)
+step2 = debugger.trace_not(<span class="mi">0.90</span>, name=<span class="st">"spam"</span>)
+step3 = debugger.trace_fusion(
+    [step1.fused_probability, <span class="mi">0.80</span>, step2.complement],
+    names=[<span class="st">"OR(title,body)"</span>, <span class="st">"vector"</span>, <span class="st">"NOT(spam)"</span>],
+    method=<span class="st">"prob_and"</span>,
+)</code></pre>
+</section>
+
+<!-- ============ Calibration Metrics ============ -->
+<section id="calibration">
+  <h2>Evaluating Calibration Quality</h2>
+  <p>Measure how well the output probabilities match actual relevance rates.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">import</span> numpy <span class="kw">as</span> np
+<span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> (
+    expected_calibration_error, brier_score, reliability_diagram, calibration_report,
+)
+
+probabilities = np.array([<span class="mi">0.9</span>, <span class="mi">0.8</span>, <span class="mi">0.3</span>, <span class="mi">0.1</span>, <span class="mi">0.7</span>, <span class="mi">0.2</span>])
+labels = np.array([<span class="mi">1.0</span>, <span class="mi">1.0</span>, <span class="mi">0.0</span>, <span class="mi">0.0</span>, <span class="mi">1.0</span>, <span class="mi">0.0</span>])
+
+ece = expected_calibration_error(probabilities, labels)      <span class="cm"># lower is better</span>
+bs = brier_score(probabilities, labels)                      <span class="cm"># lower is better</span>
+bins = reliability_diagram(probabilities, labels, n_bins=<span class="mi">5</span>) <span class="cm"># (avg_pred, avg_actual, count)</span>
+
+<span class="cm"># One-call diagnostic report</span>
+report = calibration_report(probabilities, labels)
+<span class="kw">print</span>(report.summary())   <span class="cm"># formatted text with ECE, Brier, and reliability table</span></code></pre>
+</section>
+
+<!-- ============ Online Learning ============ -->
+<section id="online">
+  <h2>Online Learning from User Feedback</h2>
+  <p>Refine parameters from streaming feedback with EMA-smoothed SGD and
+    Polyak averaging.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> BayesianProbabilityTransform
+
+transform = BayesianProbabilityTransform(alpha=<span class="mi">1.0</span>, beta=<span class="mi">0.0</span>)
+
+<span class="cm"># Batch warmup on historical data</span>
+transform.fit(historical_scores, historical_labels)
+
+<span class="cm"># Online refinement from live feedback</span>
+<span class="kw">for</span> score, label <span class="kw">in</span> feedback_stream:
+    transform.update(score, label, learning_rate=<span class="mi">0.01</span>, momentum=<span class="mi">0.95</span>)
+
+<span class="cm"># Use Polyak-averaged parameters for stable inference</span>
+alpha = transform.averaged_alpha
+beta = transform.averaged_beta</code></pre>
+</section>
+
+<!-- ============ Training Modes ============ -->
+<section id="training-modes">
+  <h2>Training Modes</h2>
+  <p>Three modes control how gradients flow through the Bayesian pipeline.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> BayesianProbabilityTransform
+
+transform = BayesianProbabilityTransform(alpha=<span class="mi">1.0</span>, beta=<span class="mi">0.0</span>)
+
+<span class="cm"># C1 (balanced, default): train on sigmoid likelihood</span>
+transform.fit(scores, labels, mode=<span class="st">"balanced"</span>)
+
+<span class="cm"># C2 (prior-aware): train on full Bayesian posterior</span>
+transform.fit(scores, labels, mode=<span class="st">"prior_aware"</span>, tfs=tfs, doc_len_ratios=ratios)
+
+<span class="cm"># C3 (prior-free): train on likelihood, inference uses prior=0.5</span>
+transform.fit(scores, labels, mode=<span class="st">"prior_free"</span>)</code></pre>
+</section>
+
+<!-- ============ Source Files ============ -->
+<section id="source-files">
+  <h2>Source Files</h2>
+  <p>Complete runnable scripts are in the
+    <a href="https://github.com/cognica-io/bayesian-bm25/tree/main/examples">examples/</a>
+    directory:</p>
+  <table>
+    <thead><tr><th>File</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>basic_probability.py</code></td><td>Simple score-to-probability conversion</td></tr>
+      <tr><td><code>search_and_retrieve.py</code></td><td>End-to-end retrieval workflow</td></tr>
+      <tr><td><code>multi_field_search.py</code></td><td>Title + body field indexing and fusion</td></tr>
+      <tr><td><code>score_fusion.py</code></td><td>Combining BM25 + vector probabilities</td></tr>
+      <tr><td><code>learnable_fusion.py</code></td><td>Batch fit + online update of weights</td></tr>
+      <tr><td><code>online_learning.py</code></td><td>Streaming feedback refinement</td></tr>
+      <tr><td><code>threshold_filtering.py</code></td><td>Probability-based filtering workflows</td></tr>
+      <tr><td><code>boolean_not.py</code></td><td>Exclusion queries ("python AND NOT java")</td></tr>
+      <tr><td><code>fusion_debugger.py</code></td><td>12 examples of pipeline debugging and tracing</td></tr>
+    </tbody>
+  </table>
+</section>
+
+</div><!-- .content -->
+</div><!-- .page-with-toc -->
+
+<!-- ====== Footer ====== -->
+<footer>
+  <div class="container">
+    <p>
+      Bayesian BM25
+      &middot; <a href="https://github.com/cognica-io/bayesian-bm25">GitHub</a>
+      &middot; <a href="https://pypi.org/project/bayesian-bm25/">PyPI</a>
+      &middot; <a href="https://cognica.io">Cognica</a>
+      &middot; Apache-2.0
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

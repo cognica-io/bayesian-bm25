@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bayesian BM25 &mdash; Probabilistic BM25 Transforms</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});">
+</script>
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ====== Hero ====== -->
+<header class="hero">
+  <h1><span>Bayesian BM25</span></h1>
+  <p class="tagline">
+    Converts raw BM25 retrieval scores into calibrated relevance probabilities
+    using Bayesian inference. Probabilistic fusion for hybrid text and vector search.
+  </p>
+  <div class="badges">
+    <a class="primary" href="https://github.com/cognica-io/bayesian-bm25">GitHub</a>
+    <a class="secondary" href="https://pypi.org/project/bayesian-bm25/">PyPI</a>
+    <a class="secondary" href="https://www.cognica.io/en/blog/posts/2026-02-01-bayesian-bm25-hybrid-search">Blog</a>
+    <a class="secondary" href="https://github.com/cognica-io/bayesian-bm25/tree/main/docs/papers">Papers</a>
+  </div>
+</header>
+
+<!-- ====== Nav ====== -->
+<nav>
+  <ul>
+    <li><a href="index.html" class="active">Overview</a></li>
+    <li><a href="docs.html">Docs</a></li>
+    <li><a href="examples.html">Examples</a></li>
+    <li><a href="#theory">Theory</a></li>
+    <li><a href="#pipeline">Pipeline</a></li>
+    <li><a href="#fusion">Fusion</a></li>
+    <li><a href="#benchmarks">Benchmarks</a></li>
+    <li><a href="#adoption">Adoption</a></li>
+  </ul>
+</nav>
+
+<!-- ====== Theory ====== -->
+<section id="theory">
+<div class="container">
+  <h2>Core Theory</h2>
+
+  <h3>The Problem with Raw BM25 Scores</h3>
+  <p>
+    Standard BM25 produces unbounded scores that lack consistent meaning across
+    queries. A score of 8.5 might be highly relevant for one query but mediocre
+    for another, making threshold-based filtering and multi-signal fusion unreliable.
+    Bayesian BM25 solves this by transforming scores into calibrated probabilities
+    in $[0, 1]$.
+  </p>
+
+  <h3>Sigmoid Likelihood</h3>
+  <p>
+    The likelihood of relevance given a BM25 score follows a sigmoid model
+    parameterized by steepness $\alpha$ and midpoint $\beta$:
+  </p>
+  <div class="math-block">
+    $$L(R \mid s) = \sigma(\alpha \cdot (s - \beta))
+    = \frac{1}{1 + e^{-\alpha(s - \beta)}}$$
+  </div>
+  <p>
+    This maps any real-valued BM25 score $s$ into $(0, 1)$, capturing the
+    intuition that relevance probability increases with score but saturates
+    at the extremes.
+  </p>
+
+  <h3>Composite Prior</h3>
+  <p>
+    A document's prior relevance probability combines two information-theoretic
+    signals: <strong>term frequency</strong> (higher TF indicates richer topical
+    content) and <strong>document length ratio</strong> (documents near the corpus
+    average length are more likely to be relevant):
+  </p>
+  <div class="math-block">
+    $$\pi(d) = \pi_{tf}(d) \cdot \pi_{len}(d)$$
+  </div>
+  <p>
+    where $\pi_{tf} = \sigma(\log(1 + tf))$ and
+    $\pi_{len} = 0.5 + 0.5 \cdot (1 - |r - 1|)$ with $r$ being the document
+    length ratio. The composite prior is multiplicative in probability space,
+    which becomes additive in log-odds space.
+  </p>
+
+  <h3>Bayesian Posterior</h3>
+  <p>
+    The final posterior combines likelihood, prior, and a corpus-level
+    <strong>base rate</strong> $b_r$ using Bayes' theorem. In log-odds space,
+    the three terms decompose additively:
+  </p>
+  <div class="math-block">
+    $$\text{logit}(P) = \text{logit}(L) + \text{logit}(\pi) + \text{logit}(b_r)$$
+  </div>
+  <p>
+    This three-term decomposition separates the score-dependent signal (likelihood)
+    from document-specific context (prior) and corpus-level prevalence (base rate),
+    enabling each component to be estimated independently.
+    The base rate alone reduces Expected Calibration Error by 68&ndash;77% without
+    requiring any relevance labels.
+  </p>
+
+  <h3>Log-Odds Conjunction</h3>
+  <p>
+    Naive probability multiplication ($P = \prod P_i$) suffers from
+    <strong>conjunction shrinkage</strong>: combining multiple agreeing
+    high-probability signals produces a low fused probability.
+    The log-odds conjunction resolves this by averaging in logit space
+    with confidence scaling:
+  </p>
+  <div class="math-block">
+    $$P_{fused} = \sigma\!\left(n^{\alpha} \cdot \frac{1}{n}\sum_{i=1}^{n} \text{logit}(P_i)\right)$$
+  </div>
+  <p>
+    The $n^{\alpha}$ factor (with $\alpha = 0.5$ giving $\sqrt{n}$ scaling)
+    compensates for the averaging effect so that $n$ perfectly agreeing signals
+    return the consensus probability, not a diluted version.
+    With per-signal weights $w_i$, this becomes the Log-OP formulation
+    $\sigma\!\bigl(n^{\alpha} \sum w_i \cdot \text{logit}(P_i)\bigr)$,
+    where $\alpha$ and weights compose multiplicatively.
+  </p>
+</div>
+</section>
+
+<!-- ====== Pipeline ====== -->
+<section id="pipeline">
+<div class="container">
+  <h2>Pipeline</h2>
+
+  <pre class="mermaid">
+graph LR
+    S["Raw BM25 Score"] --> SIG["Sigmoid Likelihood<br/>L = sigma(alpha * (s - beta))"]
+    SIG --> POST["Bayesian Posterior<br/>logit(P) = logit(L) + logit(pi) + logit(br)"]
+    TF["Term Frequency"] --> PRIOR["Composite Prior<br/>pi = pi_tf * pi_len"]
+    DL["Doc Length Ratio"] --> PRIOR
+    PRIOR --> POST
+    BR["Base Rate"] --> POST
+    POST --> PROB["Calibrated<br/>Probability"]
+    PROB --> FUSE["Fusion<br/>Log-Odds / AND / OR"]
+    VEC["Vector Score"] --> COS["cosine_to_probability()"]
+    COS --> FUSE
+    FUSE --> RANK["Final<br/>Ranking"]
+  </pre>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Score Transform</h3>
+      <p>Sigmoid likelihood converts unbounded BM25 scores to (0, 1) probabilities
+        with learnable steepness and midpoint parameters.</p>
+    </div>
+    <div class="card">
+      <h3>Composite Prior</h3>
+      <p>Term frequency and document length signals provide document-specific
+        relevance context independent of the query score.</p>
+    </div>
+    <div class="card">
+      <h3>Base Rate</h3>
+      <p>Corpus-level relevance prevalence estimated from the score distribution
+        (percentile, mixture model, or elbow detection). No labels needed.</p>
+    </div>
+    <div class="card">
+      <h3>Parameter Learning</h3>
+      <p>Batch gradient descent or online SGD with EMA-smoothed gradients
+        and Polyak averaging. Three training modes: C1, C2, C3.</p>
+    </div>
+    <div class="card">
+      <h3>Probabilistic Fusion</h3>
+      <p>Log-odds conjunction, probabilistic AND/OR/NOT, per-signal weights,
+        and sparse gating (ReLU/Swish) for multi-signal combination.</p>
+    </div>
+    <div class="card">
+      <h3>WAND Pruning</h3>
+      <p>Safe Bayesian probability upper bounds for document pruning
+        in top-k retrieval. Tighter than raw BM25 bounds.</p>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ====== Fusion ====== -->
+<section id="fusion">
+<div class="container">
+  <h2>Multi-Signal Fusion</h2>
+  <p>
+    All fusion operations work in probability space with well-defined semantics.
+    Because every signal is a calibrated probability, they compose freely.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Function</th><th>Description</th><th>Use Case</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>log_odds_conjunction()</code></td>
+        <td>$\sigma\!\bigl(n^{\alpha}\sum w_i \cdot \text{logit}(P_i)\bigr)$ &mdash; agreement-aware fusion</td>
+        <td>Primary multi-signal fusion</td>
+      </tr>
+      <tr>
+        <td><code>balanced_log_odds_fusion()</code></td>
+        <td>Min-max normalize logits, then combine &mdash; equalizes signal scales</td>
+        <td>Hybrid BM25 + dense search</td>
+      </tr>
+      <tr>
+        <td><code>prob_and()</code></td>
+        <td>$P = \prod P_i$ &mdash; product rule in log-space</td>
+        <td>Strict conjunction (all must match)</td>
+      </tr>
+      <tr>
+        <td><code>prob_or()</code></td>
+        <td>$P = 1 - \prod(1 - P_i)$ &mdash; complement rule in log-space</td>
+        <td>Disjunction (any may match)</td>
+      </tr>
+      <tr>
+        <td><code>prob_not()</code></td>
+        <td>$P = 1 - P_i$ &mdash; complement</td>
+        <td>Exclusion queries</td>
+      </tr>
+      <tr>
+        <td><code>cosine_to_probability()</code></td>
+        <td>$(1 + \cos\theta) / 2$ with epsilon clamping</td>
+        <td>Convert vector similarity for fusion</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Learnable Weights</h3>
+  <p>
+    <code>LearnableLogOddsWeights</code> learns per-signal reliability from
+    labeled data via a <strong>Hebbian gradient</strong> that is backprop-free.
+    Starting from the Naive Bayes uniform initialization ($w_i = 1/n$),
+    the gradient $\nabla_{z_j} = n^{\alpha}(p - y) \cdot w_j(x_j - \bar{x}_w)$
+    adjusts weights based on pre-synaptic activity times post-synaptic error.
+  </p>
+
+  <h3>Attention-Based Fusion</h3>
+  <p>
+    <code>AttentionLogOddsWeights</code> replaces static weights with
+    <strong>query-dependent attention</strong>. A linear projection from query
+    features to softmax attention weights allows the fusion to adapt per query:
+    some queries benefit more from lexical signals, others from semantic similarity.
+    Optional per-signal logit normalization (<code>normalize=True</code>) equalizes
+    signal scales before the weighted sum.
+  </p>
+
+  <h3>Sparse Signal Gating</h3>
+  <p>
+    For high-dimensional signal spaces, <strong>ReLU gating</strong>
+    ($\max(0, \text{logit})$, MAP estimation) and <strong>Swish gating</strong>
+    ($\text{logit} \cdot \sigma(\text{logit})$, Bayes estimation) suppress noisy
+    negative-logit signals before aggregation (Paper 2, Theorems 6.5.3/6.7.4).
+  </p>
+</div>
+</section>
+
+<!-- ====== Benchmarks ====== -->
+<section id="benchmarks">
+<div class="container">
+  <h2>Benchmarks</h2>
+  <p>
+    Evaluated on 5 <a href="https://github.com/beir-cellar/beir">BEIR</a> datasets
+    using the retrieve-then-evaluate protocol (top-1000 per signal, union candidates,
+    pytrec_eval). Dense encoder: all-MiniLM-L6-v2. BM25: k1=1.2, b=0.75, Lucene
+    variant with Snowball English stemmer.
+  </p>
+
+  <h3>NDCG@10 (Zero-Shot)</h3>
+  <table>
+    <thead>
+      <tr><th>Method</th><th>ArguAna</th><th>FiQA</th><th>NFCorpus</th><th>SciDocs</th><th>SciFact</th><th>Average</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>BM25</td><td>36.13</td><td>25.31</td><td>31.82</td><td>15.63</td><td>68.02</td><td>35.38</td></tr>
+      <tr><td>Dense</td><td>36.98</td><td>36.87</td><td>31.59</td><td>21.64</td><td>64.51</td><td>38.32</td></tr>
+      <tr><td>Convex</td><td>40.01</td><td>37.10</td><td>35.60</td><td>19.67</td><td>73.37</td><td>41.15</td></tr>
+      <tr><td>RRF</td><td>39.61</td><td>36.85</td><td>34.43</td><td>20.11</td><td>71.43</td><td>40.49</td></tr>
+      <tr class="highlight"><td>Bayesian-Balanced</td><td>37.27</td><td>40.58</td><td>35.73</td><td>21.42</td><td>72.47</td><td>41.50</td></tr>
+      <tr class="highlight"><td>Attn-NR</td><td>37.22</td><td>40.53</td><td>35.42</td><td>21.91</td><td>73.24</td><td>41.67</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Delta vs BM25 (NDCG@10)</h3>
+  <table>
+    <thead>
+      <tr><th>Method</th><th>Type</th><th>Delta</th></tr>
+    </thead>
+    <tbody>
+      <tr class="highlight"><td>Attn-NR</td><td>zero-shot</td><td>+6.28</td></tr>
+      <tr><td>Balanced-Tuned</td><td>trained</td><td>+6.26</td></tr>
+      <tr><td>Bayesian-Balanced</td><td>zero-shot</td><td>+6.11</td></tr>
+      <tr><td>Convex</td><td>zero-shot</td><td>+5.76</td></tr>
+      <tr><td>RRF</td><td>zero-shot</td><td>+5.11</td></tr>
+      <tr><td>Attention</td><td>zero-shot</td><td>+4.99</td></tr>
+      <tr><td>Dense</td><td>zero-shot</td><td>+2.94</td></tr>
+    </tbody>
+  </table>
+  <p>
+    <strong>Attn-NR</strong> achieves the highest average NDCG@10 (41.67%),
+    outperforming Convex combination (+0.52), RRF (+1.18), and BM25 (+6.28)
+    in a fully zero-shot setting with no relevance labels.
+    See the <a href="https://github.com/cognica-io/bayesian-bm25#benchmarks">full benchmark tables</a>
+    with 18 methods, MAP@10, and Recall@10.
+  </p>
+
+  <h3>Probability Calibration</h3>
+  <table>
+    <thead>
+      <tr><th>Method</th><th>NFCorpus ECE</th><th>SciFact ECE</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Bayesian (no base rate)</td><td>0.6519</td><td>0.7989</td></tr>
+      <tr class="highlight"><td>Bayesian (base_rate=auto)</td><td>0.1461 (-77.6%)</td><td>0.2577 (-67.7%)</td></tr>
+      <tr><td>Batch fit + base_rate=auto</td><td>0.0085 (-98.7%)</td><td>0.0021 (-99.7%)</td></tr>
+      <tr><td>Platt scaling</td><td>0.0186 (-97.1%)</td><td>0.0188 (-97.7%)</td></tr>
+    </tbody>
+  </table>
+  <p>
+    The base rate prior alone reduces ECE by 68&ndash;77% without any labeled data.
+    With batch fitting, calibration error drops below 1%.
+  </p>
+
+  <h4>Reproduce</h4>
+<pre><code><span class="cm"># Zero-shot (18 methods)</span>
+python benchmarks/hybrid_beir.py -d &lt;beir-data-dir&gt;
+
+<span class="cm"># With tuning (supervised + grid search)</span>
+python benchmarks/hybrid_beir.py -d &lt;beir-data-dir&gt; --tune
+
+<span class="cm"># Download BEIR datasets automatically</span>
+python benchmarks/hybrid_beir.py -d &lt;beir-data-dir&gt; --download</code></pre>
+</div>
+</section>
+
+<!-- ====== Adoption ====== -->
+<section id="adoption">
+<div class="container">
+  <h2>Adoption</h2>
+  <div class="grid">
+    <div class="card">
+      <h3><a href="https://github.com/embeddings-benchmark/mteb">MTEB</a></h3>
+      <p>Included as a baseline retrieval model (<code>bb25</code>) for the
+        Massive Text Embedding Benchmark.</p>
+    </div>
+    <div class="card">
+      <h3><a href="https://github.com/neuml/txtai">txtai</a></h3>
+      <p>Used for BM25 score normalization in hybrid search
+        (<code>normalize="bayesian-bm25"</code>).</p>
+    </div>
+    <div class="card">
+      <h3><a href="https://cognica-io.github.io/uqa/">UQA</a></h3>
+      <p>Scoring operator for probabilistic text retrieval and multi-signal
+        fusion in the unified query algebra.</p>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ====== Citation ====== -->
+<section id="citation">
+<div class="container">
+  <h2>Citation</h2>
+<pre><code>@preprint{Jeong2026BayesianBM25,
+  author    = {Jeong, Jaepil},
+  title     = {Bayesian {BM25}: {A} Probabilistic Framework for Hybrid Text
+               and Vector Search},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.18414940},
+  url       = {https://doi.org/10.5281/zenodo.18414940}
+}
+
+@preprint{Jeong2026BayesianNeural,
+  author    = {Jeong, Jaepil},
+  title     = {From {Bayesian} Inference to Neural Computation: The Analytical
+               Emergence of Neural Network Structure from Probabilistic
+               Relevance Estimation},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.18512411},
+  url       = {https://doi.org/10.5281/zenodo.18512411}
+}</code></pre>
+</div>
+</section>
+
+<!-- ====== Footer ====== -->
+<footer>
+  <div class="container">
+    <p>
+      Bayesian BM25
+      &middot; <a href="https://github.com/cognica-io/bayesian-bm25">GitHub</a>
+      &middot; <a href="https://pypi.org/project/bayesian-bm25/">PyPI</a>
+      &middot; <a href="https://cognica.io">Cognica</a>
+      &middot; Apache-2.0
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documentation &mdash; Bayesian BM25</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});">
+</script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ====== Hero ====== -->
+<header class="hero hero-compact">
+  <h1><span>Bayesian BM25</span> Documentation</h1>
+  <p class="tagline">API reference for transforms, fusion, scoring, and diagnostics.</p>
+</header>
+
+<!-- ====== Nav ====== -->
+<nav>
+  <ul>
+    <li><a href="index.html">Overview</a></li>
+    <li><a href="docs.html" class="active">Docs</a></li>
+    <li><a href="examples.html">Examples</a></li>
+  </ul>
+</nav>
+
+<div class="page-with-toc">
+
+<!-- ====== TOC ====== -->
+<aside class="toc">
+  <ul>
+    <li><a href="#install">Installation</a></li>
+    <li><a href="#transform">BayesianProbabilityTransform</a></li>
+    <li class="toc-h3"><a href="#transform-init">Constructor</a></li>
+    <li class="toc-h3"><a href="#transform-score">score_to_probability</a></li>
+    <li class="toc-h3"><a href="#transform-fit">fit</a></li>
+    <li class="toc-h3"><a href="#transform-update">update</a></li>
+    <li class="toc-h3"><a href="#transform-wand">wand_upper_bound</a></li>
+    <li><a href="#fusion-funcs">Fusion Functions</a></li>
+    <li class="toc-h3"><a href="#log-odds">log_odds_conjunction</a></li>
+    <li class="toc-h3"><a href="#balanced">balanced_log_odds_fusion</a></li>
+    <li class="toc-h3"><a href="#prob-and">prob_and / prob_or / prob_not</a></li>
+    <li class="toc-h3"><a href="#cosine">cosine_to_probability</a></li>
+    <li><a href="#learnable">LearnableLogOddsWeights</a></li>
+    <li><a href="#attention">AttentionLogOddsWeights</a></li>
+    <li><a href="#scorer">BayesianBM25Scorer</a></li>
+    <li class="toc-h3"><a href="#scorer-init">Constructor</a></li>
+    <li class="toc-h3"><a href="#scorer-index">index / retrieve</a></li>
+    <li class="toc-h3"><a href="#scorer-add">add_documents</a></li>
+    <li><a href="#multi-field">MultiFieldScorer</a></li>
+    <li><a href="#debugger">FusionDebugger</a></li>
+    <li><a href="#metrics">Calibration Metrics</a></li>
+    <li><a href="#training-modes">Training Modes</a></li>
+  </ul>
+</aside>
+
+<!-- ====== Content ====== -->
+<div class="content">
+
+<!-- ============ Installation ============ -->
+<section id="install">
+  <h2>Installation</h2>
+
+  <span class="example-tag tag-shell">Shell</span>
+<pre><code>pip install bayesian-bm25</code></pre>
+
+  <p>To use the integrated search scorer (requires <code>bm25s</code>):</p>
+  <span class="example-tag tag-shell">Shell</span>
+<pre><code>pip install bayesian-bm25[scorer]</code></pre>
+
+  <p><strong>Requirements:</strong> Python &gt;= 3.10, numpy &gt;= 1.21. The core
+    library has no other dependencies. The <code>[scorer]</code> extra adds
+    <code>bm25s</code> for end-to-end search functionality.</p>
+</section>
+
+<!-- ============ BayesianProbabilityTransform ============ -->
+<section id="transform">
+  <h2>BayesianProbabilityTransform</h2>
+  <p>
+    The core class that converts raw BM25 scores into calibrated relevance
+    probabilities. Implements sigmoid likelihood, composite prior (TF + document
+    length), and Bayesian posterior with optional base rate.
+  </p>
+
+  <h3 id="transform-init">Constructor</h3>
+<pre><code><span class="fn">BayesianProbabilityTransform</span>(
+    alpha=<span class="mi">1.0</span>,       <span class="cm"># sigmoid steepness</span>
+    beta=<span class="mi">0.0</span>,        <span class="cm"># sigmoid midpoint</span>
+    base_rate=<span class="kw">None</span>,  <span class="cm"># corpus-level relevance rate (0, 1) or None</span>
+)</code></pre>
+  <table>
+    <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>alpha</code></td><td>float</td><td>Sigmoid steepness. Higher values make the transition sharper. Learnable via <code>fit()</code>.</td></tr>
+      <tr><td><code>beta</code></td><td>float</td><td>Sigmoid midpoint. Scores below beta map to P &lt; 0.5. Learnable via <code>fit()</code>.</td></tr>
+      <tr><td><code>base_rate</code></td><td>float or None</td><td>Corpus-level base rate of relevant documents. When set, decomposes the posterior into three additive log-odds terms. Reduces ECE by 68&ndash;77%.</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="transform-score">score_to_probability(score, tf, doc_len_ratio)</h3>
+  <p>Convert raw BM25 scores to calibrated probabilities via the full Bayesian pipeline.</p>
+<pre><code>probabilities = transform.<span class="fn">score_to_probability</span>(
+    score,          <span class="cm"># float or ndarray &mdash; raw BM25 score(s)</span>
+    tf,             <span class="cm"># float or ndarray &mdash; term frequency</span>
+    doc_len_ratio,  <span class="cm"># float or ndarray &mdash; doc_len / avg_doc_len</span>
+)</code></pre>
+  <p>Returns a float or ndarray of probabilities in $[0, 1]$. Supports vectorized
+    operation for batch processing.</p>
+
+  <h3 id="transform-fit">fit(scores, labels, mode, ...)</h3>
+  <p>Learn $\alpha$ and $\beta$ from labeled data via batch gradient descent.</p>
+<pre><code>transform.<span class="fn">fit</span>(
+    scores,                <span class="cm"># ndarray (m,) &mdash; raw BM25 scores</span>
+    labels,                <span class="cm"># ndarray (m,) &mdash; binary relevance labels</span>
+    mode=<span class="st">"balanced"</span>,       <span class="cm"># "balanced" (C1), "prior_aware" (C2), "prior_free" (C3)</span>
+    learning_rate=<span class="mi">0.01</span>,   <span class="cm"># gradient descent step size</span>
+    max_iterations=<span class="mi">1000</span>,  <span class="cm"># maximum iterations</span>
+    tfs=<span class="kw">None</span>,              <span class="cm"># ndarray (m,) &mdash; term frequencies (required for C2)</span>
+    doc_len_ratios=<span class="kw">None</span>,  <span class="cm"># ndarray (m,) &mdash; document length ratios (required for C2)</span>
+)</code></pre>
+
+  <h3 id="transform-update">update(score, label, ...)</h3>
+  <p>Online SGD update from a single observation with EMA-smoothed gradients and Polyak averaging.</p>
+<pre><code>transform.<span class="fn">update</span>(
+    score,                 <span class="cm"># float &mdash; raw BM25 score</span>
+    label,                 <span class="cm"># float &mdash; binary relevance label (0 or 1)</span>
+    learning_rate=<span class="mi">0.01</span>,   <span class="cm"># SGD step size</span>
+    momentum=<span class="mi">0.9</span>,          <span class="cm"># EMA momentum for gradient smoothing</span>
+)</code></pre>
+  <p>After updating, use <code>transform.averaged_alpha</code> and
+    <code>transform.averaged_beta</code> for Polyak-averaged parameters
+    with better stability.</p>
+
+  <h3 id="transform-wand">wand_upper_bound(bm25_score)</h3>
+  <p>Compute a safe Bayesian probability upper bound for WAND pruning.</p>
+<pre><code>bound = transform.<span class="fn">wand_upper_bound</span>(bm25_upper_bound)</code></pre>
+  <p>Returns the tightest safe probability upper bound using $p_{max} = 0.9$
+    (Theorem 6.1.2). Any document's actual probability is guaranteed to be at
+    most this value. Supports base_rate-aware bounds for tighter pruning.</p>
+</section>
+
+<!-- ============ Fusion Functions ============ -->
+<section id="fusion-funcs">
+  <h2>Fusion Functions</h2>
+
+  <h3 id="log-odds">log_odds_conjunction(probs, alpha, weights, gating)</h3>
+  <p>The primary fusion function. Combines multiple probability signals in
+    log-odds space with confidence scaling.</p>
+<pre><code><span class="fn">log_odds_conjunction</span>(
+    probs,          <span class="cm"># ndarray &mdash; probabilities, last axis = signals</span>
+    alpha=<span class="kw">None</span>,     <span class="cm"># float or "auto" &mdash; confidence scaling (None=auto)</span>
+    weights=<span class="kw">None</span>,   <span class="cm"># ndarray &mdash; per-signal weights (sum to 1)</span>
+    gating=<span class="st">"none"</span>,  <span class="cm"># "none", "relu", or "swish"</span>
+)</code></pre>
+  <table>
+    <thead><tr><th>Parameter</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>alpha=None</code></td><td>Auto: resolves to 0.5 (unweighted) or 0.0 (weighted). Explicit alpha applies in both modes.</td></tr>
+      <tr><td><code>weights</code></td><td>Per-signal reliability weights in $[0,1]$, summing to 1. Log-OP formulation.</td></tr>
+      <tr><td><code>gating="relu"</code></td><td>MAP estimation: zeroes negative logits (Paper 2, Theorem 6.5.3).</td></tr>
+      <tr><td><code>gating="swish"</code></td><td>Bayes estimation: soft suppression of negative logits (Paper 2, Theorem 6.7.4).</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="balanced">balanced_log_odds_fusion(probs, dense_sims, weight, alpha)</h3>
+  <p>Designed for hybrid BM25 + dense retrieval. Min-max normalizes both signals
+    in logit space before combining, preventing heavy-tailed sparse logits from
+    drowning the dense signal.</p>
+<pre><code><span class="fn">balanced_log_odds_fusion</span>(
+    probs,       <span class="cm"># ndarray &mdash; Bayesian BM25 probabilities</span>
+    dense_sims,  <span class="cm"># ndarray &mdash; cosine similarities [-1, 1]</span>
+    weight=<span class="mi">0.5</span>,  <span class="cm"># float &mdash; sparse weight (dense = 1 - weight)</span>
+    alpha=<span class="mi">0.5</span>,   <span class="cm"># float &mdash; confidence scaling</span>
+)</code></pre>
+
+  <h3 id="prob-and">prob_and / prob_or / prob_not</h3>
+<pre><code><span class="fn">prob_and</span>(probs)   <span class="cm"># Product rule: P = prod(P_i), in log-space for stability</span>
+<span class="fn">prob_or</span>(probs)    <span class="cm"># Complement rule: P = 1 - prod(1 - P_i), in log-space</span>
+<span class="fn">prob_not</span>(prob)    <span class="cm"># Complement: P = 1 - P_i, with epsilon clamping</span></code></pre>
+  <p>These satisfy Boolean algebra laws including De Morgan's:
+    NOT(A AND B) = OR(NOT A, NOT B).</p>
+
+  <h3 id="cosine">cosine_to_probability(score)</h3>
+  <p>Maps cosine similarity $[-1, 1]$ to probability $(0, 1)$ via
+    $(1 + \text{score}) / 2$ with epsilon clamping (Definition 7.1.2).</p>
+</section>
+
+<!-- ============ LearnableLogOddsWeights ============ -->
+<section id="learnable">
+  <h2>LearnableLogOddsWeights</h2>
+  <p>
+    Learns per-signal reliability weights from labeled data via a Hebbian gradient.
+    Starts from Naive Bayes uniform initialization ($w_i = 1/n$).
+  </p>
+<pre><code>learner = <span class="fn">LearnableLogOddsWeights</span>(
+    n_signals=<span class="mi">3</span>,  <span class="cm"># number of input signals</span>
+    alpha=<span class="mi">0.0</span>,     <span class="cm"># confidence scaling (0.0 for weighted mode)</span>
+)
+
+<span class="cm"># Batch fit from labeled data</span>
+learner.<span class="fn">fit</span>(probs, labels, learning_rate=<span class="mi">0.1</span>, max_iterations=<span class="mi">500</span>)
+
+<span class="cm"># Online update from streaming feedback</span>
+learner.<span class="fn">update</span>(probs, label, learning_rate=<span class="mi">0.05</span>, momentum=<span class="mi">0.9</span>)
+
+<span class="cm"># Inference with Polyak-averaged weights</span>
+fused = learner(test_probs, use_averaged=<span class="kw">True</span>)</code></pre>
+  <p><strong>Key properties:</strong></p>
+  <ul>
+    <li><code>weights</code> &mdash; current softmax-normalized weights</li>
+    <li><code>averaged_weights</code> &mdash; Polyak-averaged weights for stable inference</li>
+    <li>Hebbian gradient: backprop-free, $O(n)$ per update</li>
+  </ul>
+</section>
+
+<!-- ============ AttentionLogOddsWeights ============ -->
+<section id="attention">
+  <h2>AttentionLogOddsWeights</h2>
+  <p>
+    Query-dependent signal weighting via attention mechanism. Replaces static
+    per-signal weights with a linear projection from query features to softmax
+    attention weights (Paper 2, Section 8).
+  </p>
+<pre><code>attn = <span class="fn">AttentionLogOddsWeights</span>(
+    n_signals=<span class="mi">2</span>,          <span class="cm"># number of input signals</span>
+    n_query_features=<span class="mi">3</span>,  <span class="cm"># dimensionality of query feature vector</span>
+    alpha=<span class="mi">0.5</span>,            <span class="cm"># confidence scaling</span>
+    normalize=<span class="kw">True</span>,       <span class="cm"># per-signal logit normalization</span>
+)
+
+<span class="cm"># Train: probs (m, 2), labels (m,), features (m, 3)</span>
+attn.<span class="fn">fit</span>(probs, labels, features,
+         learning_rate=<span class="mi">0.01</span>, max_iterations=<span class="mi">500</span>)
+
+<span class="cm"># Query-dependent fusion</span>
+fused = attn(test_probs, test_features, use_averaged=<span class="kw">True</span>)</code></pre>
+  <p>When <code>normalize=True</code>, applies per-column min-max normalization in
+    logit space before the weighted sum, equalizing signal scales (same scaling as
+    <code>balanced_log_odds_fusion</code>).</p>
+</section>
+
+<!-- ============ BayesianBM25Scorer ============ -->
+<section id="scorer">
+  <h2>BayesianBM25Scorer</h2>
+  <p>
+    Drop-in scorer wrapping <a href="https://github.com/xhluca/bm25s">bm25s</a>
+    that returns calibrated probabilities instead of raw scores. Requires the
+    <code>[scorer]</code> extra.
+  </p>
+
+  <h3 id="scorer-init">Constructor</h3>
+<pre><code>scorer = <span class="fn">BayesianBM25Scorer</span>(
+    k1=<span class="mi">1.2</span>,               <span class="cm"># BM25 k1 parameter</span>
+    b=<span class="mi">0.75</span>,               <span class="cm"># BM25 b parameter</span>
+    method=<span class="st">"lucene"</span>,      <span class="cm"># BM25 variant</span>
+    base_rate=<span class="st">"auto"</span>,     <span class="cm"># None, "auto", or float</span>
+    base_rate_method=<span class="st">"percentile"</span>,  <span class="cm"># "percentile", "mixture", or "elbow"</span>
+)</code></pre>
+
+  <h3 id="scorer-index">index / retrieve</h3>
+<pre><code><span class="cm"># Build index from pre-tokenized corpus</span>
+scorer.<span class="fn">index</span>(corpus_tokens, show_progress=<span class="kw">False</span>)
+
+<span class="cm"># Retrieve top-k with probabilities</span>
+doc_ids, probabilities = scorer.<span class="fn">retrieve</span>(queries, k=<span class="mi">10</span>)
+
+<span class="cm"># Retrieve with per-document explanations</span>
+result = scorer.<span class="fn">retrieve</span>(queries, k=<span class="mi">10</span>, explain=<span class="kw">True</span>)
+<span class="cm"># result is a RetrievalResult with .doc_ids, .probabilities, .explanations</span></code></pre>
+
+  <h3 id="scorer-add">add_documents</h3>
+<pre><code><span class="cm"># Incremental indexing (rebuilds full index with updated statistics)</span>
+scorer.<span class="fn">add_documents</span>(new_tokens)</code></pre>
+</section>
+
+<!-- ============ MultiFieldScorer ============ -->
+<section id="multi-field">
+  <h2>MultiFieldScorer</h2>
+  <p>
+    Manages separate BM25 indexes per field and fuses field-level probabilities
+    via <code>log_odds_conjunction</code> with configurable per-field weights.
+  </p>
+<pre><code>scorer = <span class="fn">MultiFieldScorer</span>(
+    fields=[<span class="st">"title"</span>, <span class="st">"body"</span>],
+    field_weights={<span class="st">"title"</span>: <span class="mi">0.4</span>, <span class="st">"body"</span>: <span class="mi">0.6</span>},
+    k1=<span class="mi">1.2</span>, b=<span class="mi">0.75</span>, method=<span class="st">"lucene"</span>,
+)
+
+<span class="cm"># Documents are dicts mapping field names to token lists</span>
+scorer.<span class="fn">index</span>(documents, show_progress=<span class="kw">False</span>)
+doc_ids, probabilities = scorer.<span class="fn">retrieve</span>(query_tokens, k=<span class="mi">10</span>)</code></pre>
+</section>
+
+<!-- ============ FusionDebugger ============ -->
+<section id="debugger">
+  <h2>FusionDebugger</h2>
+  <p>
+    Transparent inspection of the full probability pipeline. Records every
+    intermediate value (likelihood, prior, posterior, fusion) for
+    debugging and document comparison.
+  </p>
+<pre><code>debugger = <span class="fn">FusionDebugger</span>(transform)
+
+<span class="cm"># Trace a single document through the pipeline</span>
+trace = debugger.<span class="fn">trace_document</span>(
+    bm25_score=<span class="mi">8.42</span>, tf=<span class="mi">5</span>, doc_len_ratio=<span class="mi">0.60</span>,
+    cosine_score=<span class="mi">0.74</span>, doc_id=<span class="st">"doc-42"</span>,
+)
+<span class="kw">print</span>(debugger.<span class="fn">format_trace</span>(trace))
+
+<span class="cm"># Compare two documents</span>
+comparison = debugger.<span class="fn">compare</span>(trace_a, trace_b)
+<span class="kw">print</span>(debugger.<span class="fn">format_comparison</span>(comparison))
+
+<span class="cm"># Hierarchical fusion: AND(OR(title, body), vector, NOT(spam))</span>
+step1 = debugger.<span class="fn">trace_fusion</span>([<span class="mi">0.85</span>, <span class="mi">0.70</span>],
+    names=[<span class="st">"title"</span>, <span class="st">"body"</span>], method=<span class="st">"prob_or"</span>)
+step2 = debugger.<span class="fn">trace_not</span>(<span class="mi">0.90</span>, name=<span class="st">"spam"</span>)
+step3 = debugger.<span class="fn">trace_fusion</span>(
+    [step1.fused_probability, <span class="mi">0.80</span>, step2.complement],
+    names=[<span class="st">"OR(title,body)"</span>, <span class="st">"vector"</span>, <span class="st">"NOT(spam)"</span>],
+    method=<span class="st">"prob_and"</span>,
+)</code></pre>
+</section>
+
+<!-- ============ Calibration Metrics ============ -->
+<section id="metrics">
+  <h2>Calibration Metrics</h2>
+<pre><code><span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> (
+    expected_calibration_error, brier_score,
+    reliability_diagram, calibration_report,
+)
+
+ece = <span class="fn">expected_calibration_error</span>(probs, labels)       <span class="cm"># lower is better</span>
+bs = <span class="fn">brier_score</span>(probs, labels)                        <span class="cm"># lower is better</span>
+bins = <span class="fn">reliability_diagram</span>(probs, labels, n_bins=<span class="mi">10</span>)  <span class="cm"># (avg_pred, avg_actual, count)</span>
+
+<span class="cm"># One-call diagnostic report</span>
+report = <span class="fn">calibration_report</span>(probs, labels)
+<span class="kw">print</span>(report.<span class="fn">summary</span>())  <span class="cm"># formatted text with ECE, Brier, reliability table</span></code></pre>
+  <p><code>CalibrationReport</code> dataclass bundles ECE, Brier score, and
+    reliability diagram data into a single diagnostic with a <code>summary()</code>
+    method for formatted output.</p>
+</section>
+
+<!-- ============ Training Modes ============ -->
+<section id="training-modes">
+  <h2>Training Modes</h2>
+  <p>Three training modes control how the gradient flows through the model
+    (Algorithm 8.3.1 from the paper):</p>
+
+  <table>
+    <thead><tr><th>Mode</th><th>Condition</th><th>Trains On</th><th>Inference Prior</th></tr></thead>
+    <tbody>
+      <tr><td><code>"balanced"</code></td><td>C1 (default)</td><td>Sigmoid likelihood</td><td>Full composite prior</td></tr>
+      <tr><td><code>"prior_aware"</code></td><td>C2</td><td>Full Bayesian posterior (chain-rule gradients through dP/dL)</td><td>Full composite prior</td></tr>
+      <tr><td><code>"prior_free"</code></td><td>C3</td><td>Sigmoid likelihood</td><td>prior = 0.5 (neutral)</td></tr>
+    </tbody>
+  </table>
+<pre><code>transform.<span class="fn">fit</span>(scores, labels, mode=<span class="st">"balanced"</span>)       <span class="cm"># C1</span>
+transform.<span class="fn">fit</span>(scores, labels, mode=<span class="st">"prior_aware"</span>,     <span class="cm"># C2</span>
+              tfs=tfs, doc_len_ratios=ratios)
+transform.<span class="fn">fit</span>(scores, labels, mode=<span class="st">"prior_free"</span>)      <span class="cm"># C3</span></code></pre>
+  <div class="note">
+    <strong>Tip:</strong> C1 (balanced) is the recommended default. C2 (prior-aware)
+    couples alpha/beta learning with the prior, useful when TF and document length
+    data are available. C3 (prior-free) is best when you want a clean likelihood
+    fit without prior influence.
+  </div>
+</section>
+
+</div><!-- .content -->
+</div><!-- .page-with-toc -->
+
+<!-- ====== Footer ====== -->
+<footer>
+  <div class="container">
+    <p>
+      Bayesian BM25
+      &middot; <a href="https://github.com/cognica-io/bayesian-bm25">GitHub</a>
+      &middot; <a href="https://pypi.org/project/bayesian-bm25/">PyPI</a>
+      &middot; <a href="https://cognica.io">Cognica</a>
+      &middot; Apache-2.0
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
