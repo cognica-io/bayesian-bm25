@@ -47,6 +47,12 @@
     <li class="toc-h3"><a href="#cosine">cosine_to_probability</a></li>
     <li><a href="#learnable">LearnableLogOddsWeights</a></li>
     <li><a href="#attention">AttentionLogOddsWeights</a></li>
+    <li><a href="#multi-head">MultiHeadAttentionLogOddsWeights</a></li>
+    <li><a href="#calibrators">Calibrators</a></li>
+    <li class="toc-h3"><a href="#platt">PlattCalibrator</a></li>
+    <li class="toc-h3"><a href="#isotonic">IsotonicCalibrator</a></li>
+    <li><a href="#temporal">TemporalBayesianTransform</a></li>
+    <li><a href="#bmw">BlockMaxIndex</a></li>
     <li><a href="#scorer">BayesianBM25Scorer</a></li>
     <li class="toc-h3"><a href="#scorer-init">Constructor</a></li>
     <li class="toc-h3"><a href="#scorer-index">index / retrieve</a></li>
@@ -91,6 +97,7 @@
     alpha=<span class="mi">1.0</span>,       <span class="cm"># sigmoid steepness</span>
     beta=<span class="mi">0.0</span>,        <span class="cm"># sigmoid midpoint</span>
     base_rate=<span class="kw">None</span>,  <span class="cm"># corpus-level relevance rate (0, 1) or None</span>
+    prior_fn=<span class="kw">None</span>,   <span class="cm"># callable or None -- custom prior function</span>
 )</code></pre>
   <table>
     <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
@@ -98,6 +105,7 @@
       <tr><td><code>alpha</code></td><td>float</td><td>Sigmoid steepness. Higher values make the transition sharper. Learnable via <code>fit()</code>.</td></tr>
       <tr><td><code>beta</code></td><td>float</td><td>Sigmoid midpoint. Scores below beta map to P &lt; 0.5. Learnable via <code>fit()</code>.</td></tr>
       <tr><td><code>base_rate</code></td><td>float or None</td><td>Corpus-level base rate of relevant documents. When set, decomposes the posterior into three additive log-odds terms. Reduces ECE by 68&ndash;77%.</td></tr>
+      <tr><td><code>prior_fn</code></td><td>callable or None</td><td>Custom prior function (score, tf, doc_len_ratio) -&gt; float. Replaces composite prior when set. prior_free mode overrides.</td></tr>
     </tbody>
   </table>
 
@@ -154,7 +162,8 @@
     probs,          <span class="cm"># ndarray &mdash; probabilities, last axis = signals</span>
     alpha=<span class="kw">None</span>,     <span class="cm"># float or "auto" &mdash; confidence scaling (None=auto)</span>
     weights=<span class="kw">None</span>,   <span class="cm"># ndarray &mdash; per-signal weights (sum to 1)</span>
-    gating=<span class="st">"none"</span>,  <span class="cm"># "none", "relu", or "swish"</span>
+    gating=<span class="st">"none"</span>,  <span class="cm"># "none", "relu", "swish", or "gelu"</span>
+    gating_beta=<span class="mi">1.0</span>,  <span class="cm"># generalized swish sharpness (swish only)</span>
 )</code></pre>
   <table>
     <thead><tr><th>Parameter</th><th>Description</th></tr></thead>
@@ -163,6 +172,8 @@
       <tr><td><code>weights</code></td><td>Per-signal reliability weights in $[0,1]$, summing to 1. Log-OP formulation.</td></tr>
       <tr><td><code>gating="relu"</code></td><td>MAP estimation: zeroes negative logits (Paper 2, Theorem 6.5.3).</td></tr>
       <tr><td><code>gating="swish"</code></td><td>Bayes estimation: soft suppression of negative logits (Paper 2, Theorem 6.7.4).</td></tr>
+      <tr><td><code>gating="gelu"</code></td><td>Gaussian noise model: logit * sigmoid(1.702 * logit) (Paper 2, Theorem 6.8.1).</td></tr>
+      <tr><td><code>gating_beta</code></td><td>Generalized swish sharpness. Only used with gating="swish". Default 1.0 (Theorem 6.7.6).</td></tr>
     </tbody>
   </table>
 
@@ -197,8 +208,9 @@
     Starts from Naive Bayes uniform initialization ($w_i = 1/n$).
   </p>
 <pre><code>learner = <span class="fn">LearnableLogOddsWeights</span>(
-    n_signals=<span class="mi">3</span>,  <span class="cm"># number of input signals</span>
-    alpha=<span class="mi">0.0</span>,     <span class="cm"># confidence scaling (0.0 for weighted mode)</span>
+    n_signals=<span class="mi">3</span>,      <span class="cm"># number of input signals</span>
+    alpha=<span class="mi">0.0</span>,         <span class="cm"># confidence scaling (0.0 for weighted mode)</span>
+    base_rate=<span class="kw">None</span>,   <span class="cm"># corpus-level base rate bias in log-odds space</span>
 )
 
 <span class="cm"># Batch fit from labeled data</span>
@@ -230,6 +242,8 @@ fused = learner(test_probs, use_averaged=<span class="kw">True</span>)</code></p
     n_query_features=<span class="mi">3</span>,  <span class="cm"># dimensionality of query feature vector</span>
     alpha=<span class="mi">0.5</span>,            <span class="cm"># confidence scaling</span>
     normalize=<span class="kw">True</span>,       <span class="cm"># per-signal logit normalization</span>
+    seed=<span class="kw">None</span>,            <span class="cm"># random seed for reproducible initialization</span>
+    base_rate=<span class="kw">None</span>,       <span class="cm"># corpus-level base rate bias in log-odds space</span>
 )
 
 <span class="cm"># Train: probs (m, 2), labels (m,), features (m, 3)</span>
@@ -241,6 +255,113 @@ fused = attn(test_probs, test_features, use_averaged=<span class="kw">True</span
   <p>When <code>normalize=True</code>, applies per-column min-max normalization in
     logit space before the weighted sum, equalizing signal scales (same scaling as
     <code>balanced_log_odds_fusion</code>).</p>
+  <p>Supports exact pruning via <code>compute_upper_bounds()</code> and
+    <code>prune()</code> methods (Theorem 8.7.1). Given candidate probability upper
+    bounds, the pruner safely eliminates documents whose fused probability cannot
+    exceed the current threshold.</p>
+</section>
+
+<!-- ============ MultiHeadAttentionLogOddsWeights ============ -->
+<section id="multi-head">
+  <h2>MultiHeadAttentionLogOddsWeights</h2>
+  <p>
+    Multi-head attention fusion that creates multiple independent attention heads,
+    averages their log-odds, and applies sigmoid (Remark 8.6, Corollary 8.7.2).
+  </p>
+<pre><code>mh = <span class="fn">MultiHeadAttentionLogOddsWeights</span>(
+    n_heads=<span class="mi">4</span>,            <span class="cm"># number of independent heads</span>
+    n_signals=<span class="mi">2</span>,          <span class="cm"># number of input signals</span>
+    n_query_features=<span class="mi">3</span>,  <span class="cm"># query feature dimensionality</span>
+    alpha=<span class="mi">0.5</span>,            <span class="cm"># confidence scaling</span>
+    normalize=<span class="kw">False</span>,      <span class="cm"># per-signal logit normalization</span>
+)
+
+<span class="cm"># Train all heads on the same data (different init -> diversity)</span>
+mh.<span class="fn">fit</span>(probs, labels, query_features)
+
+<span class="cm"># Inference: average log-odds across heads, then sigmoid</span>
+fused = mh(test_probs, test_features, use_averaged=<span class="kw">True</span>)
+
+<span class="cm"># Attention pruning (Theorem 8.7.1)</span>
+surviving_idx, fused_probs = mh.<span class="fn">prune</span>(
+    candidate_probs, query_features, threshold=<span class="mi">0.5</span>,
+    upper_bound_probs=candidate_upper_bounds,
+)</code></pre>
+</section>
+
+<!-- ============ Calibrators ============ -->
+<section id="calibrators">
+  <h2>Calibrators</h2>
+  <p>Convert raw neural model scores into calibrated probabilities for Bayesian fusion.</p>
+
+  <h3 id="platt">PlattCalibrator</h3>
+  <p>Sigmoid calibration: $P = \sigma(a \cdot s + b)$ with BCE gradient descent.</p>
+<pre><code><span class="kw">from</span> bayesian_bm25.calibration <span class="kw">import</span> PlattCalibrator
+
+platt = <span class="fn">PlattCalibrator</span>(a=<span class="mi">1.0</span>, b=<span class="mi">0.0</span>)
+platt.<span class="fn">fit</span>(scores, labels, learning_rate=<span class="mi">0.01</span>, max_iterations=<span class="mi">1000</span>)
+calibrated = platt.<span class="fn">calibrate</span>(new_scores)  <span class="cm"># or platt(new_scores)</span></code></pre>
+
+  <h3 id="isotonic">IsotonicCalibrator</h3>
+  <p>Non-parametric monotone calibration via Pool Adjacent Violators Algorithm (PAVA).
+    numpy-only, no scipy dependency.</p>
+<pre><code><span class="kw">from</span> bayesian_bm25.calibration <span class="kw">import</span> IsotonicCalibrator
+
+iso = <span class="fn">IsotonicCalibrator</span>()
+iso.<span class="fn">fit</span>(scores, labels)
+calibrated = iso.<span class="fn">calibrate</span>(new_scores)  <span class="cm"># or iso(new_scores)</span></code></pre>
+  <p>Both calibrators produce output in $(0, 1)$ suitable for <code>log_odds_conjunction</code>.</p>
+</section>
+
+<!-- ============ TemporalBayesianTransform ============ -->
+<section id="temporal">
+  <h2>TemporalBayesianTransform</h2>
+  <p>
+    Extends <code>BayesianProbabilityTransform</code> with exponential temporal
+    weighting for non-stationary relevance patterns (Section 12.2 #3).
+  </p>
+<pre><code><span class="kw">from</span> bayesian_bm25.probability <span class="kw">import</span> TemporalBayesianTransform
+
+transform = <span class="fn">TemporalBayesianTransform</span>(
+    alpha=<span class="mi">1.0</span>,              <span class="cm"># sigmoid steepness</span>
+    beta=<span class="mi">0.0</span>,               <span class="cm"># sigmoid midpoint</span>
+    decay_half_life=<span class="mi">100.0</span>,  <span class="cm"># observations until weight halves</span>
+)
+
+<span class="cm"># Batch fit with temporal weights: recent data gets more influence</span>
+transform.<span class="fn">fit</span>(scores, labels, timestamps=timestamps)
+
+<span class="cm"># Online update: auto-increments internal timestamp</span>
+transform.<span class="fn">update</span>(score, label)</code></pre>
+  <table>
+    <thead><tr><th>Parameter</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>decay_half_life</code></td><td>Number of observations after which a sample's weight decays to 50%. Must be positive. Very large values match the parent class.</td></tr>
+      <tr><td><code>timestamps</code></td><td>Per-sample timestamps for <code>fit()</code>. When None, all samples weighted equally.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============ BlockMaxIndex ============ -->
+<section id="bmw">
+  <h2>BlockMaxIndex</h2>
+  <p>
+    Block-max index for BMW-style upper bounds (Section 6.2, Corollary 7.4.2).
+    Partitions documents into blocks and stores per-block maximum BM25
+    contributions for tighter pruning bounds than global WAND.
+  </p>
+<pre><code><span class="kw">from</span> bayesian_bm25.scorer <span class="kw">import</span> BlockMaxIndex
+
+idx = <span class="fn">BlockMaxIndex</span>(block_size=<span class="mi">128</span>)
+idx.<span class="fn">build</span>(score_matrix)  <span class="cm"># shape: (n_terms, n_docs)</span>
+
+<span class="cm"># Per-block BM25 upper bound</span>
+block_ub = idx.<span class="fn">block_upper_bound</span>(term_idx, block_id)
+
+<span class="cm"># Bayesian probability upper bound (tighter than global WAND)</span>
+bayesian_ub = idx.<span class="fn">bayesian_block_upper_bound</span>(
+    term_idx, block_id, transform, p_max=<span class="mi">0.9</span>,
+)</code></pre>
 </section>
 
 <!-- ============ BayesianBM25Scorer ============ -->

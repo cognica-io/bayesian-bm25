@@ -175,12 +175,12 @@ graph LR
     <div class="card">
       <h3>Probabilistic Fusion</h3>
       <p>Log-odds conjunction, probabilistic AND/OR/NOT, per-signal weights,
-        and sparse gating (ReLU/Swish) for multi-signal combination.</p>
+        sparse gating (ReLU/Swish/GELU), multi-head attention, and neural score calibration.</p>
     </div>
     <div class="card">
       <h3>WAND Pruning</h3>
       <p>Safe Bayesian probability upper bounds for document pruning
-        in top-k retrieval. Tighter than raw BM25 bounds.</p>
+        in top-k retrieval. Block-max (BMW) bounds for tighter per-block pruning. Attention pruning for fusion.</p>
     </div>
   </div>
 </div>
@@ -255,9 +255,37 @@ graph LR
   <h3>Sparse Signal Gating</h3>
   <p>
     For high-dimensional signal spaces, <strong>ReLU gating</strong>
-    ($\max(0, \text{logit})$, MAP estimation) and <strong>Swish gating</strong>
-    ($\text{logit} \cdot \sigma(\text{logit})$, Bayes estimation) suppress noisy
-    negative-logit signals before aggregation (Paper 2, Theorems 6.5.3/6.7.4).
+    ($\max(0, \text{logit})$, MAP estimation), <strong>Swish gating</strong>
+    ($\text{logit} \cdot \sigma(\text{logit})$, Bayes estimation),
+    and <strong>GELU gating</strong>
+    ($\text{logit} \cdot \sigma(1.702 \cdot \text{logit})$, Gaussian noise model)
+    suppress noisy negative-logit signals before aggregation
+    (Paper 2, Theorems 6.5.3/6.7.4/6.8.1).
+    The generalized Swish gate
+    $\text{logit} \cdot \sigma(\beta \cdot \text{logit})$
+    interpolates between $x/2$ ($\beta \to 0$), standard Swish ($\beta = 1$),
+    and ReLU ($\beta \to \infty$) via the <code>gating_beta</code> parameter
+    (Theorem 6.7.6).
+  </p>
+
+  <h3>Multi-Head Attention</h3>
+  <p>
+    <code>MultiHeadAttentionLogOddsWeights</code> creates multiple independent
+    attention heads with different random initializations. Each head produces
+    fused log-odds independently, then the results are averaged in log-odds space
+    before converting back to probability via sigmoid (Remark 8.6). Multi-head
+    diversity reduces variance compared to single-head attention.
+    Both single-head and multi-head attention support exact pruning via
+    <code>compute_upper_bounds()</code> and <code>prune()</code> (Theorem 8.7.1).
+  </p>
+
+  <h3>Neural Score Calibration</h3>
+  <p>
+    <code>PlattCalibrator</code> (sigmoid: $P = \sigma(a \cdot s + b)$) and
+    <code>IsotonicCalibrator</code> (PAVA monotone regression) convert raw neural
+    model scores into calibrated probabilities suitable for Bayesian fusion.
+    Calibrated scores can be combined with BM25 probabilities via
+    <code>log_odds_conjunction</code>.
   </p>
 </div>
 </section>
@@ -279,12 +307,13 @@ graph LR
       <tr><th>Method</th><th>ArguAna</th><th>FiQA</th><th>NFCorpus</th><th>SciDocs</th><th>SciFact</th><th>Average</th></tr>
     </thead>
     <tbody>
-      <tr><td>BM25</td><td>36.13</td><td>25.31</td><td>31.82</td><td>15.63</td><td>68.02</td><td>35.38</td></tr>
+      <tr><td>BM25</td><td>36.16</td><td>25.32</td><td>31.85</td><td>15.65</td><td>67.91</td><td>35.38</td></tr>
       <tr><td>Dense</td><td>36.98</td><td>36.87</td><td>31.59</td><td>21.64</td><td>64.51</td><td>38.32</td></tr>
-      <tr><td>Convex</td><td>40.01</td><td>37.10</td><td>35.60</td><td>19.67</td><td>73.37</td><td>41.15</td></tr>
-      <tr><td>RRF</td><td>39.61</td><td>36.85</td><td>34.43</td><td>20.11</td><td>71.43</td><td>40.49</td></tr>
-      <tr class="highlight"><td>Bayesian-Balanced</td><td>37.27</td><td>40.58</td><td>35.73</td><td>21.42</td><td>72.47</td><td>41.50</td></tr>
-      <tr class="highlight"><td>Attn-NR</td><td>37.22</td><td>40.53</td><td>35.42</td><td>21.91</td><td>73.24</td><td>41.67</td></tr>
+      <tr><td>Convex</td><td>40.03</td><td>37.10</td><td>35.61</td><td>19.65</td><td>73.38</td><td>41.15</td></tr>
+      <tr><td>RRF</td><td>39.61</td><td>36.85</td><td>34.43</td><td>20.09</td><td>71.43</td><td>40.48</td></tr>
+      <tr class="highlight"><td>Bayesian-Balanced</td><td>37.27</td><td>40.59</td><td>35.73</td><td>21.40</td><td>72.47</td><td>41.50</td></tr>
+      <tr class="highlight"><td>Attn-NR</td><td>37.21</td><td>40.43</td><td>35.43</td><td>21.91</td><td>73.22</td><td>41.64</td></tr>
+      <tr><td>MH-NR</td><td>37.13</td><td>39.08</td><td>35.72</td><td>21.78</td><td>70.60</td><td>40.86</td></tr>
     </tbody>
   </table>
 
@@ -294,21 +323,23 @@ graph LR
       <tr><th>Method</th><th>Type</th><th>Delta</th></tr>
     </thead>
     <tbody>
-      <tr class="highlight"><td>Attn-NR</td><td>zero-shot</td><td>+6.28</td></tr>
-      <tr><td>Balanced-Tuned</td><td>trained</td><td>+6.26</td></tr>
-      <tr><td>Bayesian-Balanced</td><td>zero-shot</td><td>+6.11</td></tr>
-      <tr><td>Convex</td><td>zero-shot</td><td>+5.76</td></tr>
-      <tr><td>RRF</td><td>zero-shot</td><td>+5.11</td></tr>
-      <tr><td>Attention</td><td>zero-shot</td><td>+4.99</td></tr>
+      <tr class="highlight"><td>Attn-NR</td><td>zero-shot</td><td>+6.26</td></tr>
+      <tr><td>Bayesian-Balanced</td><td>zero-shot</td><td>+6.12</td></tr>
+      <tr><td>MH-NR</td><td>zero-shot</td><td>+5.48</td></tr>
+      <tr><td>Convex</td><td>zero-shot</td><td>+5.78</td></tr>
+      <tr><td>Multi-Head</td><td>zero-shot</td><td>+5.04</td></tr>
+      <tr><td>RRF</td><td>zero-shot</td><td>+5.10</td></tr>
+      <tr><td>Attention</td><td>zero-shot</td><td>+4.98</td></tr>
       <tr><td>Dense</td><td>zero-shot</td><td>+2.94</td></tr>
     </tbody>
   </table>
   <p>
-    <strong>Attn-NR</strong> achieves the highest average NDCG@10 (41.67%),
-    outperforming Convex combination (+0.52), RRF (+1.18), and BM25 (+6.28)
+    <strong>Attn-NR</strong> achieves the highest average NDCG@10 (41.64%),
+    outperforming Convex combination (+0.49), RRF (+1.16), and BM25 (+6.26)
     in a fully zero-shot setting with no relevance labels.
+    MH-NR (multi-head + normalize, +5.48) outperforms single-head Attention (+4.98).
     See the <a href="https://github.com/cognica-io/bayesian-bm25#benchmarks">full benchmark tables</a>
-    with 18 methods, MAP@10, and Recall@10.
+    with 22 methods, MAP@10, and Recall@10.
   </p>
 
   <h3>Probability Calibration</h3>
@@ -329,7 +360,7 @@ graph LR
   </p>
 
   <h4>Reproduce</h4>
-<pre><code><span class="cm"># Zero-shot (18 methods)</span>
+<pre><code><span class="cm"># Zero-shot (22 methods)</span>
 python benchmarks/hybrid_beir.py -d &lt;beir-data-dir&gt;
 
 <span class="cm"># With tuning (supervised + grid search)</span>
