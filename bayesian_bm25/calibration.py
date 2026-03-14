@@ -205,7 +205,7 @@ class IsotonicCalibrator:
         indices = np.searchsorted(x, scores_arr)
 
         result = np.empty_like(scores_arr)
-        for i, (s, idx) in enumerate(zip(scores_arr, indices)):
+        for i, (s, idx) in enumerate(zip(scores_arr, indices, strict=True)):
             if idx == 0:
                 result[i] = y[0]
             elif idx >= len(x):

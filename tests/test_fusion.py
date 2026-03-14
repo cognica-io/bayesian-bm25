@@ -1274,7 +1274,6 @@ class TestGELUGating:
     def test_gelu_between_swish_and_relu_positive(self):
         """GELU result between swish and relu for positive logits."""
         probs = np.array([0.8, 0.9, 0.7])  # all > 0.5, positive logits
-        result_none = log_odds_conjunction(probs, gating="none")
         result_swish = log_odds_conjunction(probs, gating="swish")
         result_gelu = log_odds_conjunction(probs, gating="gelu")
         result_relu = log_odds_conjunction(probs, gating="relu")

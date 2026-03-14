@@ -233,7 +233,7 @@ def run_head_diversity(rng: np.random.Generator) -> dict:
     n_heads = len(heads)
     distances = []
 
-    print(f"\n  Pairwise L2 distances between head weight matrices:")
+    print("\n  Pairwise L2 distances between head weight matrices:")
     print(f"\n  {'Head i':>6}  {'Head j':>6}  {'L2 Distance':>12}")
     print(f"  {'-' * 30}")
 
