@@ -25,17 +25,21 @@ Methods compared:
   8. Balanced-Elbow   -- balanced fusion with elbow base_rate estimation
   9. Gated-ReLU       -- log-odds conjunction with ReLU gating (Theorem 6.5.3)
  10. Gated-Swish      -- log-odds conjunction with Swish gating (Theorem 6.7.4)
- 11. Attention        -- query-dependent attention weights (Paper 2, Section 8)
- 12. Attn-NR          -- Attention + logit normalization + 7 features (dense+cross)
- 13. Attn-NR-CV       -- 5-fold cross-validated Attn-NR
- 14. MultiField       -- MultiFieldScorer (title + body), sparse-only
- 15. MF-Balanced      -- MultiField probs + dense via balanced_log_odds_fusion
+ 11. Gated-GELU       -- log-odds conjunction with GELU gating (Theorem 6.8.1)
+ 12. Gated-Swish-B2   -- generalized swish with beta=2.0 (Theorem 6.7.6)
+ 13. Attention        -- query-dependent attention weights (Paper 2, Section 8)
+ 14. Attn-NR          -- Attention + logit normalization + 7 features (dense+cross)
+ 15. Attn-NR-CV       -- 5-fold cross-validated Attn-NR
+ 16. Multi-Head       -- 4-head attention fusion (Remark 8.6)
+ 17. MH-NR            -- Multi-head + normalize + rich features (Corollary 8.7.2)
+ 18. MultiField       -- MultiFieldScorer (title + body), sparse-only
+ 19. MF-Balanced      -- MultiField probs + dense via balanced_log_odds_fusion
 
 With --tune, additional tuned methods are evaluated:
 
- 16. Bayesian-Tuned     -- BayesianBM25 with tuned alpha, beta, base_rate
- 17. Balanced-Tuned     -- balanced_log_odds_fusion with tuned weight
- 18. Hybrid-AND-Tuned   -- log-odds conjunction with tuned alpha
+ 20. Bayesian-Tuned     -- BayesianBM25 with tuned alpha, beta, base_rate
+ 21. Balanced-Tuned     -- balanced_log_odds_fusion with tuned weight
+ 22. Hybrid-AND-Tuned   -- log-odds conjunction with tuned alpha
 
 Dependencies:
     pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5
@@ -66,6 +70,7 @@ import Stemmer
 
 from bayesian_bm25.fusion import (
     AttentionLogOddsWeights,
+    MultiHeadAttentionLogOddsWeights,
     balanced_log_odds_fusion,
     cosine_to_probability,
     log_odds_conjunction,
@@ -1078,8 +1083,9 @@ BASELINE_METHODS = [
     "BM25", "Dense", "Convex", "RRF",
     "Bayesian-OR", "Bayesian-LogOdds", "LO-Local", "Bayesian-LO-BR", "Bayesian-Balanced",
     "Balanced-Mix", "Balanced-Elbow",
-    "Gated-ReLU", "Gated-Swish",
+    "Gated-ReLU", "Gated-Swish", "Gated-GELU", "Gated-Swish-B2",
     "Attention", "Attn-NR", "Attn-NR-CV",
+    "Multi-Head", "MH-NR",
     "MultiField", "MF-Balanced",
 ]
 
@@ -1362,6 +1368,12 @@ def run_dataset(
         hybrid_scores["Gated-Swish"] = log_odds_conjunction(
             gated_input, gating="swish",
         )
+        hybrid_scores["Gated-GELU"] = log_odds_conjunction(
+            gated_input, gating="gelu",
+        )
+        hybrid_scores["Gated-Swish-B2"] = log_odds_conjunction(
+            gated_input, gating="swish", gating_beta=2.0,
+        )
 
         for method_name, scores in hybrid_scores.items():
             runs[method_name][qid] = {
@@ -1543,6 +1555,97 @@ def run_dataset(
     )
     print(f"  Attention variants done ({time.time() - t0:.1f}s)")
 
+    # 5d. Multi-head attention fusion (Paper 2, Remark 8.6)
+    t0 = time.time()
+
+    # Multi-Head: basic features, 4 heads
+    mh_tp, mh_tl, mh_tf, mh_tq = _collect_attn_training_data(
+        attn_cache, corpus_ids, qrels, "features",
+        n_signals=2,
+    )
+    mh_n_train = len(mh_tp)
+    mh_labels = np.array(mh_tl, dtype=np.float64)
+    mh_has_both = (
+        mh_n_train >= 10
+        and float(np.sum(mh_labels)) > 0
+        and float(np.sum(1.0 - mh_labels)) > 0
+    )
+
+    if mh_has_both:
+        mh_model = MultiHeadAttentionLogOddsWeights(
+            n_heads=4, n_signals=2, n_query_features=3, alpha=0.5,
+        )
+        mh_model.fit(
+            np.array(mh_tp, dtype=np.float64),
+            mh_labels,
+            np.array(mh_tf, dtype=np.float64),
+            learning_rate=0.01,
+            max_iterations=500,
+        )
+
+        for qid, cache in attn_cache.items():
+            ui = cache["union_idx"]
+            signals = _prepare_attn_probs(cache["cand_probs_br"], cache["cand_dense"])
+            probs_matrix = np.column_stack(signals)
+            feats = cache["features"]
+            scores = mh_model(probs_matrix, feats, use_averaged=True)
+            runs["Multi-Head"][qid] = {
+                corpus_ids[ui[j]]: float(scores[j])
+                for j in range(len(ui))
+            }
+        print(f"  Multi-Head trained ({mh_n_train} pairs, 4 heads)")
+    else:
+        methods = [m for m in methods if m != "Multi-Head"]
+        if "Multi-Head" in runs:
+            del runs["Multi-Head"]
+        print(f"  Multi-Head skipped (insufficient data: {mh_n_train} pairs)")
+
+    # MH-NR: rich features + normalize, 4 heads
+    mh_nr_tp, mh_nr_tl, mh_nr_tf, mh_nr_tq = _collect_attn_training_data(
+        attn_cache, corpus_ids, qrels, "features_rich",
+        n_signals=2,
+    )
+    mh_nr_n_train = len(mh_nr_tp)
+    mh_nr_labels = np.array(mh_nr_tl, dtype=np.float64)
+    mh_nr_has_both = (
+        mh_nr_n_train >= 10
+        and float(np.sum(mh_nr_labels)) > 0
+        and float(np.sum(1.0 - mh_nr_labels)) > 0
+    )
+
+    if mh_nr_has_both:
+        mh_nr_model = MultiHeadAttentionLogOddsWeights(
+            n_heads=4, n_signals=2, n_query_features=7, alpha=0.5,
+            normalize=True,
+        )
+        mh_nr_model.fit(
+            np.array(mh_nr_tp, dtype=np.float64),
+            mh_nr_labels,
+            np.array(mh_nr_tf, dtype=np.float64),
+            learning_rate=0.01,
+            max_iterations=500,
+            query_ids=np.array(mh_nr_tq),
+        )
+
+        for qid, cache in attn_cache.items():
+            ui = cache["union_idx"]
+            signals = _prepare_attn_probs(cache["cand_probs_br"], cache["cand_dense"])
+            probs_matrix = np.column_stack(signals)
+            feats = cache["features_rich"]
+            scores = mh_nr_model(probs_matrix, feats, use_averaged=True)
+            runs["MH-NR"][qid] = {
+                corpus_ids[ui[j]]: float(scores[j])
+                for j in range(len(ui))
+            }
+        print(f"  MH-NR trained ({mh_nr_n_train} pairs, 4 heads, normalize)")
+    else:
+        methods = [m for m in methods if m != "MH-NR"]
+        if "MH-NR" in runs:
+            del runs["MH-NR"]
+        print(f"  MH-NR skipped (insufficient data: {mh_nr_n_train} pairs)")
+
+    print(f"  Multi-head variants done ({time.time() - t0:.1f}s)")
+
     # 6. Evaluate baselines
     results: dict[str, dict[str, float]] = {}
     for method_name in methods:
@@ -1698,8 +1801,9 @@ def run_dataset(
 CALIBRATION_METHODS = [
     "Bayesian-OR", "Bayesian-LO-BR", "Bayesian-Balanced",
     "Balanced-Mix", "Balanced-Elbow",
-    "Gated-ReLU", "Gated-Swish",
+    "Gated-ReLU", "Gated-Swish", "Gated-GELU", "Gated-Swish-B2",
     "Attention",
+    "Multi-Head", "MH-NR",
     "MultiField", "MF-Balanced",
 ]
 

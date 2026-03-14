@@ -1052,3 +1052,84 @@ class TestEndToEnd:
             np.array([p_match, float(prob_not(p_exclude))])
         ))
         assert fused.fused_probability == pytest.approx(expected, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Gating trace (Features 1, 2)
+# ---------------------------------------------------------------------------
+
+class TestGatingTrace:
+    """Tests for gating fields in FusionTrace."""
+
+    def test_gating_none_by_default(self, debugger):
+        """Gating fields are None by default."""
+        trace = debugger.trace_fusion([0.8, 0.7])
+        assert trace.gating is None
+        assert trace.gating_beta is None
+
+    def test_gating_recorded(self, debugger):
+        """Gating type is recorded in trace."""
+        trace = debugger.trace_fusion([0.8, 0.7], gating="relu")
+        assert trace.gating == "relu"
+
+    def test_gating_beta_recorded(self, debugger):
+        """Gating beta is recorded in trace."""
+        trace = debugger.trace_fusion(
+            [0.8, 0.7], gating="swish", gating_beta=2.0
+        )
+        assert trace.gating == "swish"
+        assert trace.gating_beta == 2.0
+
+    def test_gelu_gating_recorded(self, debugger):
+        """GELU gating is recorded in trace."""
+        trace = debugger.trace_fusion([0.8, 0.7], gating="gelu")
+        assert trace.gating == "gelu"
+
+    def test_format_trace_shows_gating(self, debugger):
+        """format_trace displays gating info when present."""
+        trace = debugger.trace_document(
+            bm25_score=8.0, tf=5.0, doc_len_ratio=0.6,
+            cosine_score=0.7, doc_id="doc-1",
+        )
+        # Default trace has no gating info
+        output_default = debugger.format_trace(trace)
+        assert "gating=" not in output_default
+
+    def test_format_trace_shows_gating_with_beta(self, debugger):
+        """format_trace displays gating with beta."""
+        trace = debugger.trace_fusion(
+            [0.8, 0.7], gating="swish", gating_beta=2.0
+        )
+        # Build a document trace manually to test format
+        doc_trace = DocumentTrace(
+            doc_id="test",
+            signals={},
+            fusion=trace,
+            final_probability=trace.fused_probability,
+        )
+        output = debugger.format_trace(doc_trace)
+        assert "gating=swish" in output
+        assert "beta=2.0" in output
+
+    def test_gating_trace_matches_function(self, debugger):
+        """Trace with gating matches log_odds_conjunction with gating."""
+        probs = [0.9, 0.3, 0.7]
+        trace = debugger.trace_fusion(probs, gating="relu")
+        expected = float(log_odds_conjunction(np.array(probs), gating="relu"))
+        assert trace.fused_probability == pytest.approx(expected, abs=1e-9)
+
+    def test_gelu_trace_matches_function(self, debugger):
+        """Trace with GELU matches log_odds_conjunction with GELU."""
+        probs = [0.9, 0.3, 0.7]
+        trace = debugger.trace_fusion(probs, gating="gelu")
+        expected = float(log_odds_conjunction(np.array(probs), gating="gelu"))
+        assert trace.fused_probability == pytest.approx(expected, abs=1e-9)
+
+    def test_swish_beta_trace_matches_function(self, debugger):
+        """Trace with swish beta matches log_odds_conjunction with beta."""
+        probs = [0.9, 0.3, 0.7]
+        trace = debugger.trace_fusion(probs, gating="swish", gating_beta=2.0)
+        expected = float(
+            log_odds_conjunction(np.array(probs), gating="swish", gating_beta=2.0)
+        )
+        assert trace.fused_probability == pytest.approx(expected, abs=1e-9)

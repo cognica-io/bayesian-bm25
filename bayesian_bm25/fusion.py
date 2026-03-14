@@ -116,7 +116,9 @@ def _resolve_alpha(alpha: float | str | None, default: float) -> float:
     return float(alpha)
 
 
-def _apply_gating(logits: np.ndarray, gating: str) -> np.ndarray:
+def _apply_gating(
+    logits: np.ndarray, gating: str, beta: float = 1.0,
+) -> np.ndarray:
     """Apply sparse-signal gating to logit values before aggregation.
 
     Parameters
@@ -124,21 +126,33 @@ def _apply_gating(logits: np.ndarray, gating: str) -> np.ndarray:
     logits : array
         Log-odds values to gate.
     gating : str
-        Gating function: "none", "relu", or "swish".
+        Gating function: "none", "relu", "swish", or "gelu".
 
         - "relu": MAP estimate under sparse prior (Theorem 6.5.3).
           Zeroes out weak/negative evidence: max(0, logit).
         - "swish": Bayes estimate under sparse prior (Theorem 6.7.4).
-          Soft gating: logit * sigmoid(logit).
+          Soft gating: logit * sigmoid(beta * logit).  When beta=1.0
+          this is the standard swish (Theorem 6.7.6).
+        - "gelu": Bayesian expected signal under Gaussian noise model
+          (Theorem 6.8.1, Proposition 6.8.2).  Approximated as
+          logit * sigmoid(1.702 * logit), which matches Swish_1.702.
+          The ``beta`` parameter is ignored for gelu.
+    beta : float
+        Generalized swish parameter (Theorem 6.7.6).  Controls the
+        sharpness of the swish gate.  beta=1.0 is the standard swish,
+        beta -> 0 approaches x/2, and beta -> inf approaches ReLU.
+        Ignored when gating is "gelu".
     """
     if gating == "none":
         return logits
     if gating == "relu":
         return np.maximum(0.0, logits)
     if gating == "swish":
-        return logits * sigmoid(logits)
+        return logits * sigmoid(beta * logits)
+    if gating == "gelu":
+        return logits * sigmoid(1.702 * logits)
     raise ValueError(
-        f"gating must be 'none', 'relu', or 'swish', got {gating!r}"
+        f"gating must be 'none', 'relu', 'swish', or 'gelu', got {gating!r}"
     )
 
 
@@ -147,6 +161,7 @@ def log_odds_conjunction(
     alpha: float | str | None = None,
     weights: np.ndarray | None = None,
     gating: str = "none",
+    gating_beta: float = 1.0,
 ) -> np.ndarray | float:
     """Log-odds conjunction with multiplicative confidence scaling (Paper 2, Section 4).
 
@@ -188,7 +203,12 @@ def log_odds_conjunction(
         - ``"none"`` (default): no gating.
         - ``"relu"``: MAP under sparse prior (Theorem 6.5.3): max(0, logit).
         - ``"swish"``: Bayes under sparse prior (Theorem 6.7.4):
-          logit * sigmoid(logit).
+          logit * sigmoid(beta * logit).
+        - ``"gelu"``: Bayesian expected signal under Gaussian noise model
+          (Theorem 6.8.1): logit * sigmoid(1.702 * logit).
+    gating_beta : float
+        Generalized swish parameter (Theorem 6.7.6).  Only used when
+        ``gating="swish"``.  Default 1.0 preserves existing behavior.
 
     Returns
     -------
@@ -197,7 +217,7 @@ def log_odds_conjunction(
     probs = _clamp_probability(np.asarray(probs, dtype=np.float64))
     n = probs.shape[-1]
     raw_logits = logit(probs)
-    gated_logits = _apply_gating(raw_logits, gating)
+    gated_logits = _apply_gating(raw_logits, gating, beta=gating_beta)
 
     if weights is not None:
         weights = np.asarray(weights, dtype=np.float64)
@@ -318,13 +338,26 @@ class LearnableLogOddsWeights:
         (Paper 2, Section 4.2).
     """
 
-    def __init__(self, n_signals: int, alpha: float | str = 0.0) -> None:
+    def __init__(
+        self,
+        n_signals: int,
+        alpha: float | str = 0.0,
+        base_rate: float | None = None,
+    ) -> None:
         if n_signals < 1:
             raise ValueError(
                 f"n_signals must be >= 1, got {n_signals}"
             )
+        if base_rate is not None and not (0.0 < base_rate < 1.0):
+            raise ValueError(
+                f"base_rate must be in (0, 1), got {base_rate}"
+            )
         self._n_signals = n_signals
         self._alpha = _resolve_alpha(alpha, default=0.0)
+        self._base_rate = base_rate
+        self._logit_base_rate: float | None = (
+            float(logit(base_rate)) if base_rate is not None else None
+        )
 
         # Softmax parameterization: zeros -> uniform 1/n (Naive Bayes init)
         self._logits = np.zeros(n_signals, dtype=np.float64)
@@ -345,6 +378,11 @@ class LearnableLogOddsWeights:
     def alpha(self) -> float:
         """Confidence scaling exponent (fixed)."""
         return self._alpha
+
+    @property
+    def base_rate(self) -> float | None:
+        """Corpus-level base rate of relevance, or None if not set."""
+        return self._base_rate
 
     @property
     def weights(self) -> np.ndarray:
@@ -374,8 +412,18 @@ class LearnableLogOddsWeights:
         -------
         Combined probability after weighted log-odds conjunction.
         """
+        probs = _clamp_probability(np.asarray(probs, dtype=np.float64))
         w = self._weights_avg if use_averaged else self.weights
-        return log_odds_conjunction(probs, alpha=self._alpha, weights=w)
+
+        n = self._n_signals
+        scale = n ** self._alpha
+        x = logit(probs)
+
+        l_weighted = scale * np.sum(w * x, axis=-1)
+        if self._logit_base_rate is not None:
+            l_weighted = l_weighted + self._logit_base_rate
+        result = sigmoid(l_weighted)
+        return float(result) if np.ndim(result) == 0 else result
 
     def fit(
         self,
@@ -430,7 +478,10 @@ class LearnableLogOddsWeights:
             x_bar_w = np.sum(w * x, axis=-1)
 
             # Predicted probability: shape (m,)
-            p = sigmoid(scale * x_bar_w)
+            l_weighted = scale * x_bar_w
+            if self._logit_base_rate is not None:
+                l_weighted = l_weighted + self._logit_base_rate
+            p = sigmoid(l_weighted)
             p = np.atleast_1d(np.asarray(p, dtype=np.float64))
 
             # Error: shape (m,)
@@ -509,7 +560,10 @@ class LearnableLogOddsWeights:
         x_bar_w = np.sum(w * x, axis=-1)
 
         # Predicted probability: shape (m,)
-        p = sigmoid(scale * x_bar_w)
+        l_weighted = scale * x_bar_w
+        if self._logit_base_rate is not None:
+            l_weighted = l_weighted + self._logit_base_rate
+        p = sigmoid(l_weighted)
         p = np.atleast_1d(np.asarray(p, dtype=np.float64))
 
         # Error: shape (m,)
@@ -581,6 +635,8 @@ class AttentionLogOddsWeights:
         n_query_features: int,
         alpha: float | str = 0.5,
         normalize: bool = False,
+        seed: int = 0,
+        base_rate: float | None = None,
     ) -> None:
         if n_signals < 1:
             raise ValueError(f"n_signals must be >= 1, got {n_signals}")
@@ -588,16 +644,24 @@ class AttentionLogOddsWeights:
             raise ValueError(
                 f"n_query_features must be >= 1, got {n_query_features}"
             )
+        if base_rate is not None and not (0.0 < base_rate < 1.0):
+            raise ValueError(
+                f"base_rate must be in (0, 1), got {base_rate}"
+            )
         self._n_signals = n_signals
         self._n_query_features = n_query_features
         self._alpha = _resolve_alpha(alpha, default=0.5)
         self._normalize = normalize
+        self._base_rate = base_rate
+        self._logit_base_rate: float | None = (
+            float(logit(base_rate)) if base_rate is not None else None
+        )
 
         # W: (n_signals, n_query_features), b: (n_signals,)
         # Xavier-style initialization scaled for softmax input
-        scale = 1.0 / np.sqrt(n_query_features)
-        rng = np.random.default_rng(0)
-        self._W = rng.normal(0, scale, size=(n_signals, n_query_features))
+        init_scale = 1.0 / np.sqrt(n_query_features)
+        rng = np.random.default_rng(seed)
+        self._W = rng.normal(0, init_scale, size=(n_signals, n_query_features))
         self._b = np.zeros(n_signals, dtype=np.float64)
 
         # Online learning state
@@ -623,6 +687,11 @@ class AttentionLogOddsWeights:
     def alpha(self) -> float:
         """Confidence scaling exponent (fixed)."""
         return self._alpha
+
+    @property
+    def base_rate(self) -> float | None:
+        """Corpus-level base rate of relevance, or None if not set."""
+        return self._base_rate
 
     @property
     def normalize(self) -> bool:
@@ -704,32 +773,30 @@ class AttentionLogOddsWeights:
 
         if probs.ndim == 1:
             # Single sample: normalization cannot apply (no candidates to
-            # normalize across), fall through to original path.
+            # normalize across), fall through to direct computation.
             w_flat = w.squeeze(0)
-            return log_odds_conjunction(probs, alpha=self._alpha, weights=w_flat)
-
-        if self._normalize:
-            # Normalize logits per-signal column, then weighted sum + sigmoid
             x = logit(_clamp_probability(probs))
-            x = self._normalize_logits(x)
             n = self._n_signals
             scale = n ** self._alpha
-            # w may be (1, n_signals) for single query or (m, n_signals)
-            # for per-row queries; broadcast via numpy
-            l_weighted = scale * np.sum(w * x, axis=-1)
+            l_weighted = scale * np.sum(w_flat * x)
+            if self._logit_base_rate is not None:
+                l_weighted = l_weighted + self._logit_base_rate
             result = sigmoid(l_weighted)
-            return np.atleast_1d(np.asarray(result, dtype=np.float64))
+            return float(result)
 
-        # Batched: each row has its own query-dependent weights.
-        # When w has fewer rows than probs (single query features for all
-        # candidates), broadcast by repeating the single weight vector.
-        results = np.empty(probs.shape[0], dtype=np.float64)
-        for i in range(probs.shape[0]):
-            wi = w[min(i, w.shape[0] - 1)]
-            results[i] = log_odds_conjunction(
-                probs[i], alpha=self._alpha, weights=wi
-            )
-        return results
+        # Vectorized batched path (replaces per-row loop)
+        x = logit(_clamp_probability(probs))
+        if self._normalize:
+            x = self._normalize_logits(x)
+        n = self._n_signals
+        scale = n ** self._alpha
+        # w may be (1, n_signals) for single query or (m, n_signals)
+        # for per-row queries; broadcast via numpy
+        l_weighted = scale * np.sum(w * x, axis=-1)
+        if self._logit_base_rate is not None:
+            l_weighted = l_weighted + self._logit_base_rate
+        result = sigmoid(l_weighted)
+        return np.atleast_1d(np.asarray(result, dtype=np.float64))
 
     def fit(
         self,
@@ -797,7 +864,10 @@ class AttentionLogOddsWeights:
 
             # Weighted log-odds per sample
             x_bar_w = np.sum(w * x, axis=-1)  # (m,)
-            p = sigmoid(scale * x_bar_w)  # (m,)
+            l_weighted = scale * x_bar_w
+            if self._logit_base_rate is not None:
+                l_weighted = l_weighted + self._logit_base_rate
+            p = sigmoid(l_weighted)  # (m,)
             p = np.atleast_1d(np.asarray(p, dtype=np.float64))
             error = p - labels  # (m,)
 
@@ -890,7 +960,10 @@ class AttentionLogOddsWeights:
         w = self._softmax(z)  # (m, n)
 
         x_bar_w = np.sum(w * x, axis=-1)  # (m,)
-        p = sigmoid(scale * x_bar_w)
+        l_weighted = scale * x_bar_w
+        if self._logit_base_rate is not None:
+            l_weighted = l_weighted + self._logit_base_rate
+        p = sigmoid(l_weighted)
         p = np.atleast_1d(np.asarray(p, dtype=np.float64))
         error = p - label
 
@@ -934,6 +1007,104 @@ class AttentionLogOddsWeights:
         self._W_avg = avg_decay * self._W_avg + (1.0 - avg_decay) * self._W
         self._b_avg = avg_decay * self._b_avg + (1.0 - avg_decay) * self._b
 
+    def compute_upper_bounds(
+        self,
+        upper_bound_probs: np.ndarray,
+        query_features: np.ndarray,
+        use_averaged: bool = False,
+    ) -> np.ndarray:
+        """Compute fused probability upper bounds (Theorem 8.7.1).
+
+        Given per-signal probability upper bounds, compute the maximum
+        possible fused probability for each candidate.
+
+        Parameters
+        ----------
+        upper_bound_probs : array of shape (m, n_signals)
+            Maximum possible probability per signal per candidate.
+        query_features : array of shape (n_query_features,) or (m, n_query_features)
+            Query feature vector(s) for computing attention weights.
+        use_averaged : bool
+            If True, use Polyak-averaged parameters.
+
+        Returns
+        -------
+        Array of shape (m,) -- upper bound on fused probability per candidate.
+        """
+        upper_bound_probs = _clamp_probability(
+            np.asarray(upper_bound_probs, dtype=np.float64)
+        )
+        query_features = np.atleast_2d(
+            np.asarray(query_features, dtype=np.float64)
+        )
+        if upper_bound_probs.ndim == 1:
+            upper_bound_probs = upper_bound_probs.reshape(1, -1)
+
+        w = self._compute_weights(query_features, use_averaged)
+        x = logit(upper_bound_probs)
+        if self._normalize:
+            x = self._normalize_logits(x)
+        n = self._n_signals
+        scale = n ** self._alpha
+        l_weighted = scale * np.sum(w * x, axis=-1)
+        if self._logit_base_rate is not None:
+            l_weighted = l_weighted + self._logit_base_rate
+        result = sigmoid(l_weighted)
+        return np.atleast_1d(np.asarray(result, dtype=np.float64))
+
+    def prune(
+        self,
+        probs: np.ndarray,
+        query_features: np.ndarray,
+        threshold: float,
+        upper_bound_probs: np.ndarray | None = None,
+        use_averaged: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Prune candidates whose upper bound is below threshold (Theorem 8.7.1).
+
+        Parameters
+        ----------
+        probs : array of shape (m, n_signals)
+            Actual probability signals per candidate.
+        query_features : array of shape (n_query_features,) or (m, n_query_features)
+            Query feature vector(s).
+        threshold : float
+            Minimum fused probability to survive pruning.
+        upper_bound_probs : array of shape (m, n_signals) or None
+            Per-signal upper bounds.  If None, uses ``probs`` as its
+            own upper bound (no pruning benefit, but safe).
+        use_averaged : bool
+            If True, use Polyak-averaged parameters.
+
+        Returns
+        -------
+        (surviving_indices, fused_probabilities) : tuple of arrays
+            Indices of candidates that survived pruning and their
+            fused probabilities.
+        """
+        probs = np.asarray(probs, dtype=np.float64)
+        query_features = np.atleast_2d(
+            np.asarray(query_features, dtype=np.float64)
+        )
+        if probs.ndim == 1:
+            probs = probs.reshape(1, -1)
+        if upper_bound_probs is None:
+            upper_bound_probs = probs
+        upper_bounds = self.compute_upper_bounds(
+            upper_bound_probs, query_features, use_averaged
+        )
+        surviving_mask = upper_bounds >= threshold
+        surviving_indices = np.where(surviving_mask)[0]
+        if len(surviving_indices) == 0:
+            return surviving_indices, np.array([], dtype=np.float64)
+        surv_qf = (
+            query_features[surviving_indices]
+            if query_features.shape[0] > 1
+            else query_features
+        )
+        fused = self(probs[surviving_indices], surv_qf, use_averaged)
+        return surviving_indices, np.atleast_1d(fused)
+
     @staticmethod
     def _softmax(z: np.ndarray) -> np.ndarray:
         """Numerically stable softmax along last axis."""
@@ -941,3 +1112,232 @@ class AttentionLogOddsWeights:
         z_shifted = z - np.max(z, axis=-1, keepdims=True)
         exp_z = np.exp(z_shifted)
         return exp_z / np.sum(exp_z, axis=-1, keepdims=True)
+
+
+class MultiHeadAttentionLogOddsWeights:
+    """Multi-head attention fusion (Paper 2, Remark 8.6, Corollary 8.7.2).
+
+    Creates multiple independent ``AttentionLogOddsWeights`` heads, each
+    initialized with a different random seed.  At inference time, each
+    head produces fused log-odds independently, and the results are
+    combined by averaging log-odds across heads before converting back
+    to probability via sigmoid.
+
+    Parameters
+    ----------
+    n_heads : int
+        Number of attention heads (>= 1).
+    n_signals : int
+        Number of probability signals to combine (>= 1).
+    n_query_features : int
+        Dimensionality of the query feature vector (>= 1).
+    alpha : float or str
+        Confidence scaling exponent (fixed, not learned).
+    normalize : bool
+        Whether to apply per-signal logit normalization.
+    """
+
+    def __init__(
+        self,
+        n_heads: int,
+        n_signals: int,
+        n_query_features: int,
+        alpha: float | str = 0.5,
+        normalize: bool = False,
+    ) -> None:
+        if n_heads < 1:
+            raise ValueError(f"n_heads must be >= 1, got {n_heads}")
+        self._n_heads = n_heads
+        self._heads = [
+            AttentionLogOddsWeights(
+                n_signals=n_signals,
+                n_query_features=n_query_features,
+                alpha=alpha,
+                normalize=normalize,
+                seed=h,
+            )
+            for h in range(n_heads)
+        ]
+
+    @property
+    def n_heads(self) -> int:
+        """Number of attention heads."""
+        return self._n_heads
+
+    @property
+    def heads(self) -> list[AttentionLogOddsWeights]:
+        """List of attention head instances."""
+        return list(self._heads)
+
+    def __call__(
+        self,
+        probs: np.ndarray,
+        query_features: np.ndarray,
+        use_averaged: bool = False,
+    ) -> np.ndarray | float:
+        """Combine probability signals via multi-head attention fusion.
+
+        Each head produces fused log-odds independently.  The final
+        result averages the log-odds across heads and applies sigmoid.
+
+        Parameters
+        ----------
+        probs : array of shape (..., n_signals)
+            Probability values to combine.
+        query_features : array of shape (n_query_features,) or (m, n_query_features)
+            Query feature vector(s).
+        use_averaged : bool
+            If True, use Polyak-averaged parameters.
+
+        Returns
+        -------
+        Combined probability after multi-head log-odds averaging.
+        """
+        probs = np.asarray(probs, dtype=np.float64)
+        head_results = []
+        for head in self._heads:
+            r = head(probs, query_features, use_averaged)
+            head_results.append(np.atleast_1d(np.asarray(r, dtype=np.float64)))
+
+        # Average in log-odds space, then sigmoid
+        head_logits = [logit(_clamp_probability(r)) for r in head_results]
+        avg_logit = np.mean(head_logits, axis=0)
+        result = sigmoid(avg_logit)
+        if probs.ndim == 1:
+            return float(result) if np.ndim(result) == 0 else float(result[0])
+        return np.atleast_1d(np.asarray(result, dtype=np.float64))
+
+    def fit(
+        self,
+        probs: np.ndarray,
+        labels: np.ndarray,
+        query_features: np.ndarray,
+        **kwargs,
+    ) -> None:
+        """Train all heads on the same data.
+
+        Different random initializations lead to different learned
+        solutions, providing diversity across heads.
+
+        Parameters
+        ----------
+        probs : array of shape (m, n_signals)
+            Training probability signals.
+        labels : array of shape (m,)
+            Binary relevance labels.
+        query_features : array of shape (m, n_query_features)
+            Query features for each training sample.
+        **kwargs
+            Additional keyword arguments passed to each head's ``fit()``.
+        """
+        for head in self._heads:
+            head.fit(probs, labels, query_features, **kwargs)
+
+    def update(
+        self,
+        probs: np.ndarray | float,
+        label: np.ndarray | float,
+        query_features: np.ndarray,
+        **kwargs,
+    ) -> None:
+        """Online update for all heads.
+
+        Parameters
+        ----------
+        probs : array of shape (n_signals,) or (m, n_signals)
+            Probability signal(s).
+        label : float or array of shape (m,)
+            Binary relevance label(s).
+        query_features : array of shape (n_query_features,) or (m, n_query_features)
+            Query feature(s).
+        **kwargs
+            Additional keyword arguments passed to each head's ``update()``.
+        """
+        for head in self._heads:
+            head.update(probs, label, query_features, **kwargs)
+
+    def compute_upper_bounds(
+        self,
+        upper_bound_probs: np.ndarray,
+        query_features: np.ndarray,
+        use_averaged: bool = False,
+    ) -> np.ndarray:
+        """Compute fused upper bounds across heads (Corollary 8.7.2).
+
+        Each head computes its upper bound independently.  The final
+        upper bound averages the per-head upper bound log-odds and
+        applies sigmoid.
+
+        Parameters
+        ----------
+        upper_bound_probs : array of shape (m, n_signals)
+            Per-signal probability upper bounds.
+        query_features : array of shape (n_query_features,) or (m, n_query_features)
+            Query feature vector(s).
+        use_averaged : bool
+            If True, use Polyak-averaged parameters.
+
+        Returns
+        -------
+        Array of shape (m,) -- upper bound on fused probability per candidate.
+        """
+        head_bounds = []
+        for head in self._heads:
+            ub = head.compute_upper_bounds(
+                upper_bound_probs, query_features, use_averaged
+            )
+            head_bounds.append(ub)
+        head_logits = [logit(_clamp_probability(b)) for b in head_bounds]
+        avg_logit = np.mean(head_logits, axis=0)
+        result = sigmoid(avg_logit)
+        return np.atleast_1d(np.asarray(result, dtype=np.float64))
+
+    def prune(
+        self,
+        probs: np.ndarray,
+        query_features: np.ndarray,
+        threshold: float,
+        upper_bound_probs: np.ndarray | None = None,
+        use_averaged: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Prune candidates using multi-head upper bounds (Corollary 8.7.2).
+
+        Parameters
+        ----------
+        probs : array of shape (m, n_signals)
+            Actual probability signals per candidate.
+        query_features : array of shape (n_query_features,) or (m, n_query_features)
+            Query feature vector(s).
+        threshold : float
+            Minimum fused probability to survive pruning.
+        upper_bound_probs : array of shape (m, n_signals) or None
+            Per-signal upper bounds.  If None, uses ``probs``.
+        use_averaged : bool
+            If True, use Polyak-averaged parameters.
+
+        Returns
+        -------
+        (surviving_indices, fused_probabilities) : tuple of arrays
+        """
+        probs = np.asarray(probs, dtype=np.float64)
+        query_features = np.atleast_2d(
+            np.asarray(query_features, dtype=np.float64)
+        )
+        if probs.ndim == 1:
+            probs = probs.reshape(1, -1)
+        if upper_bound_probs is None:
+            upper_bound_probs = probs
+        upper_bounds = self.compute_upper_bounds(
+            upper_bound_probs, query_features, use_averaged
+        )
+        surviving_mask = upper_bounds >= threshold
+        surviving_indices = np.where(surviving_mask)[0]
+        if len(surviving_indices) == 0:
+            return surviving_indices, np.array([], dtype=np.float64)
+        surv_qf = (
+            query_features[surviving_indices]
+            if query_features.shape[0] > 1
+            else query_features
+        )
+        fused = self(probs[surviving_indices], surv_qf, use_averaged)
+        return surviving_indices, np.atleast_1d(np.asarray(fused, dtype=np.float64))

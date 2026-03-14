@@ -11,6 +11,7 @@ from importlib.metadata import version as _metadata_version
 from bayesian_bm25.fusion import (
     AttentionLogOddsWeights,
     LearnableLogOddsWeights,
+    MultiHeadAttentionLogOddsWeights,
     balanced_log_odds_fusion,
     cosine_to_probability,
     log_odds_conjunction,
@@ -35,6 +36,7 @@ __all__ = [
     "BayesianProbabilityTransform",
     "CalibrationReport",
     "LearnableLogOddsWeights",
+    "MultiHeadAttentionLogOddsWeights",
     "balanced_log_odds_fusion",
     "brier_score",
     "calibration_report",
@@ -55,10 +57,22 @@ def __getattr__(name: str):
     if name == "RetrievalResult":
         from bayesian_bm25.scorer import RetrievalResult
         return RetrievalResult
+    if name == "BlockMaxIndex":
+        from bayesian_bm25.scorer import BlockMaxIndex
+        return BlockMaxIndex
     if name == "MultiFieldScorer":
         from bayesian_bm25.multi_field import MultiFieldScorer
         return MultiFieldScorer
     if name == "FusionDebugger":
         from bayesian_bm25.debug import FusionDebugger
         return FusionDebugger
+    if name == "PlattCalibrator":
+        from bayesian_bm25.calibration import PlattCalibrator
+        return PlattCalibrator
+    if name == "IsotonicCalibrator":
+        from bayesian_bm25.calibration import IsotonicCalibrator
+        return IsotonicCalibrator
+    if name == "TemporalBayesianTransform":
+        from bayesian_bm25.probability import TemporalBayesianTransform
+        return TemporalBayesianTransform
     raise AttributeError(f"module 'bayesian_bm25' has no attribute {name!r}")

@@ -13,13 +13,17 @@ Key capabilities:
 - **Score-to-probability transform** — convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
 - **Base rate calibration** — corpus-level base rate prior estimated from score distribution (95th percentile, mixture model, or elbow detection) decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68–77% without relevance labels
 - **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
-- **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling, optional per-signal reliability weights (Log-OP), and sparse signal gating (ReLU/Swish activations from Paper 2, Theorems 6.5.3/6.7.4)
-- **Learnable fusion weights** — `LearnableLogOddsWeights` learns per-signal reliability from labeled data via a Hebbian gradient that is backprop-free, starting from Naive Bayes uniform initialization (Remark 5.3.2)
-- **Attention-based fusion** — `AttentionLogOddsWeights` learns query-dependent signal weights via attention mechanism (Paper 2, Section 8), replacing static weights with query-adaptive weighting
+- **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling, optional per-signal reliability weights (Log-OP), and sparse signal gating (ReLU/Swish/GELU activations from Paper 2, Theorems 6.5.3/6.7.4/6.8.1) with generalized swish beta control (Theorem 6.7.6)
+- **Learnable fusion weights** — `LearnableLogOddsWeights` learns per-signal reliability from labeled data via a Hebbian gradient that is backprop-free, starting from Naive Bayes uniform initialization (Remark 5.3.2); supports optional `base_rate` additive bias in log-odds space
+- **Attention-based fusion** — `AttentionLogOddsWeights` learns query-dependent signal weights via attention mechanism (Paper 2, Section 8), with exact attention pruning via `compute_upper_bounds()` and `prune()` (Theorem 8.7.1); supports optional `base_rate`
+- **Multi-head attention** — `MultiHeadAttentionLogOddsWeights` creates multiple independent attention heads with different initializations and averages their log-odds for more robust fusion (Remark 8.6, Corollary 8.7.2)
+- **Neural score calibration** — `PlattCalibrator` (sigmoid) and `IsotonicCalibrator` (PAVA) convert raw neural model scores into calibrated probabilities for Bayesian fusion (Section 12.2 #5)
+- **External prior features** — `prior_fn` callable on `BayesianProbabilityTransform` allows custom document priors to replace the composite prior, enabling features like recency or popularity weighting (Section 12.2 #6)
+- **Temporal adaptation** — `TemporalBayesianTransform` uses exponential decay to weight recent observations more heavily in `fit()`, tracking concept drift in non-stationary relevance patterns (Section 12.2 #3)
 - **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
-- **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
+- **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval; `BlockMaxIndex` provides tighter block-level bounds for BMW-style pruning (Section 6.2, Corollary 7.4.2)
 - **Calibration metrics** — `expected_calibration_error()`, `brier_score()`, `reliability_diagram()`, and `calibration_report()` for evaluating probability quality, with `CalibrationReport` bundling all metrics into a single diagnostic
-- **Fusion debugger** — `FusionDebugger` records every intermediate value through the full pipeline (likelihood, prior, posterior, fusion) for transparent inspection, document comparison, and crossover detection; supports hierarchical fusion tracing with AND/OR/NOT composition
+- **Fusion debugger** — `FusionDebugger` records every intermediate value through the full pipeline (likelihood, prior, posterior, fusion) for transparent inspection, document comparison, and crossover detection; supports hierarchical fusion tracing with AND/OR/NOT composition and gating trace fields
 - **Multi-field search** — `MultiFieldScorer` maintains separate BM25 indexes per field and fuses field-level probabilities via log-odds conjunction with configurable per-field weights
 - **Search integration** — drop-in scorer wrapping [bm25s](https://github.com/xhluca/bm25s) that returns probabilities instead of raw scores
 
@@ -131,9 +135,14 @@ fused = log_odds_conjunction(stacked, weights=np.array([0.6, 0.4]))
 # Fuse with weights and confidence scaling (alpha + weights compose)
 fused = log_odds_conjunction(stacked, alpha=0.5, weights=np.array([0.6, 0.4]))
 
-# Gated fusion: ReLU/Swish activation in logit space (Paper 2, Theorems 6.5.3/6.7.4)
-fused_relu = log_odds_conjunction(stacked, gating="relu")    # MAP estimation
-fused_swish = log_odds_conjunction(stacked, gating="swish")  # Bayes estimation
+# Gated fusion: ReLU/Swish/GELU activation in logit space (Paper 2, Theorems 6.5-6.8)
+fused_relu = log_odds_conjunction(stacked, gating="relu")     # MAP estimation
+fused_swish = log_odds_conjunction(stacked, gating="swish")   # Bayes estimation
+fused_gelu = log_odds_conjunction(stacked, gating="gelu")     # Gaussian noise model
+
+# Generalized swish: beta controls gate sharpness (Theorem 6.7.6)
+# beta -> 0: x/2 (maximum ignorance), beta=1: standard swish, beta -> inf: ReLU
+fused_soft = log_odds_conjunction(stacked, gating="swish", gating_beta=0.5)
 ```
 
 ### Learning Fusion Weights from Data
@@ -176,6 +185,70 @@ attn.fit(training_probs, training_labels, query_features,
 
 # Query-dependent fusion: weights adapt per query
 fused = attn(test_probs, test_features, use_averaged=True)
+```
+
+### Multi-Head Attention Fusion
+
+```python
+import numpy as np
+from bayesian_bm25 import MultiHeadAttentionLogOddsWeights
+
+# 4 heads, 2 signals, 3 query features
+mh = MultiHeadAttentionLogOddsWeights(
+    n_heads=4, n_signals=2, n_query_features=3, alpha=0.5,
+)
+
+# Train all heads on the same data (different init -> different solutions)
+mh.fit(training_probs, training_labels, query_features,
+       learning_rate=0.01, max_iterations=500)
+
+# Inference: heads produce fused log-odds independently, then average + sigmoid
+fused = mh(test_probs, test_features, use_averaged=True)
+
+# Attention pruning: safely eliminate candidates below a threshold
+surviving_idx, fused_probs = mh.prune(
+    candidate_probs, query_features, threshold=0.5,
+    upper_bound_probs=candidate_upper_bounds,
+)
+```
+
+### Neural Score Calibration
+
+```python
+from bayesian_bm25.calibration import PlattCalibrator, IsotonicCalibrator
+from bayesian_bm25 import log_odds_conjunction
+
+# Platt scaling: P = sigmoid(a * score + b)
+platt = PlattCalibrator()
+platt.fit(neural_scores, labels, learning_rate=0.01, max_iterations=1000)
+calibrated = platt.calibrate(new_scores)  # output in (0, 1)
+
+# Isotonic regression: non-parametric monotone mapping via PAVA
+iso = IsotonicCalibrator()
+iso.fit(neural_scores, labels)
+calibrated = iso.calibrate(new_scores)
+
+# Combine calibrated neural scores with BM25 probabilities
+stacked = np.stack([bm25_probs, calibrated], axis=-1)
+fused = log_odds_conjunction(stacked)
+```
+
+### Temporal Adaptation
+
+```python
+from bayesian_bm25.probability import TemporalBayesianTransform
+
+# Short half-life: adapt quickly to changing relevance patterns
+transform = TemporalBayesianTransform(
+    alpha=1.0, beta=0.0, decay_half_life=100.0,
+)
+
+# Batch fit with timestamps: recent data gets more weight
+transform.fit(scores, labels, timestamps=timestamps)
+
+# Online update: timestamp auto-increments, Polyak decay reduces over time
+for score, label in feedback_stream:
+    transform.update(score, label)
 ```
 
 ### WAND Pruning with Bayesian Upper Bounds
@@ -407,9 +480,13 @@ All methods above are zero-shot (no relevance labels required). With `--tune`, a
 | Balanced-Elbow | Bayesian-Balanced with elbow-detection base rate estimation |
 | Gated-ReLU | `log_odds_conjunction` with ReLU gating in logit space (Paper 2, Theorem 6.5.3) |
 | Gated-Swish | `log_odds_conjunction` with Swish gating in logit space (Paper 2, Theorem 6.7.4) |
+| Gated-GELU | `log_odds_conjunction` with GELU gating (Paper 2, Theorem 6.8.1): `logit * sigmoid(1.702 * logit)` |
+| Gated-Swish-B2 | Generalized swish with `gating_beta=2.0` (Paper 2, Theorem 6.7.6) |
 | Attention | Query-dependent signal weighting via `AttentionLogOddsWeights` (Paper 2, Section 8) |
 | **Attn-NR** | Attention with per-signal logit normalization (`normalize=True`) and 7 features (sparse + dense + cross-signal) |
 | Attn-NR-CV | Attn-NR with 5-fold cross-validation (train/test split per query) |
+| Multi-Head | 4-head `MultiHeadAttentionLogOddsWeights`, averages log-odds across heads (Remark 8.6) |
+| MH-NR | Multi-head + logit normalization + 7 features (Corollary 8.7.2) |
 | MultiField | `MultiFieldScorer` (title + body) with `log_odds_conjunction`, sparse-only |
 | MF-Balanced | MultiField probs + dense via `balanced_log_odds_fusion` |
 | Balanced-Tuned | Bayesian-Balanced + supervised `BayesianProbabilityTransform.fit()` + grid search over base_rate and fusion_weight |
@@ -419,12 +496,12 @@ All methods above are zero-shot (no relevance labels required). With `--tune`, a
 **Why include underperforming methods?** The tables above deliberately include methods that underperform BM25. Each failure mode is informative:
 
 - **Bayesian-OR** (NDCG@10 avg 28.38) — Probabilistic OR assumes signal independence and catastrophically fails on ArguAna (0.06%). This demonstrates *why* the log-odds conjunction framework (Paper 2, Section 4) is needed: naive probability combination without logit-space calibration collapses when signal distributions differ.
-- **Gated-ReLU / Gated-Swish** (36.25 / 35.54) — Sparse gating (Paper 2, Theorems 6.5.3 / 6.7.4) is too aggressive for the BEIR hybrid fusion task. ReLU zeros out negative logits entirely, discarding useful weak signals; Swish softens the gate but still suppresses too much. These gates are designed for high-dimensional signal spaces where most inputs are noise — in a two-signal (sparse + dense) setting, there is no noise to suppress.
+- **Gated-ReLU / Gated-Swish / Gated-GELU** (36.25 / 35.54 / TBD) — Sparse gating (Paper 2, Theorems 6.5.3 / 6.7.4 / 6.8.1) is too aggressive for the BEIR hybrid fusion task. ReLU zeros out negative logits entirely, discarding useful weak signals; Swish and GELU soften the gate but still suppress too much. These gates are designed for high-dimensional signal spaces where most inputs are noise — in a two-signal (sparse + dense) setting, there is no noise to suppress.
 - **MultiField** (28.58 over 4 datasets) — Sparse-only multi-field search loses to concatenated BM25 because field separation fragments term statistics (smaller per-field document frequency, shorter effective document lengths). However, **MF-Balanced** (40.17) recovers most of the gap by fusing with dense embeddings, confirming that field-level BM25 signals are complementary to dense vectors even when they are individually weaker.
 
 Reproduce:
 ```bash
-# Zero-shot (18 methods)
+# Zero-shot (22 methods)
 python benchmarks/hybrid_beir.py -d <beir-data-dir>
 
 # With tuning (auto-estimation + supervised learning + grid search)
@@ -493,6 +570,10 @@ Additional benchmarks (no external datasets required):
 - `python benchmarks/learnable_weights.py` — learnable weight recovery, fusion quality, online convergence, and timing
 - `python benchmarks/weighted_fusion.py` — weighted vs uniform log-odds fusion across noise scenarios
 - `python benchmarks/wand_upper_bound.py` — WAND upper bound tightness and skip rate analysis
+- `python benchmarks/gating_functions.py` — gating comparison (none/relu/swish/gelu), beta sensitivity, timing overhead
+- `python benchmarks/bmw_upper_bound.py` — BMW block-max vs global WAND tightness, pruning rate, block size sensitivity
+- `python benchmarks/neural_calibration.py` — Platt vs isotonic calibration accuracy, hybrid fusion quality, timing
+- `python benchmarks/multi_head_attention.py` — multi-head vs single-head quality, pruning safety/efficiency, head diversity
 
 ## Citation
 

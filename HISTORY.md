@@ -1,5 +1,77 @@
 # History
 
+## 0.9.0 (2026-03-14)
+
+- Add GELU gating to `log_odds_conjunction` (Paper 2, Theorem 6.8.1, Proposition 6.8.2)
+  - `gating="gelu"`: Bayesian expected signal under Gaussian noise model
+  - Implemented as `logit * sigmoid(1.702 * logit)`, matching Swish_1.702
+  - Ignores `gating_beta` parameter (uses fixed 1.702)
+- Add generalized swish via `gating_beta` parameter (Paper 2, Theorem 6.7.6)
+  - `gating_beta=1.0` (default) preserves existing swish behavior
+  - `gating_beta -> 0` approaches `x/2` (maximum ignorance limit)
+  - `gating_beta -> inf` approaches ReLU (deterministic MAP limit)
+  - `gating="swish", gating_beta=1.702` matches `gating="gelu"`
+- Add `BlockMaxIndex` for BMW block-max upper bounds (Paper 1, Section 6.2; Paper 2, Corollary 7.4.2)
+  - Partitions documents into fixed-size blocks, stores per-block max per term
+  - `block_upper_bound()`: per-term BM25 upper bound for a block
+  - `bayesian_block_upper_bound()`: delegates to `BayesianProbabilityTransform.wand_upper_bound()`
+    for tighter Bayesian probability bounds
+- Add `prior_fn` parameter to `BayesianProbabilityTransform` for external prior features
+  (Paper 1, Section 12.2 #6)
+  - Custom callable `(score, tf, doc_len_ratio) -> float | ndarray` replaces composite prior
+  - Output is clamped to (epsilon, 1-epsilon) for numerical stability
+  - `prior_free` mode overrides custom prior (uses prior=0.5)
+  - `prior_fn=None` (default) preserves existing composite prior behavior
+- Add `MultiHeadAttentionLogOddsWeights` for multi-head attention fusion
+  (Paper 2, Remark 8.6, Corollary 8.7.2)
+  - Creates multiple `AttentionLogOddsWeights` heads with different random seeds
+  - Combines by averaging log-odds across heads, then sigmoid
+  - Supports `fit()`, `update()`, `compute_upper_bounds()`, and `prune()`
+- Add exact attention pruning to `AttentionLogOddsWeights` and
+  `MultiHeadAttentionLogOddsWeights` (Paper 2, Theorem 8.7.1, Corollary 8.7.2)
+  - `compute_upper_bounds()`: computes fused probability upper bounds from per-signal bounds
+  - `prune()`: safely prunes candidates whose upper bound is below threshold
+- Add `PlattCalibrator` and `IsotonicCalibrator` for neural score integration
+  (Paper 1, Section 12.2 #5; Paper 2, Section 5.1)
+  - `PlattCalibrator`: sigmoid calibration `P = sigmoid(a * score + b)` with BCE gradient descent
+  - `IsotonicCalibrator`: non-parametric monotone calibration via PAVA (numpy-only, no scipy)
+  - Both produce calibrated probabilities suitable for `log_odds_conjunction`
+- Add `TemporalBayesianTransform` for time-weighted parameter adaptation
+  (Paper 1, Section 12.2 #3)
+  - Extends `BayesianProbabilityTransform` with exponential temporal weighting
+  - `fit(timestamps=...)` weights gradients by `exp(-decay_rate * (max_ts - ts_i))`
+  - `update()` increments internal timestamp, reduces Polyak avg_decay over time
+  - `decay_half_life` controls how quickly older observations lose influence
+- Vectorize `AttentionLogOddsWeights.__call__()` batched path
+  - Replaces per-row `for` loop with numpy broadcast `scale * sum(w * x, axis=-1)`
+  - Matches existing vectorized normalize=True path
+- Add `base_rate` parameter to `LearnableLogOddsWeights` and `AttentionLogOddsWeights`
+  (Paper 1, Theorem 4.4.2)
+  - Adds `logit(base_rate)` as constant additive bias in log-odds space
+  - `base_rate=None` (default) preserves existing behavior
+  - `base_rate=0.5` is neutral (logit(0.5) = 0)
+  - Validated in `__call__()`, `fit()`, and `update()`
+- Add `seed` parameter to `AttentionLogOddsWeights.__init__()` (default 0)
+- Add gating trace fields (`gating`, `gating_beta`) to `FusionTrace` dataclass
+  - `trace_fusion()` accepts and records gating parameters
+  - `format_trace()` displays gating info when present
+- Add examples:
+  - `examples/gating_functions.py`: GELU gating, generalized swish beta, practical noise filtering
+  - `examples/neural_calibration.py`: Platt and isotonic calibration for neural reranker integration
+  - `examples/temporal_adaptation.py`: concept drift detection and half-life tuning
+  - `examples/multi_head_fusion.py`: multi-head attention fusion with pruning and head diversity
+- Add benchmarks:
+  - `benchmarks/gating_functions.py`: gating comparison, beta sensitivity, timing
+  - `benchmarks/bmw_upper_bound.py`: block-level vs global WAND tightness, pruning rate, block size sensitivity
+  - `benchmarks/neural_calibration.py`: Platt vs isotonic accuracy, hybrid fusion quality, timing
+  - `benchmarks/multi_head_attention.py`: head count scaling, pruning safety/efficiency, head diversity
+- Update hybrid BEIR benchmark (`benchmarks/hybrid_beir.py`) with 4 new fusion methods (19 -> 23 total)
+  - Add Gated-GELU (Paper 2, Theorem 6.8.1)
+  - Add Gated-Swish-B2 (Paper 2, Theorem 6.7.6, beta=2.0)
+  - Add Multi-Head (4-head attention fusion, Paper 2, Remark 8.6)
+  - Add MH-NR (multi-head + logit normalization + 7 features, Paper 2, Corollary 8.7.2)
+  - Add calibration diagnostics for all new probability-producing methods
+
 ## 0.8.0 (2026-03-05)
 
 - Add `normalize` parameter to `AttentionLogOddsWeights` for per-signal logit normalization

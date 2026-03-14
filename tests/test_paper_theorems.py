@@ -2712,3 +2712,72 @@ class TestTheorem531ParameterCorrespondence:
             f"Equal-quality signals should maintain ~uniform weights, "
             f"got {learner.weights}"
         ))
+
+
+# -----------------------------------------------------------------------
+# Paper 2, Theorem 6.8.1: GELU = Bayesian expected signal under Gaussian noise
+# -----------------------------------------------------------------------
+
+class TestGELUGatingImplementation:
+    """Verify Theorem 6.8.1: GELU gating in log_odds_conjunction matches
+    the Swish_1.702 approximation (Proposition 6.8.2).
+
+    This connects the theoretical approximation to our implementation.
+    """
+
+    def test_gelu_equals_bayesian_gaussian_signal(self):
+        """GELU gating = x * Phi(x), approximated as x * sigma(1.702*x).
+
+        The implementation uses the sigmoid approximation, so we verify
+        it against the exact Gaussian CDF form for moderate logits.
+        """
+        probs = np.array([0.9, 0.3, 0.7, 0.6])
+        # Compute manually: logit -> gelu gate -> mean -> scale -> sigmoid
+        from bayesian_bm25.probability import _clamp_probability
+        x = logit(_clamp_probability(np.asarray(probs, dtype=np.float64)))
+
+        # Exact GELU: x * Phi(x)
+        gelu_exact = x * _gaussian_cdf(x)
+        mean_exact = float(np.mean(gelu_exact))
+        n = len(probs)
+        expected_exact = float(sigmoid(mean_exact * (n ** 0.5)))
+
+        # Our implementation uses sigmoid(1.702 * x) approximation
+        result = log_odds_conjunction(probs, gating="gelu")
+
+        # Should be close to exact (within GELU approximation error)
+        assert result == pytest.approx(expected_exact, abs=0.05)
+
+    def test_gelu_matches_swish_1702_in_conjunction(self):
+        """Proposition 6.8.2: GELU gating matches Swish_1.702 exactly in our implementation."""
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            n = rng.integers(2, 6)
+            probs = rng.uniform(0.05, 0.95, size=n)
+            result_gelu = log_odds_conjunction(probs, gating="gelu")
+            result_swish = log_odds_conjunction(probs, gating="swish", gating_beta=1.702)
+            assert result_gelu == pytest.approx(result_swish, abs=1e-12)
+
+
+# -----------------------------------------------------------------------
+# Paper 2, Theorem 6.7.6: Generalized Swish limits
+# -----------------------------------------------------------------------
+
+class TestGeneralizedSwishGatingImplementation:
+    """Verify Theorem 6.7.6 limits through log_odds_conjunction interface."""
+
+    def test_beta_zero_approaches_neutral_in_conjunction(self):
+        """beta -> 0 in conjunction: swish gate -> x/2, shifting fused result toward 0.5."""
+        probs = np.array([0.9, 0.7])
+        result_small = log_odds_conjunction(probs, gating="swish", gating_beta=0.001)
+        # With x/2 gating, all logits are halved, so the confidence is reduced
+        # The result should be closer to 0.5 than with normal fusion
+        result_none = log_odds_conjunction(probs, gating="none")
+        assert abs(result_small - 0.5) < abs(result_none - 0.5)
+
+    def test_beta_large_approaches_relu_in_conjunction(self):
+        """beta -> inf in conjunction: swish gate -> ReLU gate."""
+        probs = np.array([0.9, 0.3])
+        result_relu = log_odds_conjunction(probs, gating="relu")
+        result_large = log_odds_conjunction(probs, gating="swish", gating_beta=100.0)
+        assert result_large == pytest.approx(result_relu, abs=0.01)

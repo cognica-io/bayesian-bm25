@@ -116,6 +116,10 @@ class FusionTrace:
     # Output
     fused_probability: float
 
+    # Gating
+    gating: str | None = None
+    gating_beta: float | None = None
+
     # Intermediate (for prob_and): log-space product
     log_probs: list[float] | None = None
     log_prob_sum: float | None = None
@@ -261,6 +265,8 @@ class FusionDebugger:
         method: str = "log_odds",
         alpha: float | None = None,
         weights: list[float] | np.ndarray | None = None,
+        gating: str | None = None,
+        gating_beta: float | None = None,
     ) -> FusionTrace:
         """Trace the fusion of multiple probability signals.
 
@@ -278,6 +284,10 @@ class FusionDebugger:
             Confidence scaling exponent for log_odds method.
         weights : list of float or None
             Per-signal weights for weighted log_odds.
+        gating : str or None
+            Gating function for log_odds method (e.g. "relu", "swish", "gelu").
+        gating_beta : float or None
+            Beta parameter for generalized swish gating.
         """
         probs = list(probabilities)
         n = len(probs)
@@ -285,7 +295,9 @@ class FusionDebugger:
             names = [f"signal_{i}" for i in range(n)]
 
         if method == "log_odds":
-            return self._trace_log_odds(probs, names, alpha, weights)
+            return self._trace_log_odds(
+                probs, names, alpha, weights, gating, gating_beta
+            )
         elif method == "prob_and":
             return self._trace_prob_and(probs, names)
         elif method == "prob_or":
@@ -304,11 +316,23 @@ class FusionDebugger:
         names: list[str],
         alpha: float | None,
         weights: list[float] | np.ndarray | None,
+        gating: str | None = None,
+        gating_beta: float | None = None,
     ) -> FusionTrace:
         """Unroll log_odds_conjunction to capture all intermediates."""
+        from bayesian_bm25.fusion import _apply_gating
+
         n = len(probs)
         probs_arr = _clamp_probability(np.array(probs, dtype=np.float64))
-        logits_arr = [float(logit(p)) for p in probs_arr]
+        raw_logits = np.array([float(logit(p)) for p in probs_arr])
+
+        # Apply gating if specified
+        if gating is not None and gating != "none":
+            beta = gating_beta if gating_beta is not None else 1.0
+            gated = _apply_gating(raw_logits, gating, beta=beta)
+            logits_arr = [float(v) for v in gated]
+        else:
+            logits_arr = [float(v) for v in raw_logits]
 
         weights_list: list[float] | None = None
 
@@ -332,6 +356,8 @@ class FusionDebugger:
                 scaled_logit=scaled,
                 weights=weights_list,
                 fused_probability=fused,
+                gating=gating,
+                gating_beta=gating_beta,
             )
 
         effective_alpha = 0.5 if alpha is None else alpha
@@ -351,6 +377,8 @@ class FusionDebugger:
             scaled_logit=scaled,
             weights=None,
             fused_probability=fused,
+            gating=gating,
+            gating_beta=gating_beta,
         )
 
     def _trace_prob_and(
@@ -622,7 +650,12 @@ class FusionDebugger:
         f = trace.fusion
         alpha_str = f", alpha={f.alpha}" if f.alpha is not None else ""
         n_str = f", n={len(f.signal_probabilities)}"
-        lines.append(f"  [Fusion] method={f.method}{alpha_str}{n_str}")
+        gating_str = ""
+        if f.gating is not None and f.gating != "none":
+            gating_str = f", gating={f.gating}"
+            if f.gating_beta is not None and f.gating != "gelu":
+                gating_str += f"(beta={f.gating_beta})"
+        lines.append(f"  [Fusion] method={f.method}{alpha_str}{n_str}{gating_str}")
         if verbose:
             # log_odds intermediates
             if f.logits is not None:

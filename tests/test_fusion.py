@@ -14,6 +14,7 @@ import pytest
 from bayesian_bm25.fusion import (
     AttentionLogOddsWeights,
     LearnableLogOddsWeights,
+    MultiHeadAttentionLogOddsWeights,
     balanced_log_odds_fusion,
     cosine_to_probability,
     log_odds_conjunction,
@@ -21,6 +22,7 @@ from bayesian_bm25.fusion import (
     prob_not,
     prob_or,
 )
+from bayesian_bm25.probability import logit, sigmoid
 
 
 class TestVersion:
@@ -1219,3 +1221,528 @@ class TestAttentionLogOddsWeights:
         result = attn(probs, qf)
         assert result.shape == (3,)
         assert np.all(np.isfinite(result))
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: Generalized Swish / Swish_beta (Theorem 6.7.6)
+# ---------------------------------------------------------------------------
+
+class TestGatingBeta:
+    """Tests for gating_beta parameter in log_odds_conjunction."""
+
+    def test_beta_one_matches_existing_swish(self):
+        """gating_beta=1.0 matches existing swish behavior."""
+        probs = np.array([0.9, 0.3, 0.7])
+        result_default = log_odds_conjunction(probs, gating="swish")
+        result_beta1 = log_odds_conjunction(probs, gating="swish", gating_beta=1.0)
+        assert result_beta1 == pytest.approx(result_default, abs=1e-12)
+
+    def test_beta_zero_approaches_half(self):
+        """gating_beta -> 0 makes swish approach x/2 (Theorem 6.7.6 limit)."""
+        probs = np.array([0.9, 0.7])
+        # With very small beta, swish(x) = x * sigmoid(beta*x) -> x * 0.5 = x/2
+        result = log_odds_conjunction(probs, gating="swish", gating_beta=0.001)
+        # Compute expected: mean of x/2 values, scaled by n^alpha
+        from bayesian_bm25.probability import _clamp_probability
+        x = logit(_clamp_probability(np.asarray(probs)))
+        mean_half = float(np.mean(x / 2.0))
+        expected = float(sigmoid(mean_half * (2 ** 0.5)))
+        assert result == pytest.approx(expected, abs=0.01)
+
+    def test_beta_large_approaches_relu(self):
+        """gating_beta -> large makes swish approach ReLU (Theorem 6.7.6 limit)."""
+        probs = np.array([0.9, 0.3])
+        result_relu = log_odds_conjunction(probs, gating="relu")
+        result_large_beta = log_odds_conjunction(probs, gating="swish", gating_beta=100.0)
+        assert result_large_beta == pytest.approx(result_relu, abs=0.01)
+
+    def test_swish_beta_1702_matches_gelu(self):
+        """gating="swish", gating_beta=1.702 matches gating="gelu"."""
+        probs = np.array([0.9, 0.3, 0.7])
+        result_swish = log_odds_conjunction(probs, gating="swish", gating_beta=1.702)
+        result_gelu = log_odds_conjunction(probs, gating="gelu")
+        assert result_swish == pytest.approx(result_gelu, abs=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Feature 1: GELU Gating (Theorem 6.8.1, Proposition 6.8.2)
+# ---------------------------------------------------------------------------
+
+class TestGELUGating:
+    """Tests for GELU gating in log_odds_conjunction."""
+
+    def test_gelu_between_swish_and_relu_positive(self):
+        """GELU result between swish and relu for positive logits."""
+        probs = np.array([0.8, 0.9, 0.7])  # all > 0.5, positive logits
+        result_none = log_odds_conjunction(probs, gating="none")
+        result_swish = log_odds_conjunction(probs, gating="swish")
+        result_gelu = log_odds_conjunction(probs, gating="gelu")
+        result_relu = log_odds_conjunction(probs, gating="relu")
+        # For positive logits, gating attenuates: none > relu > gelu > swish
+        # But all are close since all logits positive
+        # GELU is between swish(beta=1) and swish(beta=inf)=relu
+        assert result_swish < result_gelu < result_relu
+
+    def test_gelu_matches_swish_1702(self):
+        """GELU approximates Swish_1.702 (Proposition 6.8.2)."""
+        probs = np.array([0.9, 0.3, 0.7, 0.2])
+        result_gelu = log_odds_conjunction(probs, gating="gelu")
+        result_swish = log_odds_conjunction(probs, gating="swish", gating_beta=1.702)
+        assert result_gelu == pytest.approx(result_swish, abs=1e-10)
+
+    def test_gelu_batched(self):
+        """GELU gating works with batched inputs."""
+        probs = np.array([[0.9, 0.3], [0.8, 0.8]])
+        result = log_odds_conjunction(probs, gating="gelu")
+        assert result.shape == (2,)
+        assert np.all(np.isfinite(result))
+        assert np.all(result > 0)
+        assert np.all(result < 1)
+
+    def test_gelu_with_weights(self):
+        """GELU gating works with weighted mode."""
+        probs = np.array([0.9, 0.3])
+        w = np.array([0.5, 0.5])
+        result = log_odds_conjunction(probs, weights=w, gating="gelu")
+        assert 0 < result < 1
+
+    def test_gelu_ignores_gating_beta(self):
+        """gating='gelu' ignores the gating_beta parameter."""
+        probs = np.array([0.9, 0.3, 0.7])
+        result_default = log_odds_conjunction(probs, gating="gelu")
+        result_custom_beta = log_odds_conjunction(probs, gating="gelu", gating_beta=5.0)
+        assert result_default == pytest.approx(result_custom_beta, abs=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Feature 9: Vectorize Attention Forward Pass
+# ---------------------------------------------------------------------------
+
+class TestAttentionVectorized:
+    """Tests for vectorized AttentionLogOddsWeights forward pass."""
+
+    def test_vectorized_matches_loop(self):
+        """Vectorized path matches per-row loop for random samples."""
+        rng = np.random.default_rng(42)
+        m = 100
+        n_signals = 3
+        n_qf = 4
+        attn = AttentionLogOddsWeights(n_signals=n_signals, n_query_features=n_qf)
+
+        probs = rng.uniform(0.1, 0.9, size=(m, n_signals))
+        qf = rng.standard_normal(size=(m, n_qf))
+
+        # Vectorized result
+        result_vectorized = attn(probs, qf)
+
+        # Per-row loop result
+        result_loop = np.empty(m, dtype=np.float64)
+        for i in range(m):
+            result_loop[i] = attn(probs[i], qf[i])
+
+        np.testing.assert_allclose(result_vectorized, result_loop, atol=1e-10)
+
+    def test_single_query_broadcast(self):
+        """Single query features broadcast across all candidates."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=3)
+        probs = np.array([[0.8, 0.7], [0.3, 0.9], [0.6, 0.6]])
+        qf = np.array([1.0, 0.5, -0.3])  # single query
+        result = attn(probs, qf)
+        assert result.shape == (3,)
+        assert np.all(result > 0)
+        assert np.all(result < 1)
+
+
+# ---------------------------------------------------------------------------
+# Feature 10: base_rate in Fusion Classes
+# ---------------------------------------------------------------------------
+
+class TestLearnableBaseRate:
+    """Tests for base_rate in LearnableLogOddsWeights."""
+
+    def test_none_preserves_existing(self):
+        """base_rate=None preserves existing behavior."""
+        learner_none = LearnableLogOddsWeights(n_signals=2, alpha=0.0)
+        learner_explicit = LearnableLogOddsWeights(n_signals=2, alpha=0.0, base_rate=None)
+        probs = np.array([0.7, 0.8])
+        assert learner_none(probs) == pytest.approx(learner_explicit(probs), abs=1e-12)
+
+    def test_base_rate_half_neutral(self):
+        """base_rate=0.5 is neutral (logit(0.5)=0)."""
+        learner_none = LearnableLogOddsWeights(n_signals=2, alpha=0.0)
+        learner_half = LearnableLogOddsWeights(n_signals=2, alpha=0.0, base_rate=0.5)
+        probs = np.array([0.7, 0.8])
+        assert learner_none(probs) == pytest.approx(learner_half(probs), abs=1e-8)
+
+    def test_low_base_rate_shifts_down(self):
+        """Low base_rate shifts output downward."""
+        learner_none = LearnableLogOddsWeights(n_signals=2, alpha=0.0)
+        learner_low = LearnableLogOddsWeights(n_signals=2, alpha=0.0, base_rate=0.01)
+        probs = np.array([0.7, 0.8])
+        assert learner_low(probs) < learner_none(probs)
+
+    def test_high_base_rate_shifts_up(self):
+        """High base_rate shifts output upward."""
+        learner_none = LearnableLogOddsWeights(n_signals=2, alpha=0.0)
+        learner_high = LearnableLogOddsWeights(n_signals=2, alpha=0.0, base_rate=0.99)
+        probs = np.array([0.7, 0.8])
+        assert learner_high(probs) > learner_none(probs)
+
+    def test_invalid_base_rate_raises(self):
+        """Invalid base_rate raises ValueError."""
+        with pytest.raises(ValueError, match="base_rate must be in"):
+            LearnableLogOddsWeights(n_signals=2, base_rate=0.0)
+        with pytest.raises(ValueError, match="base_rate must be in"):
+            LearnableLogOddsWeights(n_signals=2, base_rate=1.0)
+        with pytest.raises(ValueError, match="base_rate must be in"):
+            LearnableLogOddsWeights(n_signals=2, base_rate=-0.1)
+
+    def test_base_rate_property(self):
+        """base_rate property returns correct value."""
+        learner = LearnableLogOddsWeights(n_signals=2, base_rate=0.1)
+        assert learner.base_rate == 0.1
+
+    def test_fit_with_base_rate(self):
+        """fit() works with base_rate set."""
+        rng = np.random.RandomState(42)
+        m = 200
+        labels = rng.randint(0, 2, size=m).astype(np.float64)
+        signal_0 = np.where(labels == 1, 0.85, 0.15)
+        signal_1 = rng.uniform(0.3, 0.7, size=m)
+        probs = np.column_stack([signal_0, signal_1])
+
+        learner = LearnableLogOddsWeights(n_signals=2, alpha=0.0, base_rate=0.3)
+        learner.fit(probs, labels, learning_rate=0.1, max_iterations=1000)
+        assert learner.weights[0] > learner.weights[1]
+
+    def test_update_with_base_rate(self):
+        """update() works with base_rate set."""
+        learner = LearnableLogOddsWeights(n_signals=2, alpha=0.0, base_rate=0.1)
+        for _ in range(20):
+            learner.update(np.array([0.9, 0.5]), 1.0, learning_rate=0.05)
+            learner.update(np.array([0.1, 0.5]), 0.0, learning_rate=0.05)
+        assert learner._n_updates == 40
+
+
+class TestAttentionBaseRate:
+    """Tests for base_rate in AttentionLogOddsWeights."""
+
+    def test_none_preserves_existing(self):
+        """base_rate=None preserves existing behavior."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=3)
+        probs = np.array([0.8, 0.7])
+        qf = np.array([1.0, 0.5, -0.3])
+        r1 = attn(probs, qf)
+        # Re-create with explicit None
+        attn2 = AttentionLogOddsWeights(n_signals=2, n_query_features=3, base_rate=None)
+        r2 = attn2(probs, qf)
+        # Both use seed=0 default, should match
+        assert r1 == pytest.approx(r2, abs=1e-12)
+
+    def test_base_rate_half_neutral(self):
+        """base_rate=0.5 is neutral (logit(0.5)=0)."""
+        attn_none = AttentionLogOddsWeights(n_signals=2, n_query_features=3, seed=42)
+        attn_half = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=3, seed=42, base_rate=0.5
+        )
+        probs = np.array([0.8, 0.7])
+        qf = np.array([1.0, 0.5, -0.3])
+        assert attn_none(probs, qf) == pytest.approx(attn_half(probs, qf), abs=1e-8)
+
+    def test_low_base_rate_shifts_down(self):
+        """Low base_rate shifts output downward."""
+        attn_none = AttentionLogOddsWeights(n_signals=2, n_query_features=3, seed=42)
+        attn_low = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=3, seed=42, base_rate=0.01
+        )
+        probs = np.array([0.8, 0.7])
+        qf = np.array([1.0, 0.5, -0.3])
+        assert attn_low(probs, qf) < attn_none(probs, qf)
+
+    def test_high_base_rate_shifts_up(self):
+        """High base_rate shifts output upward."""
+        attn_none = AttentionLogOddsWeights(n_signals=2, n_query_features=3, seed=42)
+        attn_high = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=3, seed=42, base_rate=0.99
+        )
+        probs = np.array([0.8, 0.7])
+        qf = np.array([1.0, 0.5, -0.3])
+        assert attn_high(probs, qf) > attn_none(probs, qf)
+
+    def test_invalid_base_rate_raises(self):
+        """Invalid base_rate raises ValueError."""
+        with pytest.raises(ValueError, match="base_rate must be in"):
+            AttentionLogOddsWeights(n_signals=2, n_query_features=3, base_rate=0.0)
+
+    def test_base_rate_property(self):
+        """base_rate property returns correct value."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=3, base_rate=0.1)
+        assert attn.base_rate == 0.1
+
+    def test_fit_with_base_rate(self):
+        """fit() works with base_rate set."""
+        rng = np.random.RandomState(42)
+        m = 200
+        labels = rng.randint(0, 2, size=m).astype(np.float64)
+        signal_0 = np.where(labels == 1, 0.85, 0.15)
+        signal_1 = rng.uniform(0.3, 0.7, size=m)
+        probs = np.column_stack([signal_0, signal_1])
+        qf = np.ones((m, 2), dtype=np.float64)
+
+        attn = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=2, alpha=0.0, base_rate=0.3
+        )
+        attn.fit(probs, labels, qf, learning_rate=0.1, max_iterations=500)
+        result = attn(np.array([0.9, 0.5]), np.array([1.0, 0.0]))
+        assert 0 < result < 1
+
+    def test_update_with_base_rate(self):
+        """update() works with base_rate set."""
+        attn = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=2, base_rate=0.1
+        )
+        for _ in range(10):
+            attn.update(np.array([0.9, 0.5]), 1.0, np.array([1.0, 0.0]))
+        assert attn._n_updates == 10
+
+
+# ---------------------------------------------------------------------------
+# Feature 5: Multi-Head Attention Fusion (Remark 8.6, Corollary 8.7.2)
+# ---------------------------------------------------------------------------
+
+class TestMultiHeadAttentionLogOddsWeights:
+    """Tests for MultiHeadAttentionLogOddsWeights."""
+
+    def test_single_head_matches_attention(self):
+        """Single head matches AttentionLogOddsWeights with seed=0."""
+        mh = MultiHeadAttentionLogOddsWeights(
+            n_heads=1, n_signals=2, n_query_features=3
+        )
+        single = AttentionLogOddsWeights(
+            n_signals=2, n_query_features=3, seed=0
+        )
+        probs = np.array([0.8, 0.7])
+        qf = np.array([1.0, 0.5, -0.3])
+        r_mh = mh(probs, qf)
+        r_single = single(probs, qf)
+        assert r_mh == pytest.approx(r_single, abs=1e-10)
+
+    def test_output_in_0_1(self):
+        """Output always in (0, 1)."""
+        mh = MultiHeadAttentionLogOddsWeights(
+            n_heads=4, n_signals=3, n_query_features=2
+        )
+        rng = np.random.default_rng(42)
+        probs = rng.uniform(0.1, 0.9, size=(20, 3))
+        qf = rng.standard_normal(size=(20, 2))
+        result = mh(probs, qf)
+        assert np.all(result > 0)
+        assert np.all(result < 1)
+
+    def test_fit_reduces_bce(self):
+        """fit() reduces BCE loss."""
+        rng = np.random.RandomState(42)
+        m = 200
+        labels = rng.randint(0, 2, size=m).astype(np.float64)
+        signal_0 = np.where(labels == 1, 0.85, 0.15)
+        signal_1 = rng.uniform(0.3, 0.7, size=m)
+        probs = np.column_stack([signal_0, signal_1])
+        qf = np.ones((m, 2), dtype=np.float64)
+
+        mh = MultiHeadAttentionLogOddsWeights(
+            n_heads=3, n_signals=2, n_query_features=2, alpha=0.0
+        )
+        # Measure BCE before training
+        pred_before = np.array([mh(probs[i], qf[i]) for i in range(m)])
+        pred_before = np.clip(pred_before, 1e-10, 1.0 - 1e-10)
+        bce_before = -np.mean(
+            labels * np.log(pred_before) + (1 - labels) * np.log(1 - pred_before)
+        )
+
+        mh.fit(probs, labels, qf, learning_rate=0.1, max_iterations=500)
+
+        pred_after = np.array([mh(probs[i], qf[i]) for i in range(m)])
+        pred_after = np.clip(pred_after, 1e-10, 1.0 - 1e-10)
+        bce_after = -np.mean(
+            labels * np.log(pred_after) + (1 - labels) * np.log(1 - pred_after)
+        )
+        assert bce_after < bce_before
+
+    def test_different_heads_different_weights(self):
+        """Different heads produce different weights after training (diversity)."""
+        rng = np.random.RandomState(42)
+        m = 200
+        labels = rng.randint(0, 2, size=m).astype(np.float64)
+        probs = np.column_stack([
+            np.where(labels == 1, 0.85, 0.15),
+            rng.uniform(0.3, 0.7, size=m),
+        ])
+        qf = np.ones((m, 2), dtype=np.float64)
+
+        mh = MultiHeadAttentionLogOddsWeights(
+            n_heads=3, n_signals=2, n_query_features=2, alpha=0.0
+        )
+        mh.fit(probs, labels, qf, learning_rate=0.1, max_iterations=300)
+
+        # Check that heads have different weight matrices
+        w0 = mh.heads[0].weights_matrix
+        w1 = mh.heads[1].weights_matrix
+        assert not np.allclose(w0, w1, atol=1e-3)
+
+    def test_batched_inputs(self):
+        """Batched inputs work."""
+        mh = MultiHeadAttentionLogOddsWeights(
+            n_heads=2, n_signals=2, n_query_features=3
+        )
+        probs = np.array([[0.8, 0.7], [0.3, 0.9]])
+        qf = np.array([[1.0, 0.5, -0.3], [0.2, -0.1, 0.8]])
+        result = mh(probs, qf)
+        assert result.shape == (2,)
+        assert np.all(result > 0)
+        assert np.all(result < 1)
+
+    def test_n_heads_property(self):
+        """n_heads property returns correct value."""
+        mh = MultiHeadAttentionLogOddsWeights(
+            n_heads=4, n_signals=2, n_query_features=3
+        )
+        assert mh.n_heads == 4
+        assert len(mh.heads) == 4
+
+    def test_invalid_n_heads(self):
+        """n_heads < 1 raises ValueError."""
+        with pytest.raises(ValueError, match="n_heads"):
+            MultiHeadAttentionLogOddsWeights(
+                n_heads=0, n_signals=2, n_query_features=3
+            )
+
+    def test_update(self):
+        """update() changes parameters for all heads."""
+        mh = MultiHeadAttentionLogOddsWeights(
+            n_heads=2, n_signals=2, n_query_features=2
+        )
+        W_before = [h.weights_matrix.copy() for h in mh.heads]
+
+        for _ in range(20):
+            mh.update(np.array([0.9, 0.1]), 1.0, np.array([1.0, 0.0]))
+
+        for i, head in enumerate(mh.heads):
+            assert not np.allclose(W_before[i], head.weights_matrix)
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: Exact Attention Pruning (Theorem 8.7.1, Corollary 8.7.2)
+# ---------------------------------------------------------------------------
+
+class TestAttentionPruning:
+    """Tests for compute_upper_bounds and prune on AttentionLogOddsWeights."""
+
+    def test_upper_bound_ge_actual(self):
+        """Upper bound >= actual fused probability for all candidates."""
+        rng = np.random.default_rng(42)
+        attn = AttentionLogOddsWeights(n_signals=3, n_query_features=2)
+        m = 50
+        probs = rng.uniform(0.1, 0.9, size=(m, 3))
+        qf = rng.standard_normal(size=(m, 2))
+
+        # Use probs as its own upper bound (conservative but valid)
+        upper_bounds = attn.compute_upper_bounds(probs, qf)
+        actual = attn(probs, qf)
+
+        # Upper bound should be >= actual for every candidate
+        for i in range(m):
+            assert upper_bounds[i] >= actual[i] - 1e-10, (
+                f"idx={i}: ub={upper_bounds[i]}, actual={actual[i]}"
+            )
+
+    def test_pruned_below_threshold(self):
+        """Pruned candidates all have actual probability below threshold."""
+        rng = np.random.default_rng(42)
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=2)
+        m = 50
+        probs = rng.uniform(0.1, 0.9, size=(m, 2))
+        qf = rng.standard_normal(size=(1, 2))
+
+        actual = attn(probs, qf)
+        threshold = float(np.median(actual))
+
+        surviving_idx, fused = attn.prune(probs, qf, threshold)
+
+        # All surviving candidates should have actual >= threshold (approximately)
+        pruned_idx = np.setdiff1d(np.arange(m), surviving_idx)
+        if len(pruned_idx) > 0:
+            # Using probs as upper bound (same as actual), so prune is exact
+            pruned_actual = actual[pruned_idx]
+            assert np.all(pruned_actual < threshold + 1e-10)
+
+    def test_surviving_includes_above_threshold(self):
+        """Surviving candidates include all actually above-threshold documents."""
+        rng = np.random.default_rng(42)
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=2)
+        m = 50
+        probs = rng.uniform(0.1, 0.9, size=(m, 2))
+        # Use higher upper bounds to make pruning conservative
+        upper_probs = np.clip(probs + 0.1, 0.0, 1.0)
+        qf = rng.standard_normal(size=(1, 2))
+
+        actual = attn(probs, qf)
+        threshold = float(np.median(actual))
+
+        surviving_idx, _ = attn.prune(probs, qf, threshold, upper_bound_probs=upper_probs)
+
+        # Every doc with actual >= threshold must be in surviving
+        truly_above = np.where(actual >= threshold)[0]
+        for idx in truly_above:
+            assert idx in surviving_idx, (
+                f"Doc {idx} with actual={actual[idx]} >= {threshold} was pruned"
+            )
+
+    def test_empty_when_all_below(self):
+        """Empty result when all below threshold."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=2)
+        probs = np.array([[0.1, 0.1], [0.2, 0.2]])
+        qf = np.array([1.0, 0.0])
+        surviving_idx, fused = attn.prune(probs, qf, threshold=0.99)
+        assert len(surviving_idx) == 0
+        assert len(fused) == 0
+
+    def test_no_pruning_when_all_above(self):
+        """No pruning when all above threshold."""
+        attn = AttentionLogOddsWeights(n_signals=2, n_query_features=2)
+        probs = np.array([[0.9, 0.9], [0.8, 0.8], [0.85, 0.85]])
+        qf = np.array([1.0, 0.0])
+        surviving_idx, fused = attn.prune(probs, qf, threshold=0.01)
+        assert len(surviving_idx) == 3
+        assert len(fused) == 3
+
+
+class TestMultiHeadPruning:
+    """Tests for pruning on MultiHeadAttentionLogOddsWeights."""
+
+    def test_upper_bound_ge_actual(self):
+        """Multi-head upper bound >= actual for all candidates."""
+        rng = np.random.default_rng(42)
+        mh = MultiHeadAttentionLogOddsWeights(
+            n_heads=3, n_signals=2, n_query_features=2
+        )
+        m = 30
+        probs = rng.uniform(0.1, 0.9, size=(m, 2))
+        qf = rng.standard_normal(size=(m, 2))
+
+        upper_bounds = mh.compute_upper_bounds(probs, qf)
+        actual = mh(probs, qf)
+
+        for i in range(m):
+            assert upper_bounds[i] >= actual[i] - 1e-10
+
+    def test_prune_returns_correct_shapes(self):
+        """prune() returns correct shapes."""
+        mh = MultiHeadAttentionLogOddsWeights(
+            n_heads=2, n_signals=2, n_query_features=2
+        )
+        probs = np.array([[0.8, 0.7], [0.3, 0.9], [0.5, 0.5]])
+        qf = np.array([1.0, 0.0])
+        surviving_idx, fused = mh.prune(probs, qf, threshold=0.3)
+        assert surviving_idx.ndim == 1
+        assert fused.ndim == 1
+        assert len(surviving_idx) == len(fused)

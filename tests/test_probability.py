@@ -463,3 +463,228 @@ class TestSerialization:
         assert t.alpha == pytest.approx(1.5)
         assert t.beta == pytest.approx(0.5)
         assert t._n_updates == 5
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: External Prior Features (prior_fn)
+# ---------------------------------------------------------------------------
+
+class TestPriorFn:
+    """Tests for custom prior_fn in BayesianProbabilityTransform."""
+
+    def test_custom_prior_is_used(self):
+        """Custom prior is called and its output used in posterior."""
+        called_with = {}
+
+        def my_prior(score, tf, doc_len_ratio):
+            called_with["score"] = score
+            called_with["tf"] = tf
+            called_with["doc_len_ratio"] = doc_len_ratio
+            return 0.8  # constant high prior
+
+        t = BayesianProbabilityTransform(alpha=1.0, beta=0.0, prior_fn=my_prior)
+        result = t.score_to_probability(2.0, tf=5.0, doc_len_ratio=0.5)
+
+        # Verify the prior_fn was called
+        assert "score" in called_with
+        assert 0.0 < result < 1.0
+
+        # Verify result differs from composite prior path
+        t_default = BayesianProbabilityTransform(alpha=1.0, beta=0.0)
+        result_default = t_default.score_to_probability(2.0, tf=5.0, doc_len_ratio=0.5)
+        assert result != pytest.approx(result_default, abs=1e-3)
+
+    def test_prior_fn_receives_all_args(self):
+        """prior_fn receives score, tf, doc_len_ratio correctly."""
+        received = []
+
+        def capture_prior(score, tf, doc_len_ratio):
+            received.append((score, tf, doc_len_ratio))
+            return 0.5
+
+        t = BayesianProbabilityTransform(alpha=1.0, beta=0.0, prior_fn=capture_prior)
+        t.score_to_probability(3.0, tf=7.0, doc_len_ratio=1.2)
+
+        assert len(received) == 1
+        s, tf, dlr = received[0]
+        assert float(np.asarray(s)) == pytest.approx(3.0)
+        assert float(np.asarray(tf)) == pytest.approx(7.0)
+        assert float(np.asarray(dlr)) == pytest.approx(1.2)
+
+    def test_prior_fn_output_clamped(self):
+        """Output from prior_fn is clamped to (epsilon, 1-epsilon)."""
+        def extreme_prior(score, tf, doc_len_ratio):
+            return 0.0  # would be invalid without clamping
+
+        t = BayesianProbabilityTransform(alpha=1.0, beta=0.0, prior_fn=extreme_prior)
+        result = t.score_to_probability(2.0, tf=5.0, doc_len_ratio=0.5)
+        assert 0.0 < result < 1.0
+
+    def test_prior_fn_with_base_rate(self):
+        """prior_fn works together with base_rate."""
+        def const_prior(score, tf, doc_len_ratio):
+            return 0.7
+
+        t = BayesianProbabilityTransform(
+            alpha=1.0, beta=0.0, base_rate=0.1, prior_fn=const_prior
+        )
+        result = t.score_to_probability(2.0, tf=5.0, doc_len_ratio=0.5)
+        assert 0.0 < result < 1.0
+
+    def test_prior_free_overrides_prior_fn(self):
+        """prior_free mode overrides custom prior (prior=0.5)."""
+        def const_prior(score, tf, doc_len_ratio):
+            return 0.9
+
+        t = BayesianProbabilityTransform(alpha=1.0, beta=0.0, prior_fn=const_prior)
+        t._training_mode = "prior_free"
+
+        result_pf = t.score_to_probability(2.0, tf=5.0, doc_len_ratio=0.5)
+        # prior_free uses prior=0.5, so posterior = likelihood
+        expected = float(sigmoid(1.0 * (2.0 - 0.0)))
+        assert result_pf == pytest.approx(expected, abs=1e-5)
+
+    def test_none_prior_fn_preserves_behavior(self):
+        """prior_fn=None preserves existing composite_prior behavior."""
+        t_none = BayesianProbabilityTransform(alpha=1.0, beta=0.0, prior_fn=None)
+        t_default = BayesianProbabilityTransform(alpha=1.0, beta=0.0)
+        scores = np.array([0.5, 1.0, 2.0, 3.0])
+        for score in scores:
+            p_none = t_none.score_to_probability(score, tf=5.0, doc_len_ratio=0.5)
+            p_default = t_default.score_to_probability(score, tf=5.0, doc_len_ratio=0.5)
+            assert p_none == pytest.approx(p_default, abs=1e-12)
+
+    def test_array_prior_fn(self):
+        """prior_fn can return arrays for vectorized computation."""
+        def array_prior(score, tf, doc_len_ratio):
+            return np.full_like(np.asarray(score), 0.6)
+
+        t = BayesianProbabilityTransform(alpha=1.0, beta=0.0, prior_fn=array_prior)
+        scores = np.array([1.0, 2.0, 3.0])
+        tf = np.array([5.0, 5.0, 5.0])
+        dlr = np.array([0.5, 0.5, 0.5])
+        result = t.score_to_probability(scores, tf, dlr)
+        assert result.shape == (3,)
+        assert np.all(result > 0)
+        assert np.all(result < 1)
+
+
+# ---------------------------------------------------------------------------
+# Feature 8: Temporal Dynamics (TemporalBayesianTransform)
+# ---------------------------------------------------------------------------
+
+class TestTemporalBayesianTransform:
+    """Tests for TemporalBayesianTransform."""
+
+    def test_isinstance_of_parent(self):
+        """Inherits from BayesianProbabilityTransform."""
+        from bayesian_bm25.probability import TemporalBayesianTransform
+        t = TemporalBayesianTransform()
+        assert isinstance(t, BayesianProbabilityTransform)
+
+    def test_decay_half_life_validation(self):
+        """decay_half_life must be positive."""
+        from bayesian_bm25.probability import TemporalBayesianTransform
+        with pytest.raises(ValueError, match="decay_half_life must be positive"):
+            TemporalBayesianTransform(decay_half_life=0.0)
+        with pytest.raises(ValueError, match="decay_half_life must be positive"):
+            TemporalBayesianTransform(decay_half_life=-1.0)
+
+    def test_recent_observations_dominate(self):
+        """After fit with timestamps, params closer to recent data's truth."""
+        from bayesian_bm25.probability import TemporalBayesianTransform
+        rng = np.random.default_rng(42)
+
+        # Early data: generated with alpha=1.0, beta=0.0
+        n_early = 200
+        scores_early = rng.uniform(0, 3, size=n_early)
+        labels_early = (rng.random(n_early) < sigmoid(1.0 * scores_early)).astype(float)
+
+        # Recent data: generated with alpha=3.0, beta=2.0
+        n_recent = 200
+        scores_recent = rng.uniform(0, 5, size=n_recent)
+        labels_recent = (rng.random(n_recent) < sigmoid(3.0 * (scores_recent - 2.0))).astype(float)
+
+        scores = np.concatenate([scores_early, scores_recent])
+        labels = np.concatenate([labels_early, labels_recent])
+        timestamps = np.arange(len(scores), dtype=np.float64)
+
+        # With short half-life, recent observations dominate
+        t_temporal = TemporalBayesianTransform(
+            alpha=1.0, beta=0.0, decay_half_life=50.0
+        )
+        t_temporal.fit(
+            scores, labels, timestamps=timestamps,
+            learning_rate=0.05, max_iterations=3000,
+        )
+
+        # Without temporal weighting, use parent class
+        t_uniform = BayesianProbabilityTransform(alpha=1.0, beta=0.0)
+        t_uniform.fit(scores, labels, learning_rate=0.05, max_iterations=3000)
+
+        # Temporal should have beta closer to 2.0 (recent truth) than uniform
+        assert abs(t_temporal.beta - 2.0) < abs(t_uniform.beta - 2.0)
+
+    def test_large_half_life_matches_parent(self):
+        """Very large decay_half_life matches parent class behavior."""
+        from bayesian_bm25.probability import TemporalBayesianTransform
+        rng = np.random.default_rng(42)
+
+        scores = rng.uniform(0, 3, size=100)
+        labels = (rng.random(100) < sigmoid(2.0 * (scores - 1.0))).astype(float)
+
+        t_temporal = TemporalBayesianTransform(
+            alpha=0.5, beta=0.0, decay_half_life=1e10
+        )
+        t_uniform = BayesianProbabilityTransform(alpha=0.5, beta=0.0)
+
+        t_temporal.fit(scores, labels, learning_rate=0.05, max_iterations=2000)
+        t_uniform.fit(scores, labels, learning_rate=0.05, max_iterations=2000)
+
+        # Should be very close
+        assert t_temporal.alpha == pytest.approx(t_uniform.alpha, abs=0.05)
+        assert t_temporal.beta == pytest.approx(t_uniform.beta, abs=0.05)
+
+    def test_score_to_probability_works(self):
+        """score_to_probability works unchanged from parent."""
+        from bayesian_bm25.probability import TemporalBayesianTransform
+        t = TemporalBayesianTransform(alpha=1.0, beta=0.0)
+        result = t.score_to_probability(2.0, tf=5.0, doc_len_ratio=0.5)
+        assert 0.0 < result < 1.0
+
+    def test_properties(self):
+        """Properties return correct values."""
+        from bayesian_bm25.probability import TemporalBayesianTransform
+        t = TemporalBayesianTransform(decay_half_life=500.0)
+        assert t.decay_half_life == 500.0
+        assert t.timestamp == 0
+
+    def test_update_increments_timestamp(self):
+        """update() increments internal timestamp counter."""
+        from bayesian_bm25.probability import TemporalBayesianTransform
+        t = TemporalBayesianTransform()
+        assert t.timestamp == 0
+        t.update(2.0, 1.0)
+        assert t.timestamp == 1
+        t.update(1.0, 0.0)
+        assert t.timestamp == 2
+
+    def test_fit_without_timestamps(self):
+        """fit() without timestamps works (equal weighting)."""
+        from bayesian_bm25.probability import TemporalBayesianTransform
+        rng = np.random.default_rng(42)
+        scores = rng.uniform(0, 3, size=50)
+        labels = (scores > 1.5).astype(float)
+
+        t = TemporalBayesianTransform(alpha=0.5, beta=0.0)
+        t.fit(scores, labels, learning_rate=0.05, max_iterations=500)
+        # Should not raise and parameters should have moved
+        assert t.alpha != 0.5 or t.beta != 0.0
+
+    def test_lazy_import(self):
+        """TemporalBayesianTransform is accessible via lazy import."""
+        import bayesian_bm25
+        cls = bayesian_bm25.TemporalBayesianTransform
+        assert cls is not None
+        t = cls()
+        assert isinstance(t, BayesianProbabilityTransform)
