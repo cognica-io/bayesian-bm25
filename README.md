@@ -364,68 +364,80 @@ Evaluated on 5 [BEIR](https://github.com/beir-cellar/beir) datasets using the re
 
 | Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | Average |
 |---|---|---|---|---|---|---|
-| BM25 | 36.13 | 25.31 | 31.82 | 15.63 | 68.02 | 35.38 |
+| BM25 | 36.16 | 25.32 | 31.85 | 15.65 | 67.91 | 35.38 |
 | Dense | 36.98 | 36.87 | 31.59 | 21.64 | 64.51 | 38.32 |
-| Convex | 40.01 | 37.10 | 35.60 | 19.67 | 73.37 | 41.15 |
-| RRF | 39.61 | 36.85 | 34.43 | 20.11 | 71.43 | 40.49 |
-| Bayesian-OR | 0.06 | 25.52 | 33.46 | 15.89 | 66.95 | 28.38 |
-| Bayesian-LogOdds | 37.16 | 32.93 | 35.31 | 18.57 | 72.80 | 39.35 |
-| LO-Local | 39.66 | 37.19 | 34.10 | 19.51 | 73.80 | 40.85 |
-| Bayesian-LO-BR | 37.16 | 32.92 | 30.99 | 18.52 | 72.27 | 38.37 |
-| **Bayesian-Balanced** | **37.27** | **40.58** | **35.73** | **21.42** | **72.47** | **41.50** |
-| Balanced-Mix | 37.29 | 40.66 | 35.70 | 21.53 | 72.33 | 41.50 |
-| Balanced-Elbow | 37.29 | 40.56 | 35.76 | 21.42 | 72.46 | 41.50 |
-| Gated-ReLU | 35.16 | 27.54 | 32.45 | 17.08 | 69.01 | 36.25 |
-| Gated-Swish | 36.20 | 27.39 | 28.66 | 16.82 | 68.61 | 35.54 |
-| Attention | 37.05 | 38.86 | 34.39 | 21.05 | 70.51 | 40.37 |
-| **Attn-NR** | **37.22** | **40.53** | **35.42** | **21.91** | **73.24** | **41.67** |
-| Attn-NR-CV | 37.23 | 40.51 | 35.37 | 21.97 | 72.57 | 41.53 |
-| MultiField | 7.41 | -- | 31.16 | 15.68 | 60.06 | 28.58\* |
-| MF-Balanced | 38.40 | -- | 34.51 | 20.93 | 66.83 | 40.17\* |
+| Convex | 40.03 | 37.10 | 35.61 | 19.65 | 73.38 | 41.15 |
+| RRF | 39.61 | 36.85 | 34.43 | 20.09 | 71.43 | 40.48 |
+| Bayesian-OR | 0.06 | 25.54 | 33.47 | 15.88 | 66.97 | 28.38 |
+| Bayesian-LogOdds | 37.16 | 32.93 | 35.32 | 18.54 | 72.68 | 39.33 |
+| LO-Local | 39.63 | 37.20 | 34.10 | 19.50 | 73.81 | 40.85 |
+| Bayesian-LO-BR | 37.16 | 32.92 | 30.92 | 18.50 | 72.15 | 38.33 |
+| **Bayesian-Balanced** | **37.27** | **40.59** | **35.73** | **21.40** | **72.47** | **41.50** |
+| Balanced-Mix | 37.29 | 40.66 | 35.70 | 21.52 | 72.33 | 41.50 |
+| Balanced-Elbow | 37.29 | 40.59 | 35.76 | 21.41 | 72.46 | 41.50 |
+| Gated-ReLU | 35.17 | 27.52 | 32.42 | 17.07 | 69.02 | 36.24 |
+| Gated-Swish | 36.20 | 27.39 | 28.67 | 16.80 | 68.63 | 35.54 |
+| Gated-GELU | 36.06 | 27.62 | 30.86 | 17.07 | 69.29 | 36.18 |
+| Gated-Swish-B2 | 35.56 | 27.65 | 31.35 | 17.12 | 69.27 | 36.19 |
+| Attention | 37.05 | 38.86 | 34.40 | 21.05 | 70.44 | 40.36 |
+| **Attn-NR** | **37.21** | **40.43** | **35.43** | **21.91** | **73.22** | **41.64** |
+| Attn-NR-CV | 37.23 | 40.45 | 35.33 | 21.97 | 72.32 | 41.46 |
+| Multi-Head | 37.04 | 39.27 | 34.32 | 21.17 | 70.28 | 40.42 |
+| MH-NR | 37.13 | 39.08 | 35.72 | 21.78 | 70.60 | 40.86 |
+| MultiField | 7.40 | -- | 31.16 | 15.68 | 59.93 | 28.55\* |
+| MF-Balanced | 38.42 | -- | 34.51 | 20.92 | 66.84 | 40.17\* |
 
 #### MAP@10
 
 | Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | Average |
 |---|---|---|---|---|---|---|
-| BM25 | 23.84 | 19.10 | 11.76 | 9.15 | 63.38 | 25.45 |
+| BM25 | 23.84 | 19.11 | 11.77 | 9.16 | 63.22 | 25.42 |
 | Dense | 24.46 | 29.14 | 11.05 | 12.94 | 59.59 | 27.44 |
-| Convex | 26.76 | 29.21 | 13.46 | 11.79 | 69.12 | 30.07 |
-| RRF | 26.30 | 28.85 | 12.84 | 11.98 | 66.58 | 29.31 |
-| Bayesian-OR | 0.03 | 19.09 | 12.41 | 9.19 | 61.70 | 20.49 |
-| Bayesian-LogOdds | 24.54 | 25.58 | 13.40 | 11.02 | 68.31 | 28.57 |
-| LO-Local | 26.43 | 29.32 | 12.31 | 11.70 | 69.29 | 29.81 |
-| Bayesian-LO-BR | 24.54 | 25.58 | 11.50 | 10.99 | 67.83 | 28.09 |
-| **Bayesian-Balanced** | **24.61** | **32.73** | **13.80** | **12.85** | **68.03** | **30.40** |
-| Balanced-Mix | 24.62 | 32.77 | 13.79 | 12.93 | 67.84 | 30.39 |
-| Balanced-Elbow | 24.62 | 32.72 | 13.80 | 12.85 | 68.02 | 30.40 |
-| Gated-ReLU | 22.95 | 21.00 | 11.67 | 10.02 | 64.10 | 25.95 |
-| Gated-Swish | 23.86 | 20.88 | 10.23 | 9.85 | 63.80 | 25.73 |
-| Attention | 24.49 | 30.96 | 12.68 | 12.60 | 65.92 | 29.33 |
-| **Attn-NR** | **24.57** | **32.62** | **13.40** | **13.22** | **68.91** | **30.54** |
-| Attn-NR-CV | 24.58 | 32.58 | 13.39 | 13.24 | 68.05 | 30.37 |
-| MultiField | 4.76 | -- | 11.45 | 9.04 | 55.34 | 20.15\* |
-| MF-Balanced | 25.45 | -- | 13.04 | 12.57 | 63.21 | 28.57\* |
+| Convex | 26.77 | 29.21 | 13.46 | 11.78 | 69.13 | 30.07 |
+| RRF | 26.30 | 28.85 | 12.84 | 11.96 | 66.58 | 29.30 |
+| Bayesian-OR | 0.03 | 19.10 | 12.41 | 9.19 | 61.72 | 20.49 |
+| Bayesian-LogOdds | 24.54 | 25.58 | 13.40 | 11.01 | 68.15 | 28.54 |
+| LO-Local | 26.40 | 29.32 | 12.31 | 11.69 | 69.30 | 29.80 |
+| Bayesian-LO-BR | 24.54 | 25.58 | 11.47 | 10.98 | 67.66 | 28.05 |
+| **Bayesian-Balanced** | **24.61** | **32.74** | **13.80** | **12.83** | **68.03** | **30.40** |
+| Balanced-Mix | 24.62 | 32.77 | 13.79 | 12.92 | 67.84 | 30.39 |
+| Balanced-Elbow | 24.62 | 32.74 | 13.80 | 12.84 | 68.02 | 30.40 |
+| Gated-ReLU | 22.98 | 20.97 | 11.66 | 10.01 | 64.11 | 25.95 |
+| Gated-Swish | 23.87 | 20.88 | 10.23 | 9.85 | 63.81 | 25.73 |
+| Gated-GELU | 23.78 | 21.04 | 10.87 | 10.02 | 64.44 | 26.03 |
+| Gated-Swish-B2 | 23.42 | 21.07 | 11.11 | 10.05 | 64.42 | 26.01 |
+| Attention | 24.49 | 30.93 | 12.68 | 12.59 | 65.80 | 29.30 |
+| **Attn-NR** | **24.56** | **32.52** | **13.40** | **13.20** | **68.77** | **30.49** |
+| Attn-NR-CV | 24.58 | 32.50 | 13.38 | 13.23 | 67.71 | 30.28 |
+| Multi-Head | 24.48 | 31.33 | 12.66 | 12.69 | 65.59 | 29.35 |
+| MH-NR | 24.53 | 31.19 | 13.79 | 13.08 | 66.14 | 29.75 |
+| MultiField | 4.76 | -- | 11.45 | 9.04 | 55.18 | 20.11\* |
+| MF-Balanced | 25.47 | -- | 13.04 | 12.57 | 63.22 | 28.57\* |
 
 #### Recall@10
 
 | Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | Average |
 |---|---|---|---|---|---|---|
-| BM25 | 75.04 | 31.98 | 14.46 | 16.34 | 80.78 | 43.72 |
+| BM25 | 75.18 | 31.98 | 14.47 | 16.36 | 80.78 | 43.75 |
 | Dense | 76.53 | 44.13 | 15.50 | 23.09 | 78.33 | 47.52 |
-| Convex | 81.65 | 45.04 | 17.06 | 20.62 | 84.89 | 49.85 |
-| RRF | 81.65 | 45.03 | 16.87 | 21.15 | 84.76 | 49.89 |
-| Bayesian-OR | 0.14 | 32.71 | 15.98 | 16.76 | 81.37 | 29.39 |
-| Bayesian-LogOdds | 77.03 | 40.67 | 17.24 | 19.40 | 84.96 | 47.86 |
-| LO-Local | 81.37 | 45.22 | 16.29 | 20.42 | 86.22 | 49.90 |
-| Bayesian-LO-BR | 77.03 | 40.67 | 15.01 | 19.32 | 84.29 | 47.27 |
-| **Bayesian-Balanced** | **77.31** | **47.61** | **17.23** | **22.61** | **84.83** | **49.92** |
-| Balanced-Mix | 77.38 | 47.61 | 17.26 | 22.73 | 84.83 | 49.96 |
-| Balanced-Elbow | 77.38 | 47.56 | 17.24 | 22.63 | 84.83 | 49.93 |
-| Gated-ReLU | 74.04 | 34.39 | 16.03 | 17.79 | 82.58 | 44.97 |
-| Gated-Swish | 75.39 | 34.21 | 13.88 | 17.43 | 81.91 | 44.56 |
-| Attention | 76.74 | 46.60 | 17.10 | 22.23 | 83.04 | 49.14 |
-| **Attn-NR** | **77.24** | **47.43** | **17.05** | **23.24** | **84.69** | **49.93** |
-| Attn-NR-CV | 77.24 | 47.50 | 17.04 | 23.39 | 84.71 | 49.98 |
+| Convex | 81.72 | 45.04 | 17.06 | 20.60 | 84.89 | 49.86 |
+| RRF | 81.65 | 45.03 | 16.87 | 21.11 | 84.76 | 49.88 |
+| Bayesian-OR | 0.14 | 32.74 | 15.98 | 16.74 | 81.37 | 29.39 |
+| Bayesian-LogOdds | 77.03 | 40.67 | 17.24 | 19.36 | 84.96 | 47.85 |
+| LO-Local | 81.37 | 45.24 | 16.29 | 20.40 | 86.22 | 49.90 |
+| Bayesian-LO-BR | 77.03 | 40.67 | 15.00 | 19.28 | 84.29 | 47.26 |
+| **Bayesian-Balanced** | **77.31** | **47.66** | **17.23** | **22.59** | **84.83** | **49.93** |
+| Balanced-Mix | 77.38 | 47.61 | 17.26 | 22.71 | 84.83 | 49.96 |
+| Balanced-Elbow | 77.38 | 47.66 | 17.24 | 22.61 | 84.83 | 49.95 |
+| Gated-ReLU | 74.04 | 34.39 | 16.00 | 17.76 | 82.58 | 44.95 |
+| Gated-Swish | 75.32 | 34.21 | 13.88 | 17.40 | 81.91 | 44.55 |
+| Gated-GELU | 75.04 | 34.62 | 14.87 | 17.72 | 82.64 | 44.98 |
+| Gated-Swish-B2 | 74.11 | 34.65 | 15.16 | 17.80 | 82.64 | 44.87 |
+| Attention | 76.74 | 46.76 | 17.10 | 22.23 | 83.04 | 49.17 |
+| **Attn-NR** | **77.24** | **47.38** | **17.05** | **23.26** | **85.03** | **49.99** |
+| Attn-NR-CV | 77.24 | 47.53 | 16.98 | 23.42 | 84.71 | 49.98 |
+| Multi-Head | 76.74 | 47.02 | 17.08 | 22.37 | 83.04 | 49.25 |
+| MH-NR | 76.96 | 46.49 | 17.26 | 23.20 | 83.00 | 49.38 |
 | MultiField | 16.43 | -- | 14.64 | 16.68 | 72.87 | 30.16\* |
 | MF-Balanced | 79.30 | -- | 16.85 | 22.03 | 76.63 | 48.70\* |
 
@@ -443,22 +455,24 @@ All methods above are zero-shot (no relevance labels required). With `--tune`, a
 
 | Method | Type | Delta |
 |---|---|---|
-| **Attn-NR** | **zero-shot** | **+6.28** |
-| Balanced-Tuned | trained | +6.26 |
-| Attn-NR-CV | zero-shot | +6.14 |
-| Balanced-Elbow | zero-shot | +6.12 |
+| **Attn-NR** | **zero-shot** | **+6.26** |
+| Balanced-Elbow | zero-shot | +6.13 |
+| Bayesian-Balanced | zero-shot | +6.12 |
 | Balanced-Mix | zero-shot | +6.12 |
-| Bayesian-Balanced | zero-shot | +6.11 |
-| Convex | zero-shot | +5.76 |
+| Attn-NR-CV | zero-shot | +6.08 |
+| Convex | zero-shot | +5.78 |
+| MH-NR | zero-shot | +5.48 |
 | LO-Local | zero-shot | +5.47 |
-| RRF | zero-shot | +5.11 |
-| Attention | zero-shot | +4.99 |
-| Bayesian-LogOdds | zero-shot | +3.97 |
-| Bayesian-LO-BR | zero-shot | +2.99 |
+| RRF | zero-shot | +5.10 |
+| Multi-Head | zero-shot | +5.04 |
+| Attention | zero-shot | +4.98 |
+| Bayesian-LogOdds | zero-shot | +3.95 |
+| Bayesian-LO-BR | zero-shot | +2.95 |
 | Dense | zero-shot | +2.94 |
-| MF-Balanced | zero-shot | +2.27\* |
-| Hybrid-AND-Tuned | trained | +1.84 |
-| Gated-ReLU | zero-shot | +0.87 |
+| MF-Balanced | zero-shot | +2.28\* |
+| Gated-ReLU | zero-shot | +0.86 |
+| Gated-Swish-B2 | zero-shot | +0.82 |
+| Gated-GELU | zero-shot | +0.80 |
 | Gated-Swish | zero-shot | +0.16 |
 
 \*MF-Balanced delta computed over 4 datasets (FiQA corpus lacks title field).
@@ -496,7 +510,7 @@ All methods above are zero-shot (no relevance labels required). With `--tune`, a
 **Why include underperforming methods?** The tables above deliberately include methods that underperform BM25. Each failure mode is informative:
 
 - **Bayesian-OR** (NDCG@10 avg 28.38) — Probabilistic OR assumes signal independence and catastrophically fails on ArguAna (0.06%). This demonstrates *why* the log-odds conjunction framework (Paper 2, Section 4) is needed: naive probability combination without logit-space calibration collapses when signal distributions differ.
-- **Gated-ReLU / Gated-Swish / Gated-GELU** (36.25 / 35.54 / TBD) — Sparse gating (Paper 2, Theorems 6.5.3 / 6.7.4 / 6.8.1) is too aggressive for the BEIR hybrid fusion task. ReLU zeros out negative logits entirely, discarding useful weak signals; Swish and GELU soften the gate but still suppress too much. These gates are designed for high-dimensional signal spaces where most inputs are noise — in a two-signal (sparse + dense) setting, there is no noise to suppress.
+- **Gated-ReLU / Gated-Swish / Gated-GELU / Gated-Swish-B2** (36.24 / 35.54 / 36.18 / 36.19) — Sparse gating (Paper 2, Theorems 6.5.3 / 6.7.4 / 6.8.1 / 6.7.6) is too aggressive for the BEIR hybrid fusion task. ReLU zeros out negative logits entirely, discarding useful weak signals; Swish, GELU, and generalized Swish soften the gate but still suppress too much. These gates are designed for high-dimensional signal spaces where most inputs are noise — in a two-signal (sparse + dense) setting, there is no noise to suppress.
 - **MultiField** (28.58 over 4 datasets) — Sparse-only multi-field search loses to concatenated BM25 because field separation fragments term statistics (smaller per-field document frequency, shorter effective document lengths). However, **MF-Balanced** (40.17) recovers most of the gap by fusing with dense embeddings, confirming that field-level BM25 signals are complementary to dense vectors even when they are individually weaker.
 
 Reproduce:
