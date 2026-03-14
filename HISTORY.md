@@ -1,5 +1,9 @@
 # History
 
+## 0.8.1 (2026-03-14)
+
+- Add PEP 561 `py.typed` marker for inline type hint support
+
 ## 0.8.0 (2026-03-05)
 
 - Add `normalize` parameter to `AttentionLogOddsWeights` for per-signal logit normalization
