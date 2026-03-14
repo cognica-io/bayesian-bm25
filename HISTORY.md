@@ -72,6 +72,10 @@
   - Add MH-NR (multi-head + logit normalization + 7 features, Paper 2, Corollary 8.7.2)
   - Add calibration diagnostics for all new probability-producing methods
 
+## 0.8.1 (2026-03-14)
+
+- Add PEP 561 `py.typed` marker for inline type hint support
+
 ## 0.8.0 (2026-03-05)
 
 - Add `normalize` parameter to `AttentionLogOddsWeights` for per-signal logit normalization
