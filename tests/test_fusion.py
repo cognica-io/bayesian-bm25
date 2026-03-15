@@ -890,6 +890,42 @@ class TestGating:
         assert np.all(result > 0)
         assert np.all(result < 1)
 
+    def test_softplus_preserves_all_evidence(self):
+        """Softplus never zeroes evidence, unlike ReLU."""
+        # 0.3 has negative logit; ReLU zeroes it, softplus keeps it positive.
+        # softplus(x) > x for all finite x, so it also inflates positive
+        # logits slightly.  The combined effect places softplus above relu.
+        probs = np.array([0.9, 0.3])
+        result_softplus = log_odds_conjunction(probs, gating="softplus")
+        result_relu = log_odds_conjunction(probs, gating="relu")
+        result_none = log_odds_conjunction(probs, gating="none")
+        assert result_none < result_relu < result_softplus
+
+    def test_softplus_all_above_half(self):
+        """Softplus with all signals > 0.5 gives result above no-gating."""
+        probs = np.array([0.8, 0.9])
+        result_softplus = log_odds_conjunction(probs, gating="softplus")
+        result_none = log_odds_conjunction(probs, gating="none")
+        # softplus(x) > x for all x, so gated logits are larger
+        assert result_softplus > result_none
+
+    def test_softplus_with_weights(self):
+        """Softplus works with weighted mode."""
+        probs = np.array([0.9, 0.3])
+        w = np.array([0.5, 0.5])
+        result_none = log_odds_conjunction(probs, weights=w, gating="none")
+        result_softplus = log_odds_conjunction(probs, weights=w, gating="softplus")
+        assert result_softplus > result_none
+
+    def test_softplus_batched(self):
+        """Softplus gating works with batched inputs."""
+        probs = np.array([[0.9, 0.3], [0.8, 0.8]])
+        result = log_odds_conjunction(probs, gating="softplus")
+        assert result.shape == (2,)
+        assert np.all(np.isfinite(result))
+        assert np.all(result > 0)
+        assert np.all(result < 1)
+
 
 class TestAttentionLogOddsWeights:
     """Tests for AttentionLogOddsWeights (Paper 2, Section 8)."""
@@ -1262,6 +1298,24 @@ class TestGatingBeta:
         result_swish = log_odds_conjunction(probs, gating="swish", gating_beta=1.702)
         result_gelu = log_odds_conjunction(probs, gating="gelu")
         assert result_swish == pytest.approx(result_gelu, abs=1e-10)
+
+    def test_softplus_beta_one_is_standard(self):
+        """gating_beta=1.0 gives standard softplus: log(1 + exp(x))."""
+        probs = np.array([0.9, 0.3, 0.7])
+        result_default = log_odds_conjunction(probs, gating="softplus")
+        result_beta1 = log_odds_conjunction(
+            probs, gating="softplus", gating_beta=1.0,
+        )
+        assert result_beta1 == pytest.approx(result_default, abs=1e-12)
+
+    def test_softplus_beta_large_approaches_relu(self):
+        """gating_beta -> large makes softplus approach ReLU."""
+        probs = np.array([0.9, 0.3])
+        result_relu = log_odds_conjunction(probs, gating="relu")
+        result_large = log_odds_conjunction(
+            probs, gating="softplus", gating_beta=100.0,
+        )
+        assert result_large == pytest.approx(result_relu, abs=0.01)
 
 
 # ---------------------------------------------------------------------------

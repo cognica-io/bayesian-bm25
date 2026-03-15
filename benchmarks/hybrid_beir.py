@@ -27,19 +27,20 @@ Methods compared:
  10. Gated-Swish      -- log-odds conjunction with Swish gating (Theorem 6.7.4)
  11. Gated-GELU       -- log-odds conjunction with GELU gating (Theorem 6.8.1)
  12. Gated-Swish-B2   -- generalized swish with beta=2.0 (Theorem 6.7.6)
- 13. Attention        -- query-dependent attention weights (Paper 2, Section 8)
- 14. Attn-NR          -- Attention + logit normalization + 7 features (dense+cross)
- 15. Attn-NR-CV       -- 5-fold cross-validated Attn-NR
- 16. Multi-Head       -- 4-head attention fusion (Remark 8.6)
- 17. MH-NR            -- Multi-head + normalize + rich features (Corollary 8.7.2)
- 18. MultiField       -- MultiFieldScorer (title + body), sparse-only
- 19. MF-Balanced      -- MultiField probs + dense via balanced_log_odds_fusion
+ 13. Gated-Softplus   -- softplus gating, evidence-preserving (Remark 6.5.4)
+ 14. Attention        -- query-dependent attention weights (Paper 2, Section 8)
+ 15. Attn-NR          -- Attention + logit normalization + 7 features (dense+cross)
+ 16. Attn-NR-CV       -- 5-fold cross-validated Attn-NR
+ 17. Multi-Head       -- 4-head attention fusion (Remark 8.6)
+ 18. MH-NR            -- Multi-head + normalize + rich features (Corollary 8.7.2)
+ 19. MultiField       -- MultiFieldScorer (title + body), sparse-only
+ 20. MF-Balanced      -- MultiField probs + dense via balanced_log_odds_fusion
 
 With --tune, additional tuned methods are evaluated:
 
- 20. Bayesian-Tuned     -- BayesianBM25 with tuned alpha, beta, base_rate
- 21. Balanced-Tuned     -- balanced_log_odds_fusion with tuned weight
- 22. Hybrid-AND-Tuned   -- log-odds conjunction with tuned alpha
+ 21. Bayesian-Tuned     -- BayesianBM25 with tuned alpha, beta, base_rate
+ 22. Balanced-Tuned     -- balanced_log_odds_fusion with tuned weight
+ 23. Hybrid-AND-Tuned   -- log-odds conjunction with tuned alpha
 
 Dependencies:
     pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5
@@ -1083,7 +1084,7 @@ BASELINE_METHODS = [
     "BM25", "Dense", "Convex", "RRF",
     "Bayesian-OR", "Bayesian-LogOdds", "LO-Local", "Bayesian-LO-BR", "Bayesian-Balanced",
     "Balanced-Mix", "Balanced-Elbow",
-    "Gated-ReLU", "Gated-Swish", "Gated-GELU", "Gated-Swish-B2",
+    "Gated-ReLU", "Gated-Swish", "Gated-GELU", "Gated-Swish-B2", "Gated-Softplus",
     "Attention", "Attn-NR", "Attn-NR-CV",
     "Multi-Head", "MH-NR",
     "MultiField", "MF-Balanced",
@@ -1373,6 +1374,9 @@ def run_dataset(
         )
         hybrid_scores["Gated-Swish-B2"] = log_odds_conjunction(
             gated_input, gating="swish", gating_beta=2.0,
+        )
+        hybrid_scores["Gated-Softplus"] = log_odds_conjunction(
+            gated_input, gating="softplus",
         )
 
         for method_name, scores in hybrid_scores.items():
@@ -1801,7 +1805,7 @@ def run_dataset(
 CALIBRATION_METHODS = [
     "Bayesian-OR", "Bayesian-LO-BR", "Bayesian-Balanced",
     "Balanced-Mix", "Balanced-Elbow",
-    "Gated-ReLU", "Gated-Swish", "Gated-GELU", "Gated-Swish-B2",
+    "Gated-ReLU", "Gated-Swish", "Gated-GELU", "Gated-Swish-B2", "Gated-Softplus",
     "Attention",
     "Multi-Head", "MH-NR",
     "MultiField", "MF-Balanced",

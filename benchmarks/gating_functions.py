@@ -4,11 +4,11 @@
 # Copyright (c) 2023-2026 Cognica, Inc.
 #
 
-"""Benchmark: Sparse signal gating functions (Paper 2, Theorems 6.5-6.8).
+"""Benchmark: Sparse signal gating functions (Paper 2, Theorems 6.5-6.8, Remark 6.5.4).
 
 Evaluates the impact of gating functions on fusion quality:
 
-  1. Gating comparison: none vs relu vs swish vs gelu across noise levels
+  1. Gating comparison: none vs relu vs swish vs gelu vs softplus across noise levels
   2. Generalized swish: beta sensitivity analysis
   3. Fusion quality: BCE and MSE under heterogeneous signal quality
   4. Timing: overhead of gating in log_odds_conjunction
@@ -73,7 +73,7 @@ def run_gating_comparison(rng: np.random.Generator) -> dict:
         ([0.5, 2.0, 3.0], "One reliable, two noisy"),
         ([0.5, 3.0, 5.0], "One reliable, two very noisy"),
     ]
-    gating_modes = ["none", "relu", "swish", "gelu"]
+    gating_modes = ["none", "relu", "swish", "gelu", "softplus"]
     n_docs = 5000
 
     results = []
@@ -172,7 +172,7 @@ def run_timing(rng: np.random.Generator) -> dict:
     noise_levels = [0.5, 1.0, 2.0]
     _, probs = generate_signals(n_docs, noise_levels, rng)
 
-    gating_modes = ["none", "relu", "swish", "gelu"]
+    gating_modes = ["none", "relu", "swish", "gelu", "softplus"]
     n_repeats = 100
 
     results = []

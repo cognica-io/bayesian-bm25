@@ -126,7 +126,7 @@ def _apply_gating(
     logits : array
         Log-odds values to gate.
     gating : str
-        Gating function: "none", "relu", "swish", or "gelu".
+        Gating function: "none", "relu", "swish", "gelu", or "softplus".
 
         - "relu": MAP estimate under sparse prior (Theorem 6.5.3).
           Zeroes out weak/negative evidence: max(0, logit).
@@ -137,11 +137,21 @@ def _apply_gating(
           (Theorem 6.8.1, Proposition 6.8.2).  Approximated as
           logit * sigmoid(1.702 * logit), which matches Swish_1.702.
           The ``beta`` parameter is ignored for gelu.
+        - "softplus": Smooth ReLU that preserves all evidence
+          (Remark 6.5.4).  Computes log(1 + exp(beta * logit)) / beta.
+          Unlike ReLU, never zeroes out evidence entirely, making it
+          suitable for small datasets where discarding any signal is
+          costly.  beta=1.0 is the standard softplus; beta -> inf
+          approaches ReLU.  Because softplus(x) > x for all finite x,
+          it inflates all logits (both positive and negative), producing
+          higher fused probabilities than other gating modes.  Consider
+          using a lower ``alpha`` to compensate for the increased
+          confidence when needed.
     beta : float
-        Generalized swish parameter (Theorem 6.7.6).  Controls the
-        sharpness of the swish gate.  beta=1.0 is the standard swish,
-        beta -> 0 approaches x/2, and beta -> inf approaches ReLU.
-        Ignored when gating is "gelu".
+        Sharpness parameter for swish and softplus gating.  Controls
+        the transition sharpness: beta=1.0 gives the standard form,
+        beta -> inf approaches ReLU.  For swish, beta -> 0 approaches
+        x/2 (Theorem 6.7.6).  Ignored when gating is "gelu".
     """
     if gating == "none":
         return logits
@@ -151,8 +161,11 @@ def _apply_gating(
         return logits * sigmoid(beta * logits)
     if gating == "gelu":
         return logits * sigmoid(1.702 * logits)
+    if gating == "softplus":
+        return np.logaddexp(0.0, beta * logits) / beta
     raise ValueError(
-        f"gating must be 'none', 'relu', 'swish', or 'gelu', got {gating!r}"
+        f"gating must be 'none', 'relu', 'swish', 'gelu', or 'softplus', "
+        f"got {gating!r}"
     )
 
 
@@ -206,9 +219,14 @@ def log_odds_conjunction(
           logit * sigmoid(beta * logit).
         - ``"gelu"``: Bayesian expected signal under Gaussian noise model
           (Theorem 6.8.1): logit * sigmoid(1.702 * logit).
+        - ``"softplus"``: smooth ReLU preserving all evidence
+          (Remark 6.5.4): log(1 + exp(beta * logit)) / beta.
+          Inflates all logits (softplus(x) > x), so consider a lower
+          ``alpha`` to temper the increased confidence.
     gating_beta : float
-        Generalized swish parameter (Theorem 6.7.6).  Only used when
-        ``gating="swish"``.  Default 1.0 preserves existing behavior.
+        Sharpness parameter for swish and softplus gating.  Only used
+        when ``gating="swish"`` or ``gating="softplus"``.  Default 1.0
+        preserves existing behavior.
 
     Returns
     -------

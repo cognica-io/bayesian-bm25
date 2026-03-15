@@ -2,8 +2,8 @@ cff-version: 1.2.0
 title: "Bayesian BM25"
 message: "If you use this software, please cite the following papers."
 type: software
-version: 0.9.0
-date-released: "2026-03-14"
+version: 0.10.0
+date-released: "2026-03-15"
 license: Apache-2.0
 repository-code: "https://github.com/cognica-io/bayesian-bm25"
 authors:

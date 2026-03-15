@@ -11,9 +11,10 @@ many false positives), gating functions suppress weak/noisy evidence
 before fusion. This prevents noisy signals from diluting strong ones.
 
 This example shows:
-  1. Gating comparison: none vs relu vs swish vs gelu on mixed signals
+  1. Gating comparison: none vs relu vs swish vs gelu vs softplus on mixed signals
   2. Generalized swish: beta controls the gate sharpness
   3. Practical scenario: filtering unreliable signals in hybrid search
+  4. Softplus for small datasets: preserving all evidence
 """
 
 import numpy as np
@@ -29,7 +30,7 @@ print("=== Gating comparison on mixed signals ===\n")
 signals = np.array([0.9, 0.3, 0.7])
 print(f"  Signals: {signals}  (strong=0.9, weak=0.3, moderate=0.7)\n")
 
-gating_modes = ["none", "relu", "swish", "gelu"]
+gating_modes = ["none", "relu", "swish", "gelu", "softplus"]
 
 print(f"  {'Gating':<8}  {'Combined':>10}")
 print(f"  {'-'*8}  {'-'*10}")
@@ -113,11 +114,11 @@ for doc, sigs in zip(documents, doc_signals):
     print(f"  {doc:<45} {sigs[0]:5.2f} {sigs[1]:5.2f} {sigs[2]:5.2f}")
 
 # Rank with different gating strategies
-print(f"\n  {'Document':<45} {'none':>8} {'swish':>8} {'gelu':>8}")
-print(f"  {'-'*45} {'-'*8} {'-'*8} {'-'*8}")
+print(f"\n  {'Document':<45} {'none':>8} {'swish':>8} {'gelu':>8} {'softplus':>8}")
+print(f"  {'-'*45} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
 
 results = {}
-for mode in ["none", "swish", "gelu"]:
+for mode in ["none", "swish", "gelu", "softplus"]:
     results[mode] = log_odds_conjunction(doc_signals, gating=mode)
 
 for i, doc in enumerate(documents):
@@ -125,25 +126,32 @@ for i, doc in enumerate(documents):
         f"  {doc:<45} "
         f"{results['none'][i]:8.4f} "
         f"{results['swish'][i]:8.4f} "
-        f"{results['gelu'][i]:8.4f}"
+        f"{results['gelu'][i]:8.4f} "
+        f"{results['softplus'][i]:8.4f}"
     )
 
 # Show rankings
 print("\n  Rankings (best to worst):")
-print(f"  {'Rank':>4}  {'No gating':<45} {'Swish gating':<45} {'GELU gating'}")
-rank_none  = np.argsort(-results["none"])
-rank_swish = np.argsort(-results["swish"])
-rank_gelu  = np.argsort(-results["gelu"])
+print(
+    f"  {'Rank':>4}  {'No gating':<40} {'Swish':<40} "
+    f"{'GELU':<40} {'Softplus'}"
+)
+rank_none     = np.argsort(-results["none"])
+rank_swish    = np.argsort(-results["swish"])
+rank_gelu     = np.argsort(-results["gelu"])
+rank_softplus = np.argsort(-results["softplus"])
 
 for rank in range(len(documents)):
     i_n = rank_none[rank]
     i_s = rank_swish[rank]
     i_g = rank_gelu[rank]
+    i_sp = rank_softplus[rank]
     print(
         f"  {rank+1:4d}. "
-        f"{documents[i_n]:<45} "
-        f"{documents[i_s]:<45} "
-        f"{documents[i_g]}"
+        f"{documents[i_n]:<40} "
+        f"{documents[i_s]:<40} "
+        f"{documents[i_g]:<40} "
+        f"{documents[i_sp]}"
     )
 
 print("\n  Note: without gating, noisy metadata false negatives (docs 1, 2)")
@@ -163,8 +171,8 @@ batch_signals = np.array([
     [0.60, 0.10, 0.55],   # mixed: two above, one far below
 ])
 
-print(f"  {'Signals':<25} {'none':>8} {'relu':>8} {'swish':>8} {'gelu':>8}")
-print(f"  {'-'*25} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+print(f"  {'Signals':<25} {'none':>8} {'relu':>8} {'swish':>8} {'gelu':>8} {'softplus':>8}")
+print(f"  {'-'*25} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
 
 batch_results = {}
 for mode in gating_modes:
@@ -177,5 +185,33 @@ for i, sigs in enumerate(batch_signals):
         f"{batch_results['none'][i]:8.4f} "
         f"{batch_results['relu'][i]:8.4f} "
         f"{batch_results['swish'][i]:8.4f} "
-        f"{batch_results['gelu'][i]:8.4f}"
+        f"{batch_results['gelu'][i]:8.4f} "
+        f"{batch_results['softplus'][i]:8.4f}"
     )
+
+# ---------------------------------------------------------------
+# 5. Softplus for small datasets
+# ---------------------------------------------------------------
+print("\n=== Softplus for small datasets ===\n")
+
+print("  Softplus never zeroes evidence (softplus(x) > 0 for all x),")
+print("  and inflates all logits (softplus(x) > x for all finite x).")
+print("  Use with lower alpha to temper the increased confidence.\n")
+
+small_signals = np.array([0.9, 0.3])
+print(f"  Signals: {small_signals}  (one strong, one weak)\n")
+
+print(f"  {'Gating':<10}  {'Combined':>10}")
+print(f"  {'-'*10}  {'-'*10}")
+for mode in gating_modes:
+    result = log_odds_conjunction(small_signals, gating=mode)
+    print(f"  {mode:<10}  {result:10.4f}")
+
+# Compensate with lower alpha
+print(f"\n  Softplus + lower alpha to compensate:")
+print(f"  {'Alpha':>8}  {'Combined':>10}")
+print(f"  {'-'*8}  {'-'*10}")
+for alpha in [0.5, 0.3, 0.1, 0.0]:
+    result = log_odds_conjunction(small_signals, gating="softplus", alpha=alpha)
+    note = " (default)" if alpha == 0.5 else ""
+    print(f"  {alpha:8.1f}  {result:10.4f}{note}")

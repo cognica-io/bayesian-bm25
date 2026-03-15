@@ -13,7 +13,7 @@ Key capabilities:
 - **Score-to-probability transform** — convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
 - **Base rate calibration** — corpus-level base rate prior estimated from score distribution (95th percentile, mixture model, or elbow detection) decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68–77% without relevance labels
 - **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
-- **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling, optional per-signal reliability weights (Log-OP), and sparse signal gating (ReLU/Swish/GELU activations from Paper 2, Theorems 6.5.3/6.7.4/6.8.1) with generalized swish beta control (Theorem 6.7.6)
+- **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling, optional per-signal reliability weights (Log-OP), and sparse signal gating (ReLU/Swish/GELU/Softplus activations from Paper 2, Theorems 6.5.3/6.7.4/6.8.1/Remark 6.5.4) with generalized beta control (Theorem 6.7.6)
 - **Learnable fusion weights** — `LearnableLogOddsWeights` learns per-signal reliability from labeled data via a Hebbian gradient that is backprop-free, starting from Naive Bayes uniform initialization (Remark 5.3.2); supports optional `base_rate` additive bias in log-odds space
 - **Attention-based fusion** — `AttentionLogOddsWeights` learns query-dependent signal weights via attention mechanism (Paper 2, Section 8), with exact attention pruning via `compute_upper_bounds()` and `prune()` (Theorem 8.7.1); supports optional `base_rate`
 - **Multi-head attention** — `MultiHeadAttentionLogOddsWeights` creates multiple independent attention heads with different initializations and averages their log-odds for more robust fusion (Remark 8.6, Corollary 8.7.2)
@@ -135,14 +135,19 @@ fused = log_odds_conjunction(stacked, weights=np.array([0.6, 0.4]))
 # Fuse with weights and confidence scaling (alpha + weights compose)
 fused = log_odds_conjunction(stacked, alpha=0.5, weights=np.array([0.6, 0.4]))
 
-# Gated fusion: ReLU/Swish/GELU activation in logit space (Paper 2, Theorems 6.5-6.8)
-fused_relu = log_odds_conjunction(stacked, gating="relu")     # MAP estimation
-fused_swish = log_odds_conjunction(stacked, gating="swish")   # Bayes estimation
-fused_gelu = log_odds_conjunction(stacked, gating="gelu")     # Gaussian noise model
+# Gated fusion: ReLU/Swish/GELU/Softplus activation in logit space (Paper 2, Theorems 6.5-6.8)
+fused_relu = log_odds_conjunction(stacked, gating="relu")         # MAP estimation
+fused_swish = log_odds_conjunction(stacked, gating="swish")       # Bayes estimation
+fused_gelu = log_odds_conjunction(stacked, gating="gelu")         # Gaussian noise model
+fused_softplus = log_odds_conjunction(stacked, gating="softplus") # evidence-preserving
 
-# Generalized swish: beta controls gate sharpness (Theorem 6.7.6)
-# beta -> 0: x/2 (maximum ignorance), beta=1: standard swish, beta -> inf: ReLU
+# Generalized beta controls gate sharpness (Theorem 6.7.6)
+# beta -> 0: x/2 (maximum ignorance), beta=1: standard form, beta -> inf: ReLU
 fused_soft = log_odds_conjunction(stacked, gating="swish", gating_beta=0.5)
+
+# Softplus for small datasets: preserves all evidence (Remark 6.5.4)
+# softplus(x) > x for all finite x, so consider lower alpha to compensate
+fused_sp = log_odds_conjunction(stacked, gating="softplus", gating_beta=2.0)
 ```
 
 ### Learning Fusion Weights from Data
@@ -496,6 +501,7 @@ All methods above are zero-shot (no relevance labels required). With `--tune`, a
 | Gated-Swish | `log_odds_conjunction` with Swish gating in logit space (Paper 2, Theorem 6.7.4) |
 | Gated-GELU | `log_odds_conjunction` with GELU gating (Paper 2, Theorem 6.8.1): `logit * sigmoid(1.702 * logit)` |
 | Gated-Swish-B2 | Generalized swish with `gating_beta=2.0` (Paper 2, Theorem 6.7.6) |
+| Gated-Softplus | `log_odds_conjunction` with softplus gating (Remark 6.5.4): `log(1 + exp(logit)) / 1`, evidence-preserving smooth ReLU for small datasets |
 | Attention | Query-dependent signal weighting via `AttentionLogOddsWeights` (Paper 2, Section 8) |
 | **Attn-NR** | Attention with per-signal logit normalization (`normalize=True`) and 7 features (sparse + dense + cross-signal) |
 | Attn-NR-CV | Attn-NR with 5-fold cross-validation (train/test split per query) |
@@ -510,12 +516,12 @@ All methods above are zero-shot (no relevance labels required). With `--tune`, a
 **Why include underperforming methods?** The tables above deliberately include methods that underperform BM25. Each failure mode is informative:
 
 - **Bayesian-OR** (NDCG@10 avg 28.38) — Probabilistic OR assumes signal independence and catastrophically fails on ArguAna (0.06%). This demonstrates *why* the log-odds conjunction framework (Paper 2, Section 4) is needed: naive probability combination without logit-space calibration collapses when signal distributions differ.
-- **Gated-ReLU / Gated-Swish / Gated-GELU / Gated-Swish-B2** (36.24 / 35.54 / 36.18 / 36.19) — Sparse gating (Paper 2, Theorems 6.5.3 / 6.7.4 / 6.8.1 / 6.7.6) is too aggressive for the BEIR hybrid fusion task. ReLU zeros out negative logits entirely, discarding useful weak signals; Swish, GELU, and generalized Swish soften the gate but still suppress too much. These gates are designed for high-dimensional signal spaces where most inputs are noise — in a two-signal (sparse + dense) setting, there is no noise to suppress.
+- **Gated-ReLU / Gated-Swish / Gated-GELU / Gated-Swish-B2 / Gated-Softplus** — Sparse gating (Paper 2, Theorems 6.5.3 / 6.7.4 / 6.8.1 / 6.7.6 / Remark 6.5.4) is too aggressive for the BEIR hybrid fusion task. ReLU zeros out negative logits entirely, discarding useful weak signals; Swish, GELU, and generalized Swish soften the gate but still suppress too much. Softplus preserves all evidence but inflates logits, which is better suited for small datasets with many signals rather than a two-signal setting. These gates are designed for high-dimensional signal spaces where most inputs are noise — in a two-signal (sparse + dense) setting, there is no noise to suppress.
 - **MultiField** (28.58 over 4 datasets) — Sparse-only multi-field search loses to concatenated BM25 because field separation fragments term statistics (smaller per-field document frequency, shorter effective document lengths). However, **MF-Balanced** (40.17) recovers most of the gap by fusing with dense embeddings, confirming that field-level BM25 signals are complementary to dense vectors even when they are individually weaker.
 
 Reproduce:
 ```bash
-# Zero-shot (22 methods)
+# Zero-shot (23 methods)
 python benchmarks/hybrid_beir.py -d <beir-data-dir>
 
 # With tuning (auto-estimation + supervised learning + grid search)
@@ -584,7 +590,7 @@ Additional benchmarks (no external datasets required):
 - `python benchmarks/learnable_weights.py` — learnable weight recovery, fusion quality, online convergence, and timing
 - `python benchmarks/weighted_fusion.py` — weighted vs uniform log-odds fusion across noise scenarios
 - `python benchmarks/wand_upper_bound.py` — WAND upper bound tightness and skip rate analysis
-- `python benchmarks/gating_functions.py` — gating comparison (none/relu/swish/gelu), beta sensitivity, timing overhead
+- `python benchmarks/gating_functions.py` — gating comparison (none/relu/swish/gelu/softplus), beta sensitivity, timing overhead
 - `python benchmarks/bmw_upper_bound.py` — BMW block-max vs global WAND tightness, pruning rate, block size sensitivity
 - `python benchmarks/neural_calibration.py` — Platt vs isotonic calibration accuracy, hybrid fusion quality, timing
 - `python benchmarks/multi_head_attention.py` — multi-head vs single-head quality, pruning safety/efficiency, head diversity
