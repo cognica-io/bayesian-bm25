@@ -162,8 +162,8 @@
     probs,          <span class="cm"># ndarray &mdash; probabilities, last axis = signals</span>
     alpha=<span class="kw">None</span>,     <span class="cm"># float or "auto" &mdash; confidence scaling (None=auto)</span>
     weights=<span class="kw">None</span>,   <span class="cm"># ndarray &mdash; per-signal weights (sum to 1)</span>
-    gating=<span class="st">"none"</span>,  <span class="cm"># "none", "relu", "swish", or "gelu"</span>
-    gating_beta=<span class="mi">1.0</span>,  <span class="cm"># generalized swish sharpness (swish only)</span>
+    gating=<span class="st">"none"</span>,  <span class="cm"># "none", "relu", "swish", "gelu", or "softplus"</span>
+    gating_beta=<span class="mi">1.0</span>,  <span class="cm"># sharpness for swish/softplus gating</span>
 )</code></pre>
   <table>
     <thead><tr><th>Parameter</th><th>Description</th></tr></thead>
@@ -173,7 +173,8 @@
       <tr><td><code>gating="relu"</code></td><td>MAP estimation: zeroes negative logits (Paper 2, Theorem 6.5.3).</td></tr>
       <tr><td><code>gating="swish"</code></td><td>Bayes estimation: soft suppression of negative logits (Paper 2, Theorem 6.7.4).</td></tr>
       <tr><td><code>gating="gelu"</code></td><td>Gaussian noise model: logit * sigmoid(1.702 * logit) (Paper 2, Theorem 6.8.1).</td></tr>
-      <tr><td><code>gating_beta</code></td><td>Generalized swish sharpness. Only used with gating="swish". Default 1.0 (Theorem 6.7.6).</td></tr>
+      <tr><td><code>gating="softplus"</code></td><td>Evidence-preserving smooth ReLU: log(1 + exp(beta * logit)) / beta. Never zeroes evidence; suitable for small datasets (Remark 6.5.4). softplus(x) &gt; x for all finite x, so consider lower alpha.</td></tr>
+      <tr><td><code>gating_beta</code></td><td>Sharpness for swish and softplus gating. Default 1.0. beta &rarr; &infin; approaches ReLU (Theorem 6.7.6).</td></tr>
     </tbody>
   </table>
 

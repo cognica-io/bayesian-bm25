@@ -175,7 +175,7 @@ graph LR
     <div class="card">
       <h3>Probabilistic Fusion</h3>
       <p>Log-odds conjunction, probabilistic AND/OR/NOT, per-signal weights,
-        sparse gating (ReLU/Swish/GELU), multi-head attention, and neural score calibration.</p>
+        sparse gating (ReLU/Swish/GELU/Softplus), multi-head attention, and neural score calibration.</p>
     </div>
     <div class="card">
       <h3>WAND Pruning</h3>
@@ -261,6 +261,10 @@ graph LR
     ($\text{logit} \cdot \sigma(1.702 \cdot \text{logit})$, Gaussian noise model)
     suppress noisy negative-logit signals before aggregation
     (Paper 2, Theorems 6.5.3/6.7.4/6.8.1).
+    <strong>Softplus gating</strong>
+    ($\log(1 + e^{\beta \cdot \text{logit}}) / \beta$, Remark 6.5.4)
+    is a smooth ReLU that never zeroes out evidence, making it suitable for
+    small datasets where discarding any signal is costly.
     The generalized Swish gate
     $\text{logit} \cdot \sigma(\beta \cdot \text{logit})$
     interpolates between $x/2$ ($\beta \to 0$), standard Swish ($\beta = 1$),
@@ -339,7 +343,7 @@ graph LR
     in a fully zero-shot setting with no relevance labels.
     MH-NR (multi-head + normalize, +5.48) outperforms single-head Attention (+4.98).
     See the <a href="https://github.com/cognica-io/bayesian-bm25#benchmarks">full benchmark tables</a>
-    with 22 methods, MAP@10, and Recall@10.
+    with 23 methods, MAP@10, and Recall@10.
   </p>
 
   <h3>Probability Calibration</h3>
@@ -360,7 +364,7 @@ graph LR
   </p>
 
   <h4>Reproduce</h4>
-<pre><code><span class="cm"># Zero-shot (22 methods)</span>
+<pre><code><span class="cm"># Zero-shot (23 methods)</span>
 python benchmarks/hybrid_beir.py -d &lt;beir-data-dir&gt;
 
 <span class="cm"># With tuning (supervised + grid search)</span>

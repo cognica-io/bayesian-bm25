@@ -165,9 +165,10 @@ fused = log_odds_conjunction(stacked, alpha=<span class="mi">0.5</span>, weights
 <span class="cm"># Gated fusion: ReLU/Swish activation in logit space</span>
 fused_relu = log_odds_conjunction(stacked, gating=<span class="st">"relu"</span>)    <span class="cm"># MAP estimation</span>
 fused_swish = log_odds_conjunction(stacked, gating=<span class="st">"swish"</span>)  <span class="cm"># Bayes estimation</span>
-fused_gelu = log_odds_conjunction(stacked, gating=<span class="st">"gelu"</span>)     <span class="cm"># Gaussian noise model</span>
+fused_gelu = log_odds_conjunction(stacked, gating=<span class="st">"gelu"</span>)         <span class="cm"># Gaussian noise model</span>
+fused_softplus = log_odds_conjunction(stacked, gating=<span class="st">"softplus"</span>) <span class="cm"># evidence-preserving</span>
 
-<span class="cm"># Generalized swish: beta controls gate sharpness (Theorem 6.7.6)</span>
+<span class="cm"># Generalized beta controls gate sharpness (Theorem 6.7.6)</span>
 fused_soft = log_odds_conjunction(stacked, gating=<span class="st">"swish"</span>, gating_beta=<span class="mi">0.5</span>)</code></pre>
 </section>
 
@@ -251,7 +252,7 @@ surviving_idx, fused_probs = mh.prune(
 <!-- ============ Gating Functions ============ -->
 <section id="gating">
   <h2>Gating Functions</h2>
-  <p>GELU gating and generalized Swish for noisy multi-signal fusion.</p>
+  <p>GELU, Softplus, and generalized Swish gating for noisy multi-signal fusion.</p>
 
   <span class="example-tag tag-python">Python</span>
 <pre><code><span class="kw">import</span> numpy <span class="kw">as</span> np
@@ -264,6 +265,7 @@ none  = log_odds_conjunction(signals, gating=<span class="st">"none"</span>)   <
 relu  = log_odds_conjunction(signals, gating=<span class="st">"relu"</span>)   <span class="cm"># MAP estimation</span>
 swish = log_odds_conjunction(signals, gating=<span class="st">"swish"</span>)  <span class="cm"># Bayes estimation</span>
 gelu  = log_odds_conjunction(signals, gating=<span class="st">"gelu"</span>)   <span class="cm"># Gaussian noise model</span>
+sp    = log_odds_conjunction(signals, gating=<span class="st">"softplus"</span>)<span class="cm"># evidence-preserving</span>
 
 <span class="cm"># Generalized swish: beta controls gate sharpness</span>
 <span class="cm"># beta -> 0: x/2 (soft), beta = 1: standard swish, beta -> inf: ReLU</span>
@@ -271,7 +273,11 @@ soft = log_odds_conjunction(signals, gating=<span class="st">"swish"</span>, gat
 hard = log_odds_conjunction(signals, gating=<span class="st">"swish"</span>, gating_beta=<span class="mi">5.0</span>)
 
 <span class="cm"># GELU = Swish with beta=1.702</span>
-gelu_equiv = log_odds_conjunction(signals, gating=<span class="st">"swish"</span>, gating_beta=<span class="mi">1.702</span>)</code></pre>
+gelu_equiv = log_odds_conjunction(signals, gating=<span class="st">"swish"</span>, gating_beta=<span class="mi">1.702</span>)
+
+<span class="cm"># Softplus for small datasets: preserves all evidence (Remark 6.5.4)</span>
+<span class="cm"># softplus(x) > x for all finite x, so use lower alpha to compensate</span>
+sp_gentle = log_odds_conjunction(signals, gating=<span class="st">"softplus"</span>, alpha=<span class="mi">0.3</span>)</code></pre>
 </section>
 
 <!-- ============ Neural Calibration ============ -->
@@ -458,7 +464,7 @@ transform.fit(scores, labels, mode=<span class="st">"prior_free"</span>)</code><
       <tr><td><code>threshold_filtering.py</code></td><td>Probability-based filtering workflows</td></tr>
       <tr><td><code>boolean_not.py</code></td><td>Exclusion queries ("python AND NOT java")</td></tr>
       <tr><td><code>fusion_debugger.py</code></td><td>12 examples of pipeline debugging and tracing</td></tr>
-      <tr><td><code>gating_functions.py</code></td><td>GELU gating, generalized swish beta, noise filtering</td></tr>
+      <tr><td><code>gating_functions.py</code></td><td>GELU/Softplus gating, generalized beta, noise filtering, small dataset demo</td></tr>
       <tr><td><code>neural_calibration.py</code></td><td>Platt and isotonic calibration for neural rerankers</td></tr>
       <tr><td><code>temporal_adaptation.py</code></td><td>Concept drift detection and half-life tuning</td></tr>
       <tr><td><code>multi_head_fusion.py</code></td><td>Multi-head attention fusion with pruning</td></tr>
