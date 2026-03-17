@@ -77,6 +77,13 @@ class VectorSignalTrace:
     # Logit-space
     logit_probability: float
 
+    # Calibrated vector fields (optional, backward compatible)
+    distance: float | None = None
+    f_R: float | None = None
+    f_G: float | None = None
+    log_density_ratio: float | None = None
+    calibration_method: str | None = None
+
 
 @dataclass
 class NotTrace:
@@ -220,6 +227,61 @@ class FusionDebugger:
             cosine_score=cosine_score,
             probability=prob_val,
             logit_probability=logit_val,
+        )
+
+    def trace_calibrated_vector(
+        self,
+        distance: float,
+        probability: float,
+        *,
+        f_R: float | None = None,
+        calibration_method: str | None = None,
+        calibrator: object | None = None,
+    ) -> VectorSignalTrace:
+        """Trace a calibrated vector distance through the probability pipeline.
+
+        Parameters
+        ----------
+        distance : float
+            Vector distance/similarity value.
+        probability : float
+            Pre-computed calibrated probability from VectorProbabilityTransform.
+        f_R : float or None
+            Relevant-document density at the distance.
+        calibration_method : str or None
+            Method used for calibration (e.g., "kde", "gmm", "auto").
+        calibrator : VectorProbabilityTransform or None
+            If provided, f_G and log_density_ratio are computed from
+            the calibrator's background parameters.
+        """
+        f_G = None
+        log_ratio_val = None
+
+        if calibrator is not None:
+            from bayesian_bm25.vector_probability import _gaussian_pdf
+            mu_G = getattr(calibrator, "mu_G", None)
+            sigma_G = getattr(calibrator, "sigma_G", None)
+            if mu_G is not None and sigma_G is not None:
+                f_G = float(_gaussian_pdf(distance, mu_G, sigma_G))
+                if f_R is not None:
+                    from bayesian_bm25.probability import _EPSILON
+                    f_R_safe = max(f_R, _EPSILON)
+                    f_G_safe = max(f_G, _EPSILON)
+                    log_ratio_val = float(
+                        np.log(f_R_safe / f_G_safe)
+                    )
+
+        logit_val = float(logit(probability))
+
+        return VectorSignalTrace(
+            cosine_score=distance,
+            probability=probability,
+            logit_probability=logit_val,
+            distance=distance,
+            f_R=f_R,
+            f_G=f_G,
+            log_density_ratio=log_ratio_val,
+            calibration_method=calibration_method,
         )
 
     def trace_not(

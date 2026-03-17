@@ -37,11 +37,14 @@ __all__ = [
     "CalibrationReport",
     "LearnableLogOddsWeights",
     "MultiHeadAttentionLogOddsWeights",
+    "VectorProbabilityTransform",
     "balanced_log_odds_fusion",
     "brier_score",
     "calibration_report",
     "cosine_to_probability",
     "expected_calibration_error",
+    "ivf_density_prior",
+    "knn_density_prior",
     "log_odds_conjunction",
     "prob_and",
     "prob_not",
@@ -75,4 +78,13 @@ def __getattr__(name: str):
     if name == "TemporalBayesianTransform":
         from bayesian_bm25.probability import TemporalBayesianTransform
         return TemporalBayesianTransform
+    if name == "VectorProbabilityTransform":
+        from bayesian_bm25.vector_probability import VectorProbabilityTransform
+        return VectorProbabilityTransform
+    if name == "ivf_density_prior":
+        from bayesian_bm25.vector_probability import ivf_density_prior
+        return ivf_density_prior
+    if name == "knn_density_prior":
+        from bayesian_bm25.vector_probability import knn_density_prior
+        return knn_density_prior
     raise AttributeError(f"module 'bayesian_bm25' has no attribute {name!r}")

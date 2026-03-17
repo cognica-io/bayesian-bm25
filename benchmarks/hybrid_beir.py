@@ -15,32 +15,38 @@ EnglishAnalyzer with Porter stemmer).
 
 Methods compared:
 
-  1. BM25             -- Sparse retrieval via bm25s
-  2. Dense            -- Cosine similarity via sentence-transformers
-  3. Convex           -- w * dense_norm + (1-w) * bm25_norm, w=0.5
-  4. RRF              -- sum(1/(k + rank_i)), k=60
-  5. Bayesian-OR      -- Bayesian BM25 probs + probabilistic OR
-  6. Bayesian-LogOdds -- Per-query calibrated log-odds fusion
-  7. Balanced-Mix     -- balanced fusion with mixture base_rate estimation
-  8. Balanced-Elbow   -- balanced fusion with elbow base_rate estimation
-  9. Gated-ReLU       -- log-odds conjunction with ReLU gating (Theorem 6.5.3)
- 10. Gated-Swish      -- log-odds conjunction with Swish gating (Theorem 6.7.4)
- 11. Gated-GELU       -- log-odds conjunction with GELU gating (Theorem 6.8.1)
- 12. Gated-Swish-B2   -- generalized swish with beta=2.0 (Theorem 6.7.6)
- 13. Gated-Softplus   -- softplus gating, evidence-preserving (Remark 6.5.4)
- 14. Attention        -- query-dependent attention weights (Paper 2, Section 8)
- 15. Attn-NR          -- Attention + logit normalization + 7 features (dense+cross)
- 16. Attn-NR-CV       -- 5-fold cross-validated Attn-NR
- 17. Multi-Head       -- 4-head attention fusion (Remark 8.6)
- 18. MH-NR            -- Multi-head + normalize + rich features (Corollary 8.7.2)
- 19. MultiField       -- MultiFieldScorer (title + body), sparse-only
- 20. MF-Balanced      -- MultiField probs + dense via balanced_log_odds_fusion
+  1. BM25                       -- sparse retrieval via bm25s
+  2. Dense                      -- cosine similarity via sentence-transformers
+  3. Convex                     -- w * dense_norm + (1-w) * bm25_norm, w=0.5
+  4. RRF                        -- sum(1/(k + rank_i)), k=60
+  5. Bayesian-OR                -- probabilistic OR fusion
+  6. Bayesian-LogOdds           -- per-query calibrated log-odds fusion
+  7. Bayesian-LogOdds-Local     -- symmetric log-odds, locally calibrated
+  8. Bayesian-LogOdds-BR        -- log-odds fusion with base rate prior
+  9. Bayesian-Balanced          -- balanced log-odds (percentile base rate)
+ 10. Bayesian-Balanced-Mix      -- balanced fusion (mixture base rate)
+ 11. Bayesian-Balanced-Elbow    -- balanced fusion (elbow base rate)
+ 12. Bayesian-Gated-ReLU        -- gated log-odds, ReLU
+ 13. Bayesian-Gated-Swish       -- gated log-odds, Swish
+ 14. Bayesian-Gated-GELU        -- gated log-odds, GELU
+ 15. Bayesian-Gated-Swish-B2    -- gated log-odds, Swish beta=2.0
+ 16. Bayesian-Gated-Softplus    -- gated log-odds, softplus
+ 17. Bayesian-Attention         -- query-dependent attention weights
+ 18. Bayesian-Attn-Norm         -- attention + logit normalization + 7 features
+ 19. Bayesian-Attn-Norm-CV      -- 5-fold cross-validated Attn-Norm
+ 20. Bayesian-MultiHead         -- 4-head attention fusion
+ 21. Bayesian-MultiHead-Norm    -- MultiHead + normalize + rich features
+ 22. Bayesian-MultiField        -- MultiFieldScorer (title + body), sparse-only
+ 23. Bayesian-MultiField-Bal    -- MultiField + dense via balanced fusion
+ 24. Bayesian-Vector-Balanced   -- VPT-calibrated dense + balanced fusion
+ 25. Bayesian-Vector-Softplus   -- VPT-calibrated dense + softplus gating
+ 26. Bayesian-Vector-Attn       -- VPT-calibrated dense + attention fusion
 
 With --tune, additional tuned methods are evaluated:
 
- 21. Bayesian-Tuned     -- BayesianBM25 with tuned alpha, beta, base_rate
- 22. Balanced-Tuned     -- balanced_log_odds_fusion with tuned weight
- 23. Hybrid-AND-Tuned   -- log-odds conjunction with tuned alpha
+ 27. Bayesian-Tuned             -- tuned alpha, beta, base_rate
+ 28. Bayesian-Balanced-Tuned    -- balanced fusion with tuned weight
+ 29. Bayesian-Hybrid-AND-Tuned  -- log-odds conjunction with tuned alpha
 
 Dependencies:
     pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5
@@ -80,9 +86,11 @@ from bayesian_bm25.metrics import calibration_report
 from bayesian_bm25.multi_field import MultiFieldScorer
 from bayesian_bm25.probability import (
     BayesianProbabilityTransform,
+    _clamp_probability,
     logit,
 )
 from bayesian_bm25.scorer import BayesianBM25Scorer
+from bayesian_bm25.vector_probability import VectorProbabilityTransform
 
 STEMMER = Stemmer.Stemmer("english")
 
@@ -393,6 +401,11 @@ def fusion_bayesian_bm25_logodds(
 
     Documents with only one signal active use single-signal logit
     (not penalized for missing the other).
+
+    Returns raw log-odds (not probabilities).  The sparse input has
+    already been through sigmoid in score_to_probability, so applying
+    sigmoid here would create a double sigmoid(logit(...)) round-trip
+    that accumulates numerical error.
     """
     n_signals = 2
     alpha = 0.5
@@ -426,8 +439,10 @@ def fusion_logodds_local(
 
     Instead of converting BM25 -> Bayesian BM25 probability -> logit (which
     saturates), calibrate raw BM25 scores the same way as dense:
-    logit = alpha*(s - median).
+    logit = alpha*(s - median).  Returns probabilities via sigmoid.
     """
+    from bayesian_bm25.probability import sigmoid as _sigmoid
+
     n_signals = 2
     alpha = 0.5
     scale = n_signals ** alpha
@@ -443,7 +458,8 @@ def fusion_logodds_local(
     scores_both = l_bar * scale
     scores_dense_only = logit_d * w_dense
 
-    return np.where(has_sparse, scores_both, scores_dense_only)
+    raw = np.where(has_sparse, scores_both, scores_dense_only)
+    return np.asarray(_sigmoid(raw), dtype=np.float64)
 
 
 def fusion_bayesian_bm25_logodds_br(
@@ -452,7 +468,12 @@ def fusion_bayesian_bm25_logodds_br(
     dense_median: float,
     dense_alpha: float,
 ) -> np.ndarray:
-    """Bayesian BM25 log-odds with base rate prior (dampens probability saturation)."""
+    """Bayesian BM25 log-odds with base rate prior.
+
+    Returns raw log-odds (not probabilities).  Same rationale as
+    fusion_bayesian_bm25_logodds: the sparse input has already been
+    through sigmoid, so a second sigmoid would accumulate error.
+    """
     n_signals = 2
     alpha = 0.5
     scale = n_signals ** alpha
@@ -491,6 +512,28 @@ def _compute_dense_calibration(dense_sim: np.ndarray) -> tuple[float, float]:
     std = float(np.std(positive))
     alpha_eff = 1.0 / std if std > 0 else 1.0
     return median, alpha_eff
+
+
+def fusion_vpt_balanced(
+    sparse_probs: np.ndarray,
+    vpt_dense_probs: np.ndarray,
+    weight: float = 0.5,
+) -> np.ndarray:
+    """Balanced log-odds fusion with VPT-calibrated dense probabilities.
+
+    Same pipeline as ``balanced_log_odds_fusion`` but accepts pre-calibrated
+    dense probabilities from ``VectorProbabilityTransform`` instead of raw
+    cosine similarities.
+    """
+    logit_sparse = np.asarray(
+        logit(_clamp_probability(sparse_probs)), dtype=np.float64,
+    )
+    logit_dense = np.asarray(
+        logit(_clamp_probability(vpt_dense_probs)), dtype=np.float64,
+    )
+    sparse_norm = _min_max_normalize(logit_sparse)
+    dense_norm = _min_max_normalize(logit_dense)
+    return weight * dense_norm + (1.0 - weight) * sparse_norm
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +868,7 @@ def _prepare_attn_probs(
     probs_br: np.ndarray,
     cand_dense: np.ndarray,
     probs_no_br: np.ndarray | None = None,
+    dense_probs_override: np.ndarray | None = None,
 ) -> tuple[np.ndarray, ...]:
     """Prepare raw probability signals for attention.
 
@@ -833,10 +877,16 @@ def _prepare_attn_probs(
 
     When probs_no_br is provided, returns 3 signals (BM25-BR, dense,
     BM25-no-BR).  Otherwise returns 2 signals.
+
+    When dense_probs_override is provided, it is used directly instead
+    of converting cand_dense via cosine_to_probability (for VPT).
     """
-    dense_probs = np.asarray(
-        cosine_to_probability(cand_dense), dtype=np.float64,
-    )
+    if dense_probs_override is not None:
+        dense_probs = np.asarray(dense_probs_override, dtype=np.float64)
+    else:
+        dense_probs = np.asarray(
+            cosine_to_probability(cand_dense), dtype=np.float64,
+        )
     if probs_no_br is not None:
         return probs_br, dense_probs, probs_no_br
     return probs_br, dense_probs
@@ -850,12 +900,15 @@ def _collect_attn_training_data(
     seed: int = 42,
     exclude_qids: set | None = None,
     n_signals: int = 2,
+    dense_probs_key: str | None = None,
 ) -> tuple[list, list, list, list]:
     """Collect (probs, labels, features, query_ids) for attention training.
 
     When exclude_qids is set, those queries are skipped (for CV).
     n_signals=3 includes BM25 probs without base rate as a third signal.
     Returns query_ids so fit() can normalize logits per-query when normalize=True.
+    When dense_probs_key is set, uses pre-computed dense probabilities
+    (e.g. VPT-calibrated) from that cache key instead of cosine_to_probability.
     """
     rng = np.random.default_rng(seed)
     train_probs: list[list[float]] = []
@@ -872,9 +925,11 @@ def _collect_attn_training_data(
 
         ui = cache["union_idx"]
         probs_no_br = cache.get("cand_probs") if n_signals == 3 else None
+        vpt_override = cache.get(dense_probs_key) if dense_probs_key else None
         signals = _prepare_attn_probs(
             cache["cand_probs_br"], cache["cand_dense"],
             probs_no_br=probs_no_br,
+            dense_probs_override=vpt_override,
         )
         feats = cache[feature_key]
 
@@ -911,6 +966,7 @@ def _score_attn_variant(
     feature_key: str,
     only_qids: set | None = None,
     n_signals: int = 2,
+    dense_probs_key: str | None = None,
 ) -> dict[str, dict[str, float]]:
     """Score queries with a trained attention model. Returns run dict."""
     run: dict[str, dict[str, float]] = {}
@@ -919,9 +975,11 @@ def _score_attn_variant(
             continue
         ui = cache["union_idx"]
         probs_no_br = cache.get("cand_probs") if n_signals == 3 else None
+        vpt_override = cache.get(dense_probs_key) if dense_probs_key else None
         signals = _prepare_attn_probs(
             cache["cand_probs_br"], cache["cand_dense"],
             probs_no_br=probs_no_br,
+            dense_probs_override=vpt_override,
         )
         feats = cache[feature_key]
         probs_matrix = np.column_stack(signals)
@@ -948,11 +1006,13 @@ def _train_and_score_attn(
     n_signals: int = 2,
     lr: float = 0.01,
     max_iter: int = 500,
+    dense_probs_key: str | None = None,
 ) -> bool:
     """Train one attention variant and populate its run. Returns success."""
     tp, tl, tf, tq = _collect_attn_training_data(
         attn_cache, corpus_ids, qrels, feature_key,
         n_signals=n_signals,
+        dense_probs_key=dense_probs_key,
     )
     n_train = len(tp)
     labels_arr = np.array(tl, dtype=np.float64)
@@ -984,6 +1044,7 @@ def _train_and_score_attn(
     runs[variant_name] = _score_attn_variant(
         model, attn_cache, corpus_ids, feature_key,
         n_signals=n_signals,
+        dense_probs_key=dense_probs_key,
     )
     print(f"  {variant_name} trained ({n_train} pairs)")
     return True
@@ -1004,8 +1065,8 @@ def _train_attn_cv(
     lr: float = 0.01,
     max_iter: int = 500,
 ) -> bool:
-    """Train Attn-NR-CV via k-fold cross-validation."""
-    variant_name = "Attn-NR-CV"
+    """Train Attn-Norm-CV via k-fold cross-validation."""
+    variant_name = "Bayesian-Attn-Norm-CV"
     cv_qids = [qid for qid in attn_cache if qrels.get(qid)]
     n_cv = len(cv_qids)
 
@@ -1082,16 +1143,19 @@ def _train_attn_cv(
 
 BASELINE_METHODS = [
     "BM25", "Dense", "Convex", "RRF",
-    "Bayesian-OR", "Bayesian-LogOdds", "LO-Local", "Bayesian-LO-BR", "Bayesian-Balanced",
-    "Balanced-Mix", "Balanced-Elbow",
-    "Gated-ReLU", "Gated-Swish", "Gated-GELU", "Gated-Swish-B2", "Gated-Softplus",
-    "Attention", "Attn-NR", "Attn-NR-CV",
-    "Multi-Head", "MH-NR",
-    "MultiField", "MF-Balanced",
+    "Bayesian-OR", "Bayesian-LogOdds", "Bayesian-LogOdds-Local",
+    "Bayesian-LogOdds-BR", "Bayesian-Balanced",
+    "Bayesian-Balanced-Mix", "Bayesian-Balanced-Elbow",
+    "Bayesian-Gated-ReLU", "Bayesian-Gated-Swish", "Bayesian-Gated-GELU",
+    "Bayesian-Gated-Swish-B2", "Bayesian-Gated-Softplus",
+    "Bayesian-Attention", "Bayesian-Attn-Norm", "Bayesian-Attn-Norm-CV",
+    "Bayesian-MultiHead", "Bayesian-MultiHead-Norm",
+    "Bayesian-MultiField", "Bayesian-MultiField-Bal",
+    "Bayesian-Vector-Balanced", "Bayesian-Vector-Softplus", "Bayesian-Vector-Attn",
 ]
 
 TUNED_METHODS = [
-    "Bayesian-Tuned", "Balanced-Tuned", "Hybrid-AND-Tuned",
+    "Bayesian-Tuned", "Bayesian-Balanced-Tuned", "Bayesian-Hybrid-AND-Tuned",
 ]
 
 
@@ -1230,7 +1294,10 @@ def run_dataset(
 
     methods = list(BASELINE_METHODS)
     if mf_scorer is None:
-        methods = [m for m in methods if m not in ("MultiField", "MF-Balanced")]
+        methods = [
+            m for m in methods
+            if m not in ("Bayesian-MultiField", "Bayesian-MultiField-Bal")
+        ]
     runs: dict[str, dict[str, dict[str, float]]] = {m: {} for m in methods}
 
     # Pre-allocate rank arrays (reused per query, reset after each)
@@ -1339,20 +1406,20 @@ def run_dataset(
             "Bayesian-LogOdds": fusion_bayesian_bm25_logodds(
                 cand_bayesian_probs, cand_dense, dense_median, dense_alpha,
             ),
-            "LO-Local": fusion_logodds_local(
+            "Bayesian-LogOdds-Local": fusion_logodds_local(
                 cand_bm25, cand_dense,
                 bm25_median, bm25_alpha, dense_median, dense_alpha,
             ),
-            "Bayesian-LO-BR": fusion_bayesian_bm25_logodds_br(
+            "Bayesian-LogOdds-BR": fusion_bayesian_bm25_logodds_br(
                 cand_bayesian_probs_br, cand_dense, dense_median, dense_alpha,
             ),
             "Bayesian-Balanced": balanced_log_odds_fusion(
                 cand_bayesian_probs_br, cand_dense,
             ),
-            "Balanced-Mix": balanced_log_odds_fusion(
+            "Bayesian-Balanced-Mix": balanced_log_odds_fusion(
                 cand_bayesian_probs_mix, cand_dense,
             ),
-            "Balanced-Elbow": balanced_log_odds_fusion(
+            "Bayesian-Balanced-Elbow": balanced_log_odds_fusion(
                 cand_bayesian_probs_elbow, cand_dense,
             ),
         }
@@ -1363,20 +1430,38 @@ def run_dataset(
             cosine_to_probability(cand_dense), dtype=np.float64,
         )
         gated_input = np.column_stack([cand_bayesian_probs_br, dense_probs_cand])
-        hybrid_scores["Gated-ReLU"] = log_odds_conjunction(
+        hybrid_scores["Bayesian-Gated-ReLU"] = log_odds_conjunction(
             gated_input, gating="relu",
         )
-        hybrid_scores["Gated-Swish"] = log_odds_conjunction(
+        hybrid_scores["Bayesian-Gated-Swish"] = log_odds_conjunction(
             gated_input, gating="swish",
         )
-        hybrid_scores["Gated-GELU"] = log_odds_conjunction(
+        hybrid_scores["Bayesian-Gated-GELU"] = log_odds_conjunction(
             gated_input, gating="gelu",
         )
-        hybrid_scores["Gated-Swish-B2"] = log_odds_conjunction(
+        hybrid_scores["Bayesian-Gated-Swish-B2"] = log_odds_conjunction(
             gated_input, gating="swish", gating_beta=2.0,
         )
-        hybrid_scores["Gated-Softplus"] = log_odds_conjunction(
+        hybrid_scores["Bayesian-Gated-Softplus"] = log_odds_conjunction(
             gated_input, gating="softplus",
+        )
+
+        # VPT-calibrated dense fusion (Paper 3, Theorem 3.1.1)
+        # Background fitted from full query-corpus distance distribution;
+        # candidates calibrated via likelihood ratio f_R/f_G.
+        dense_dist_full = 1.0 - dense_sim
+        vpt = VectorProbabilityTransform.fit_background(dense_dist_full)
+        cand_dense_dist = 1.0 - cand_dense
+        vpt_dense_probs = vpt.calibrate(cand_dense_dist)
+
+        hybrid_scores["Bayesian-Vector-Balanced"] = fusion_vpt_balanced(
+            cand_bayesian_probs_br, vpt_dense_probs,
+        )
+        vpt_gated_input = np.column_stack(
+            [cand_bayesian_probs_br, vpt_dense_probs],
+        )
+        hybrid_scores["Bayesian-Vector-Softplus"] = log_odds_conjunction(
+            vpt_gated_input, gating="softplus",
         )
 
         for method_name, scores in hybrid_scores.items():
@@ -1389,18 +1474,18 @@ def run_dataset(
         if mf_scorer is not None:
             mf_probs_full = mf_scorer.get_probabilities(qtokens)
             mf_topR = np.argsort(-mf_probs_full)[:effective_R]
-            runs["MultiField"][qid] = {
+            runs["Bayesian-MultiField"][qid] = {
                 corpus_ids[i]: float(mf_probs_full[i]) for i in mf_topR
             }
 
-            # MF-Balanced: MultiField probs + dense via balanced_log_odds_fusion
+            # MultiField-Bal: MultiField probs + dense via balanced_log_odds_fusion
             # Union of MultiField top-R and Dense top-R
             mf_union_set = set(mf_topR.tolist()) | set(dense_topR.tolist())
             mf_union_idx = np.array(sorted(mf_union_set))
             mf_cand_probs = mf_probs_full[mf_union_idx]
             mf_cand_dense = dense_sim[mf_union_idx]
             mf_balanced_scores = balanced_log_odds_fusion(mf_cand_probs, mf_cand_dense)
-            runs["MF-Balanced"][qid] = {
+            runs["Bayesian-MultiField-Bal"][qid] = {
                 corpus_ids[mf_union_idx[j]]: float(mf_balanced_scores[j])
                 for j in range(len(mf_union_idx))
             }
@@ -1429,6 +1514,7 @@ def run_dataset(
             "cand_probs": cand_bayesian_probs.copy(),
             "cand_probs_br": cand_bayesian_probs_br.copy(),
             "cand_dense": cand_dense.copy(),
+            "vpt_dense_probs": vpt_dense_probs.copy(),
             "features": np.array(
                 [np.log1p(qlen), bm25_hit_ratio, max_bm25_log],
                 dtype=np.float64,
@@ -1525,7 +1611,7 @@ def run_dataset(
             attn_scores = log_odds_conjunction(
                 probs_matrix, alpha=attn_model.alpha, weights=w,
             )
-            runs["Attention"][qid] = {
+            runs["Bayesian-Attention"][qid] = {
                 corpus_ids[ui[j]]: float(attn_scores[j])
                 for j in range(len(ui))
             }
@@ -1533,16 +1619,16 @@ def run_dataset(
         print(f"  Attention trained on {n_attn_train} judged pairs ({time.time() - t0:.1f}s)")
     else:
         # Not enough training data -- remove Attention from methods
-        methods = [m for m in methods if m != "Attention"]
-        if "Attention" in runs:
-            del runs["Attention"]
+        methods = [m for m in methods if m != "Bayesian-Attention"]
+        if "Bayesian-Attention" in runs:
+            del runs["Bayesian-Attention"]
         print(f"  Attention skipped (insufficient training data: {n_attn_train} pairs)")
 
     # 5c. Improved attention: normalization + richer features
     #
-    #   Attn-NR    : logit-space min-max normalization + 7 features
+    #   Attn-Norm    : logit-space min-max normalization + 7 features
     #                (3 BM25 + 3 dense + 1 cross-signal overlap)
-    #   Attn-NR-CV : 5-fold cross-validation of Attn-NR
+    #   Attn-Norm-CV : 5-fold cross-validation of Attn-Norm
     #
     # normalize=True on AttentionLogOddsWeights applies per-signal
     # column min-max normalization in logit space (same scaling as
@@ -1550,19 +1636,25 @@ def run_dataset(
     # statistics (top-10 mean/std, max) and retrieval overlap.
     t0 = time.time()
     _train_and_score_attn(
-        "Attn-NR", attn_cache, corpus_ids, qrels,
+        "Bayesian-Attn-Norm", attn_cache, corpus_ids, qrels,
         "features_rich", 7, True, methods, runs,
     )
     _train_attn_cv(
         attn_cache, corpus_ids, qrels,
         "features_rich", 7, True, methods, runs,
     )
+    # Vector-Attn: attention with VPT-calibrated dense probabilities
+    _train_and_score_attn(
+        "Bayesian-Vector-Attn", attn_cache, corpus_ids, qrels,
+        "features_rich", 7, True, methods, runs,
+        dense_probs_key="vpt_dense_probs",
+    )
     print(f"  Attention variants done ({time.time() - t0:.1f}s)")
 
     # 5d. Multi-head attention fusion (Paper 2, Remark 8.6)
     t0 = time.time()
 
-    # Multi-Head: basic features, 4 heads
+    # MultiHead: basic features, 4 heads
     mh_tp, mh_tl, mh_tf, mh_tq = _collect_attn_training_data(
         attn_cache, corpus_ids, qrels, "features",
         n_signals=2,
@@ -1593,18 +1685,18 @@ def run_dataset(
             probs_matrix = np.column_stack(signals)
             feats = cache["features"]
             scores = mh_model(probs_matrix, feats, use_averaged=True)
-            runs["Multi-Head"][qid] = {
+            runs["Bayesian-MultiHead"][qid] = {
                 corpus_ids[ui[j]]: float(scores[j])
                 for j in range(len(ui))
             }
-        print(f"  Multi-Head trained ({mh_n_train} pairs, 4 heads)")
+        print(f"  MultiHead trained ({mh_n_train} pairs, 4 heads)")
     else:
-        methods = [m for m in methods if m != "Multi-Head"]
-        if "Multi-Head" in runs:
-            del runs["Multi-Head"]
-        print(f"  Multi-Head skipped (insufficient data: {mh_n_train} pairs)")
+        methods = [m for m in methods if m != "Bayesian-MultiHead"]
+        if "Bayesian-MultiHead" in runs:
+            del runs["Bayesian-MultiHead"]
+        print(f"  MultiHead skipped (insufficient data: {mh_n_train} pairs)")
 
-    # MH-NR: rich features + normalize, 4 heads
+    # MultiHead-Norm: rich features + normalize, 4 heads
     mh_nr_tp, mh_nr_tl, mh_nr_tf, mh_nr_tq = _collect_attn_training_data(
         attn_cache, corpus_ids, qrels, "features_rich",
         n_signals=2,
@@ -1637,16 +1729,16 @@ def run_dataset(
             probs_matrix = np.column_stack(signals)
             feats = cache["features_rich"]
             scores = mh_nr_model(probs_matrix, feats, use_averaged=True)
-            runs["MH-NR"][qid] = {
+            runs["Bayesian-MultiHead-Norm"][qid] = {
                 corpus_ids[ui[j]]: float(scores[j])
                 for j in range(len(ui))
             }
-        print(f"  MH-NR trained ({mh_nr_n_train} pairs, 4 heads, normalize)")
+        print(f"  MultiHead-Norm trained ({mh_nr_n_train} pairs, 4 heads, normalize)")
     else:
-        methods = [m for m in methods if m != "MH-NR"]
-        if "MH-NR" in runs:
-            del runs["MH-NR"]
-        print(f"  MH-NR skipped (insufficient data: {mh_nr_n_train} pairs)")
+        methods = [m for m in methods if m != "Bayesian-MultiHead-Norm"]
+        if "Bayesian-MultiHead-Norm" in runs:
+            del runs["Bayesian-MultiHead-Norm"]
+        print(f"  MultiHead-Norm skipped (insufficient data: {mh_nr_n_train} pairs)")
 
     print(f"  Multi-head variants done ({time.time() - t0:.1f}s)")
 
@@ -1784,16 +1876,16 @@ def run_dataset(
             run_balanced = _compute_balanced_run_from_cache(
                 tune_cache, corpus_ids, tuned_transform, tuned["fusion_weight"],
             )
-            runs["Balanced-Tuned"] = run_balanced
-            results["Balanced-Tuned"] = evaluate_pytrec(qrels_pytrec, run_balanced, k=k)
+            runs["Bayesian-Balanced-Tuned"] = run_balanced
+            results["Bayesian-Balanced-Tuned"] = evaluate_pytrec(qrels_pytrec, run_balanced, k=k)
 
         # Hybrid-AND-Tuned
         if tuned["hybrid_alpha"] is not None:
             run_hybrid = _compute_hybrid_and_run_from_cache(
                 tune_cache, corpus_ids, tuned_transform, tuned["hybrid_alpha"],
             )
-            runs["Hybrid-AND-Tuned"] = run_hybrid
-            results["Hybrid-AND-Tuned"] = evaluate_pytrec(qrels_pytrec, run_hybrid, k=k)
+            runs["Bayesian-Hybrid-AND-Tuned"] = run_hybrid
+            results["Bayesian-Hybrid-AND-Tuned"] = evaluate_pytrec(qrels_pytrec, run_hybrid, k=k)
 
     return results
 
@@ -1803,12 +1895,16 @@ def run_dataset(
 # ---------------------------------------------------------------------------
 
 CALIBRATION_METHODS = [
-    "Bayesian-OR", "Bayesian-LO-BR", "Bayesian-Balanced",
-    "Balanced-Mix", "Balanced-Elbow",
-    "Gated-ReLU", "Gated-Swish", "Gated-GELU", "Gated-Swish-B2", "Gated-Softplus",
-    "Attention",
-    "Multi-Head", "MH-NR",
-    "MultiField", "MF-Balanced",
+    "Bayesian-OR", "Bayesian-LogOdds-Local",
+    "Bayesian-Balanced",
+    "Bayesian-Balanced-Mix", "Bayesian-Balanced-Elbow",
+    "Bayesian-Gated-ReLU", "Bayesian-Gated-Swish", "Bayesian-Gated-GELU",
+    "Bayesian-Gated-Swish-B2", "Bayesian-Gated-Softplus",
+    "Bayesian-Attention", "Bayesian-Attn-Norm", "Bayesian-Attn-Norm-CV",
+    "Bayesian-MultiHead", "Bayesian-MultiHead-Norm",
+    "Bayesian-MultiField", "Bayesian-MultiField-Bal",
+    "Bayesian-Vector-Balanced", "Bayesian-Vector-Softplus",
+    "Bayesian-Vector-Attn",
 ]
 
 
