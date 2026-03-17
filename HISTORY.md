@@ -1,5 +1,33 @@
 # History
 
+## 0.11.0 (2026-03-17)
+
+- Add `VectorProbabilityTransform` for likelihood ratio calibration of vector similarity scores (Paper 3, Theorem 3.1.1)
+  - Replaces naive `(1 + cos) / 2` conversion with `P(R|d) = sigmoid(log(f_R(d) / f_G(d)) + logit(P_base))`
+  - `fit_background()`: estimate background Gaussian (mu_G, sigma_G) from a corpus sample
+  - `calibrate()`: full calibration pipeline with auto-routing between KDE and GMM density estimation
+  - `estimate_kde()`: weighted Gaussian KDE for relevant-document density f_R (Section 4.3)
+  - `estimate_gmm()`: two-component GMM-EM with fixed background component (Algorithm 5.3.1, Remark 5.3.2)
+  - `log_density_ratio()`: log(f_R(d) / f_G(d)) vector evidence computation (Definition 3.2.1)
+  - Gap detection (Strategy 4.6.1): dual-threshold semantic cliff detection with span ratio primary and z-score fallback
+  - Auto-routing: gap + K >= 50 uses KDE, gap + K < 50 uses GMM, smooth distributions route by available weights (BM25 probabilities, density priors, or distance-based fallback)
+  - Supports `base_rate` parameter for corpus-level relevance prior
+- Add `ivf_density_prior()` for IVF cell density prior weights (Strategy 4.6.2)
+  - `prior = sigmoid(gamma * (cell_population / avg_population - 1))`
+- Add `knn_density_prior()` for HNSW k-th neighbor density proxy
+  - `prior = sigmoid(gamma * (global_median_kth / kth_distance - 1))`
+- Extend `VectorSignalTrace` with calibrated vector fields in `FusionDebugger`
+  - Add `distance`, `f_R`, `f_G`, `log_density_ratio`, `calibration_method` optional fields
+  - Add `trace_calibrated_vector()` method for tracing VPT-calibrated vector signals with full density ratio diagnostics
+- Add `VectorProbabilityTransform`, `ivf_density_prior`, `knn_density_prior` to lazy `__init__.py` exports
+- Update hybrid BEIR benchmark (`benchmarks/hybrid_beir.py`) with 3 new vector calibration methods (26 zero-shot total)
+  - Add Bayesian-Vector-Balanced: VPT-calibrated dense + balanced fusion
+  - Add Bayesian-Vector-Softplus: VPT-calibrated dense + softplus gating
+  - Add Bayesian-Vector-Attn: VPT-calibrated dense + attention fusion with logit normalization
+  - Fix log-odds fusion functions to return probabilities via sigmoid where the pipeline stays in logit space
+  - Remove raw log-odds methods from CALIBRATION_METHODS to fix Brier > 1.0 bug
+  - Rename all benchmark methods with consistent Bayesian- prefix and spelled-out abbreviations
+
 ## 0.10.0 (2026-03-15)
 
 - Add softplus gating to `log_odds_conjunction` (Remark 6.5.4)

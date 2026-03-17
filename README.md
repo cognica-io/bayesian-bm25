@@ -21,6 +21,8 @@ Key capabilities:
 - **External prior features** — `prior_fn` callable on `BayesianProbabilityTransform` allows custom document priors to replace the composite prior, enabling features like recency or popularity weighting (Section 12.2 #6)
 - **Temporal adaptation** — `TemporalBayesianTransform` uses exponential decay to weight recent observations more heavily in `fit()`, tracking concept drift in non-stationary relevance patterns (Section 12.2 #3)
 - **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
+- **Vector score calibration** — `VectorProbabilityTransform` converts vector distances into calibrated probabilities via likelihood ratio framework: `P(R|d) = sigmoid(log(f_R(d) / f_G(d)) + logit(P_base))`, with KDE/GMM density estimation, gap detection, and auto-routing (Paper 3, Theorem 3.1.1)
+- **Index-aware density priors** — `ivf_density_prior()` and `knn_density_prior()` provide density-based prior weights from IVF cell populations and k-NN distances for informing the vector calibration (Paper 3, Strategy 4.6.2)
 - **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval; `BlockMaxIndex` provides tighter block-level bounds for BMW-style pruning (Section 6.2, Corollary 7.4.2)
 - **Calibration metrics** — `expected_calibration_error()`, `brier_score()`, `reliability_diagram()`, and `calibration_report()` for evaluating probability quality, with `CalibrationReport` bundling all metrics into a single diagnostic
 - **Fusion debugger** — `FusionDebugger` records every intermediate value through the full pipeline (likelihood, prior, posterior, fusion) for transparent inspection, document comparison, and crossover detection; supports hierarchical fusion tracing with AND/OR/NOT composition and gating trace fields
@@ -149,6 +151,38 @@ fused_soft = log_odds_conjunction(stacked, gating="swish", gating_beta=0.5)
 # Softplus for small datasets: preserves all evidence (Remark 6.5.4)
 # softplus(x) > x for all finite x, so consider lower alpha to compensate
 fused_sp = log_odds_conjunction(stacked, gating="softplus", gating_beta=2.0)
+```
+
+### Vector Score Calibration
+
+```python
+import numpy as np
+from bayesian_bm25 import VectorProbabilityTransform
+
+# Estimate background distribution from corpus distances
+corpus_distances = np.random.normal(0.8, 0.15, size=10000)
+vpt = VectorProbabilityTransform.fit_background(corpus_distances, base_rate=0.01)
+
+# Calibrate query-document distances via likelihood ratio
+query_distances = np.array([0.3, 0.5, 0.7, 0.9, 1.1])
+probabilities = vpt.calibrate(query_distances)
+
+# With BM25 probability weights for informed density estimation
+bm25_probs = np.array([0.85, 0.60, 0.40, 0.20, 0.10])
+probabilities = vpt.calibrate(query_distances, weights=bm25_probs)
+
+# Explicit KDE or GMM estimation
+probabilities_kde = vpt.calibrate(query_distances, method="kde")
+probabilities_gmm = vpt.calibrate(query_distances, method="gmm")
+
+# Index-aware density priors for IVF / HNSW indexes
+from bayesian_bm25 import ivf_density_prior, knn_density_prior
+
+cell_prior = ivf_density_prior(cell_population=150, avg_population=100)
+knn_prior = knn_density_prior(kth_distance=0.5, global_median_kth=0.8)
+
+# Use density prior to inform calibration
+probabilities = vpt.calibrate(query_distances, density_prior=np.full(5, cell_prior))
 ```
 
 ### Learning Fusion Weights from Data
@@ -510,6 +544,9 @@ All methods above are zero-shot (no relevance labels required). With `--tune`, a
 | Bayesian-MultiHead-Norm | Multi-head + logit normalization + 7 features (Corollary 8.7.2) |
 | Bayesian-MultiField | `MultiFieldScorer` (title + body) with `log_odds_conjunction`, sparse-only |
 | Bayesian-MultiField-Bal | MultiField probs + dense via `balanced_log_odds_fusion` |
+| Bayesian-Vector-Balanced | `VectorProbabilityTransform`-calibrated dense probabilities + BM25 via `balanced_log_odds_fusion` (Paper 3, Theorem 3.1.1) |
+| Bayesian-Vector-Softplus | VPT-calibrated dense + BM25 via softplus-gated `log_odds_conjunction` |
+| Bayesian-Vector-Attn | VPT-calibrated dense + attention with logit normalization + 7 features |
 | Bayesian-Balanced-Tuned | Bayesian-Balanced + supervised `BayesianProbabilityTransform.fit()` + grid search over base_rate and fusion_weight |
 | Bayesian-Hybrid-AND-Tuned | `log_odds_conjunction` of Bayesian BM25 and dense probs with tuned alpha |
 | Bayesian-Tuned | Sparse-only Bayesian BM25 with tuned alpha, beta, and base_rate (no dense signal) |
