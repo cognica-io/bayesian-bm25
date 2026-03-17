@@ -31,6 +31,7 @@ Key capabilities:
 
 - [MTEB](https://github.com/embeddings-benchmark/mteb) — included as a baseline retrieval model (`bb25`) for the Massive Text Embedding Benchmark
 - [txtai](https://github.com/neuml/txtai) — used for BM25 score normalization in hybrid search (`normalize="bayesian-bm25"`)
+- [Vespa.ai](https://github.com/vespa-engine/sample-apps/tree/master/examples/bayesian_bm25) — adopted as an official sample application
 - [UQA](https://cognica-io.github.io/uqa/) — used as the scoring operator for probabilistic text retrieval and multi-signal fusion in the unified query algebra
 
 ## Installation
