@@ -298,6 +298,8 @@ class VectorProbabilityTransform:
         distances: np.ndarray,
         weights: np.ndarray,
         bandwidth_factor: float = 2.0,
+        *,
+        eval_points: np.ndarray | None = None,
     ) -> np.ndarray:
         """Section 4.3: weighted KDE for relevant-document density f_R.
 
@@ -319,10 +321,13 @@ class VectorProbabilityTransform:
         """
         distances = np.asarray(distances, dtype=np.float64)
         weights = np.asarray(weights, dtype=np.float64)
+        if eval_points is None:
+            eval_points = distances
+        eval_points = np.asarray(eval_points, dtype=np.float64)
 
         h = _silverman_bandwidth(distances, weights) * bandwidth_factor
 
-        return _kernel_density(distances, distances, weights, h)
+        return _kernel_density(eval_points, distances, weights, h)
 
     def estimate_gmm(
         self,
@@ -331,6 +336,7 @@ class VectorProbabilityTransform:
         *,
         max_iter: int = 100,
         tol: float = 1e-6,
+        eval_points: np.ndarray | None = None,
     ) -> np.ndarray:
         """Algorithm 5.3.1: GMM-EM for relevant-document density f_R.
 
@@ -356,6 +362,9 @@ class VectorProbabilityTransform:
             Density values f_R at each distance.
         """
         distances = np.asarray(distances, dtype=np.float64)
+        if eval_points is None:
+            eval_points = distances
+        eval_points = np.asarray(eval_points, dtype=np.float64)
         n = len(distances)
 
         # Initialize R component
@@ -418,8 +427,112 @@ class VectorProbabilityTransform:
 
             pi_R = float(np.clip(gamma_sum / n, 0.01, 0.99))
 
-        f_R_result = np.asarray(_gaussian_pdf(distances, mu_R, sigma_R))
+        f_R_result = np.asarray(_gaussian_pdf(eval_points, mu_R, sigma_R))
         return np.maximum(f_R_result, _EPSILON)
+
+    @staticmethod
+    def _signal_mass(weights: np.ndarray | None) -> float:
+        if weights is None:
+            return 0.0
+        weights = np.asarray(weights, dtype=np.float64)
+        if weights.size == 0:
+            return 0.0
+        return float(np.sum(np.maximum(weights, 0.0)))
+
+    def _estimate_relevant_density(
+        self,
+        eval_points: np.ndarray,
+        sample_distances: np.ndarray,
+        *,
+        weights: np.ndarray | None = None,
+        method: str = "auto",
+        bandwidth_factor: float = 2.0,
+        density_prior: np.ndarray | None = None,
+    ) -> np.ndarray:
+        eval_points = np.asarray(eval_points, dtype=np.float64)
+        sample_distances = np.asarray(sample_distances, dtype=np.float64)
+        if len(sample_distances) == 0:
+            return np.full_like(eval_points, _EPSILON)
+
+        K = len(sample_distances)
+        weight_mass = self._signal_mass(weights)
+        density_mass = self._signal_mass(density_prior)
+
+        if method == "auto":
+            gap_w = self._gap_weights(sample_distances)
+            has_gap = gap_w is not None
+
+            if has_gap:
+                if K >= 50:
+                    return self.estimate_kde(
+                        sample_distances,
+                        gap_w,
+                        bandwidth_factor,
+                        eval_points=eval_points,
+                    )
+                return self.estimate_gmm(
+                    sample_distances,
+                    gap_w,
+                    eval_points=eval_points,
+                )
+
+            if weights is not None and weight_mass > _EPSILON:
+                sharpened = self._sharpen_weights(weights)
+                return self.estimate_kde(
+                    sample_distances,
+                    sharpened,
+                    bandwidth_factor,
+                    eval_points=eval_points,
+                )
+
+            if density_prior is not None and density_mass > _EPSILON:
+                return self.estimate_gmm(
+                    sample_distances,
+                    density_prior,
+                    eval_points=eval_points,
+                )
+
+            fallback_w = self._distance_density_weights(sample_distances)
+            return self.estimate_gmm(
+                sample_distances,
+                fallback_w,
+                eval_points=eval_points,
+            )
+
+        if method == "kde":
+            if weights is not None and weight_mass > _EPSILON:
+                effective_w = np.asarray(weights, dtype=np.float64)
+            elif density_prior is not None and density_mass > _EPSILON:
+                effective_w = np.asarray(density_prior, dtype=np.float64)
+            else:
+                gap_w = self._gap_weights(sample_distances)
+                if gap_w is not None:
+                    effective_w = gap_w
+                else:
+                    effective_w = self._distance_density_weights(sample_distances)
+            return self.estimate_kde(
+                sample_distances,
+                effective_w,
+                bandwidth_factor,
+                eval_points=eval_points,
+            )
+
+        if method == "gmm":
+            if weights is not None and weight_mass > _EPSILON:
+                effective_w = np.asarray(weights, dtype=np.float64)
+            elif density_prior is not None and density_mass > _EPSILON:
+                effective_w = np.asarray(density_prior, dtype=np.float64)
+            else:
+                effective_w = None
+            return self.estimate_gmm(
+                sample_distances,
+                effective_w,
+                eval_points=eval_points,
+            )
+
+        raise ValueError(
+            f"method must be 'auto', 'kde', or 'gmm', got {method!r}"
+        )
 
     def log_density_ratio(
         self,
@@ -495,61 +608,53 @@ class VectorProbabilityTransform:
         """
         scalar = np.ndim(distances) == 0
         distances = np.atleast_1d(np.asarray(distances, dtype=np.float64))
-        K = len(distances)
 
-        if method == "auto":
-            gap_w = self._gap_weights(distances)
-            has_gap = gap_w is not None
-
-            if has_gap:
-                if K >= 50:
-                    f_R = self.estimate_kde(
-                        distances, gap_w, bandwidth_factor
-                    )
-                else:
-                    f_R = self.estimate_gmm(distances, gap_w)
-            elif weights is not None:
-                sharpened = self._sharpen_weights(weights)
-                f_R = self.estimate_kde(
-                    distances, sharpened, bandwidth_factor
-                )
-            elif density_prior is not None:
-                f_R = self.estimate_gmm(distances, density_prior)
-            else:
-                fallback_w = self._distance_density_weights(distances)
-                f_R = self.estimate_gmm(distances, fallback_w)
-
-        elif method == "kde":
-            if weights is None:
-                gap_w = self._gap_weights(distances)
-                if gap_w is not None:
-                    effective_w = gap_w
-                else:
-                    effective_w = self._distance_density_weights(distances)
-            else:
-                effective_w = np.asarray(weights, dtype=np.float64)
-            f_R = self.estimate_kde(
-                distances, effective_w, bandwidth_factor
-            )
-
-        elif method == "gmm":
-            if weights is not None:
-                effective_w = np.asarray(weights, dtype=np.float64)
-            elif density_prior is not None:
-                effective_w = np.asarray(density_prior, dtype=np.float64)
-            else:
-                effective_w = None
-            f_R = self.estimate_gmm(distances, effective_w)
-
-        else:
-            raise ValueError(
-                f"method must be 'auto', 'kde', or 'gmm', got {method!r}"
-            )
+        f_R = self._estimate_relevant_density(
+            distances,
+            distances,
+            weights=weights,
+            method=method,
+            bandwidth_factor=bandwidth_factor,
+            density_prior=density_prior,
+        )
 
         log_ratio = self.log_density_ratio(distances, f_R)
         log_odds = log_ratio + self._logit_base_rate
         result = _clamp_probability(sigmoid(log_odds))
 
+        return float(result[0]) if scalar else result
+
+    def calibrate_with_sample(
+        self,
+        eval_distances: np.ndarray | float,
+        sample_distances: np.ndarray,
+        *,
+        weights: np.ndarray | None = None,
+        method: str = "auto",
+        bandwidth_factor: float = 2.0,
+        density_prior: np.ndarray | None = None,
+    ) -> np.ndarray | float:
+        """Calibrate eval distances using a separate local sample.
+
+        This is the index-aware path used when the local neighborhood
+        sample comes from an ANN structure (e.g. IVF probed cells) while
+        probabilities must be produced for an arbitrary evaluation set.
+        """
+        scalar = np.ndim(eval_distances) == 0
+        eval_arr = np.atleast_1d(np.asarray(eval_distances, dtype=np.float64))
+        sample_arr = np.asarray(sample_distances, dtype=np.float64)
+
+        f_R = self._estimate_relevant_density(
+            eval_arr,
+            sample_arr,
+            weights=weights,
+            method=method,
+            bandwidth_factor=bandwidth_factor,
+            density_prior=density_prior,
+        )
+        log_ratio = self.log_density_ratio(eval_arr, f_R)
+        log_odds = log_ratio + self._logit_base_rate
+        result = _clamp_probability(sigmoid(log_odds))
         return float(result[0]) if scalar else result
 
 

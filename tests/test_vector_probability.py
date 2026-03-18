@@ -287,6 +287,16 @@ class TestEstimateKDE:
         # Narrower bandwidth should produce higher peak density
         assert float(np.max(f_R_narrow)) > float(np.max(f_R_wide))
 
+    def test_eval_points_supported(self):
+        rng = np.random.default_rng(42)
+        distances = rng.normal(0.3, 0.05, size=40)
+        weights = np.ones(40)
+        eval_points = np.array([0.2, 0.3, 0.4], dtype=np.float64)
+        vct = VectorProbabilityTransform(mu_G=0.8, sigma_G=0.2)
+        f_R = vct.estimate_kde(distances, weights, eval_points=eval_points)
+        assert f_R.shape == eval_points.shape
+        assert np.all(f_R > 0.0)
+
 
 class TestEstimateGMM:
     def test_returns_positive_densities(self):
@@ -322,6 +332,19 @@ class TestEstimateGMM:
         f_R = vct.estimate_gmm(distances)
         assert f_R.shape == distances.shape
         assert np.all(f_R > 0)
+
+    def test_eval_points_supported(self):
+        rng = np.random.default_rng(42)
+        relevant = rng.normal(0.2, 0.03, size=20)
+        background = rng.normal(0.7, 0.1, size=80)
+        distances = np.concatenate([relevant, background])
+        weights = np.zeros(100)
+        weights[:20] = 1.0
+        eval_points = np.array([0.15, 0.25, 0.8], dtype=np.float64)
+        vct = VectorProbabilityTransform(mu_G=0.7, sigma_G=0.1)
+        f_R = vct.estimate_gmm(distances, weights, eval_points=eval_points)
+        assert f_R.shape == eval_points.shape
+        assert np.all(f_R > 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +491,21 @@ class TestCalibrateEndToEnd:
         vct = VectorProbabilityTransform(mu_G=0.5, sigma_G=0.2)
         with pytest.raises(ValueError, match="method must be"):
             vct.calibrate(np.array([0.3, 0.5]), method="invalid")
+
+    def test_calibrate_with_sample_uses_external_local_sample(self):
+        sample_distances = np.array([0.10, 0.12, 0.14, 0.18, 0.22, 0.75, 0.82])
+        sample_weights = np.array([0.95, 0.9, 0.85, 0.7, 0.6, 0.1, 0.05])
+        eval_distances = np.array([0.11, 0.20, 0.80])
+        vct = VectorProbabilityTransform(mu_G=0.75, sigma_G=0.15)
+        result = vct.calibrate_with_sample(
+            eval_distances,
+            sample_distances,
+            weights=sample_weights,
+        )
+        assert result.shape == eval_distances.shape
+        assert np.all(result > 0.0)
+        assert np.all(result < 1.0)
+        assert float(result[0]) > float(result[-1])
 
 
 

@@ -88,9 +88,14 @@ from bayesian_bm25.probability import (
     BayesianProbabilityTransform,
     _clamp_probability,
     logit,
+    sigmoid,
 )
 from bayesian_bm25.scorer import BayesianBM25Scorer
-from bayesian_bm25.vector_probability import VectorProbabilityTransform
+from bayesian_bm25.vector_probability import (
+    VectorProbabilityTransform,
+    ivf_density_prior,
+)
+from benchmarks.simple_ivf import IVFSearchResult, SimpleIVF
 
 STEMMER = Stemmer.Stemmer("english")
 
@@ -352,6 +357,288 @@ def encode_dense(
     return emb
 
 
+def _compute_bm25_features_for_docs(
+    scorer: BayesianBM25Scorer,
+    raw_bm25: np.ndarray,
+    doc_indices: np.ndarray,
+    qtokens: list[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute per-doc BM25 features for an arbitrary subset."""
+    doc_indices = np.asarray(doc_indices, dtype=np.int32)
+    scores = np.asarray(raw_bm25[doc_indices], dtype=np.float64)
+    active = scores > 0.0
+
+    tfs = np.zeros(len(doc_indices), dtype=np.float64)
+    doc_len_ratios = np.ones(len(doc_indices), dtype=np.float64)
+
+    if np.any(active):
+        active_doc_ids = doc_indices[active]
+        doc_len_ratios[active] = (
+            scorer._doc_lengths[active_doc_ids] / scorer._avgdl
+        )
+        tfs[active] = scorer._compute_tf_batch(active_doc_ids, qtokens)
+
+    return scores, active, tfs, doc_len_ratios
+
+
+def _apply_bm25_transform(
+    transform: BayesianProbabilityTransform,
+    scores: np.ndarray,
+    active: np.ndarray,
+    tfs: np.ndarray,
+    doc_len_ratios: np.ndarray,
+) -> np.ndarray:
+    """Apply a Bayesian BM25 transform to a precomputed subset."""
+    probs = np.zeros(len(scores), dtype=np.float64)
+    if np.any(active):
+        probs[active] = transform.score_to_probability(
+            scores[active], tfs[active], doc_len_ratios[active],
+        )
+    return probs
+
+
+def _retrieve_dense_candidates(
+    query_vec: np.ndarray,
+    corpus_emb: np.ndarray,
+    retrieve_k: int,
+    *,
+    dense_backend: str,
+    dense_index: SimpleIVF | None = None,
+    ivf_nprobe: int | None = None,
+) -> dict[str, np.ndarray | IVFSearchResult | None]:
+    """Retrieve dense candidates using either exact scan or SimpleIVF."""
+    if dense_backend == "exact":
+        dense_scores_full = np.asarray(
+            query_vec @ corpus_emb.T, dtype=np.float64,
+        )
+        top_idx = np.argsort(-dense_scores_full)[:retrieve_k]
+        top_scores = dense_scores_full[top_idx]
+        return {
+            "top_idx": np.asarray(top_idx, dtype=np.int32),
+            "top_scores": np.asarray(top_scores, dtype=np.float64),
+            "sample_idx": np.asarray(top_idx, dtype=np.int32),
+            "sample_scores": np.asarray(top_scores, dtype=np.float64),
+            "sample_cell_populations": None,
+            "full_scores": dense_scores_full,
+            "search_result": None,
+        }
+
+    if dense_backend != "ivf" or dense_index is None:
+        raise ValueError(
+            f"dense_backend must be 'exact' or 'ivf', got {dense_backend!r}",
+        )
+
+    search = dense_index.search(query_vec, retrieve_k, nprobe=ivf_nprobe)
+    return {
+        "top_idx": search.indices,
+        "top_scores": search.scores,
+        "sample_idx": search.indices,
+        "sample_scores": search.scores,
+        "sample_cell_populations": search.cell_populations,
+        "full_scores": None,
+        "search_result": search,
+    }
+
+
+def _resolve_ivf_nprobe(
+    dense_index: SimpleIVF,
+    retrieve_k: int,
+    ivf_nprobe: int | None,
+    oversample_factor: float = 2.0,
+) -> int:
+    """Choose nprobe so IVF sees enough candidates for top-k quality."""
+    if ivf_nprobe is not None:
+        return max(1, min(int(ivf_nprobe), dense_index.n_cells))
+
+    target_candidates = max(
+        int(np.ceil(retrieve_k * oversample_factor)),
+        int(np.ceil(retrieve_k + dense_index.avg_population)),
+    )
+    needed = int(np.ceil(target_candidates / max(dense_index.avg_population, 1.0)))
+    return max(
+        dense_index.default_nprobe,
+        min(needed, dense_index.n_cells),
+    )
+
+
+def _combine_vpt_sample_guidance(
+    lexical_probs: np.ndarray,
+    lexical_active: np.ndarray,
+    density_prior: np.ndarray | None = None,
+    *,
+    neutral_prob: float = 0.5,
+    lexical_floor: float = 0.5,
+    min_lexical_mix: float = 0.35,
+    max_lexical_mix: float = 0.85,
+    max_logit: float = 10.0,
+) -> np.ndarray:
+    """Blend lexical and density hints into one benchmark-local VPT weight.
+
+    Missing lexical evidence is treated as neutral instead of negative.
+    When a density prior is available (IVF), combine both hints in logit
+    space so the package calibrator still receives a single generic weight
+    vector without index-specific logic.
+    """
+    lexical_probs = np.asarray(lexical_probs, dtype=np.float64)
+    lexical_active = np.asarray(lexical_active, dtype=bool)
+    guidance = np.full(len(lexical_probs), neutral_prob, dtype=np.float64)
+
+    if np.any(lexical_active):
+        guidance[lexical_active] = np.maximum(
+            lexical_probs[lexical_active], lexical_floor,
+        )
+
+    if density_prior is None:
+        return guidance
+
+    density_prior = np.asarray(density_prior, dtype=np.float64)
+    if density_prior.shape != guidance.shape:
+        raise ValueError(
+            "density_prior must have the same shape as lexical_probs",
+        )
+
+    active_ratio = float(np.mean(lexical_active)) if len(guidance) > 0 else 0.0
+    lexical_mix = float(
+        np.clip(
+            min_lexical_mix + 0.5 * active_ratio,
+            min_lexical_mix,
+            max_lexical_mix,
+        )
+    )
+    blended_logit = (
+        lexical_mix * np.asarray(logit(_clamp_probability(guidance)))
+        + (1.0 - lexical_mix)
+        * np.asarray(logit(_clamp_probability(density_prior)))
+    )
+    return np.asarray(
+        sigmoid(np.clip(blended_logit, -max_logit, max_logit)),
+        dtype=np.float64,
+    )
+
+
+def _resolve_vpt_query_gate(
+    sample_active: np.ndarray,
+    dense_top_scores: np.ndarray,
+    bm25_top_idx: np.ndarray,
+    dense_top_idx: np.ndarray,
+    dense_candidate_scores: np.ndarray | None = None,
+    vpt_dense_probs: np.ndarray | None = None,
+    *,
+    overlap_k: int = 100,
+    min_gate: float = 0.02,
+    max_gate: float = 0.98,
+) -> float:
+    """Estimate how much VPT evidence should influence this query.
+
+    Unsupervised continuous gate based only on query-time observables:
+    confidence from lexical/dense agreement and dense separation, divided by
+    confidence plus VPT distortion risk.
+    """
+    def _squash_positive(value: float, scale: float) -> float:
+        value = max(float(value), 0.0)
+        scale = max(float(scale), 1e-6)
+        return value / (value + scale)
+
+    sample_active = np.asarray(sample_active, dtype=bool)
+    dense_top_scores = np.asarray(dense_top_scores, dtype=np.float64)
+    bm25_top_idx = np.asarray(bm25_top_idx, dtype=np.int32)
+    dense_top_idx = np.asarray(dense_top_idx, dtype=np.int32)
+
+    sample_active_ratio = (
+        float(np.mean(sample_active)) if len(sample_active) > 0 else 0.0
+    )
+
+    top_k = min(overlap_k, len(bm25_top_idx), len(dense_top_idx))
+    if top_k > 0:
+        bm25_top = set(bm25_top_idx[:top_k].tolist())
+        dense_top = set(dense_top_idx[:top_k].tolist())
+        union_sz = len(bm25_top | dense_top)
+        overlap_ratio = (
+            float(len(bm25_top & dense_top)) / union_sz if union_sz > 0 else 0.0
+        )
+    else:
+        overlap_ratio = 0.0
+
+    if len(dense_top_scores) == 0:
+        dense_margin = 0.0
+        dense_spread = 0.0
+    else:
+        top1 = float(dense_top_scores[0])
+        top2 = float(dense_top_scores[1]) if len(dense_top_scores) > 1 else top1
+        top10_mean = float(np.mean(dense_top_scores[: min(10, len(dense_top_scores))]))
+        dense_margin = max(top1 - top2, 0.0)
+        dense_spread = max(top1 - top10_mean, 0.0)
+
+    confidence = (
+        0.35 * _squash_positive(sample_active_ratio, 0.08)
+        + 0.25 * _squash_positive(overlap_ratio, 0.10)
+        + 0.20 * _squash_positive(dense_margin, 0.01)
+        + 0.20 * _squash_positive(dense_spread, 0.02)
+    )
+    risk = 0.0
+
+    if dense_candidate_scores is not None and vpt_dense_probs is not None:
+        dense_candidate_scores = np.asarray(
+            dense_candidate_scores, dtype=np.float64,
+        )
+        vpt_dense_probs = np.asarray(vpt_dense_probs, dtype=np.float64)
+        if (
+            len(dense_candidate_scores) > 1
+            and len(vpt_dense_probs) == len(dense_candidate_scores)
+        ):
+            base_logits = np.asarray(
+                logit(cosine_to_probability(dense_candidate_scores)),
+                dtype=np.float64,
+            )
+            vpt_logits = np.asarray(
+                logit(_clamp_probability(vpt_dense_probs)),
+                dtype=np.float64,
+            )
+            base_std = max(float(np.std(base_logits)), 1e-6)
+            vpt_std = max(float(np.std(vpt_logits)), 1e-6)
+            std_log_ratio = abs(float(np.log(vpt_std / base_std)))
+            mean_shift = float(np.mean(np.abs(vpt_logits - base_logits)))
+            sat_ratio = float(
+                np.mean((vpt_dense_probs <= 0.02) | (vpt_dense_probs >= 0.98))
+            )
+            p95_shift = abs(
+                float(np.percentile(np.abs(vpt_logits), 95))
+                - float(np.percentile(np.abs(base_logits), 95))
+            )
+
+            risk = (
+                0.35 * _squash_positive(std_log_ratio, 0.30)
+                + 0.35 * _squash_positive(mean_shift, 1.25)
+                + 0.20 * _squash_positive(sat_ratio, 0.08)
+                + 0.10 * _squash_positive(p95_shift, 1.0)
+            )
+
+    gate = confidence / max(confidence + risk, 1e-6)
+    return float(np.clip(gate, min_gate, max_gate))
+
+
+def _blend_probability_signal(
+    base_probs: np.ndarray,
+    refined_probs: np.ndarray,
+    gate: float,
+    *,
+    max_logit: float = 10.0,
+) -> np.ndarray:
+    """Blend refined probabilities back toward a safer base signal."""
+    base_probs = np.asarray(base_probs, dtype=np.float64)
+    refined_probs = np.asarray(refined_probs, dtype=np.float64)
+    gate = float(np.clip(gate, 0.0, 1.0))
+    base_logits = np.asarray(logit(_clamp_probability(base_probs)), dtype=np.float64)
+    refined_logits = np.asarray(
+        logit(_clamp_probability(refined_probs)), dtype=np.float64,
+    )
+    logits = (1.0 - gate) * base_logits + gate * refined_logits
+    return np.asarray(
+        sigmoid(np.clip(logits, -max_logit, max_logit)),
+        dtype=np.float64,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fusion methods (operate on candidate-level arrays)
 # ---------------------------------------------------------------------------
@@ -555,13 +842,15 @@ def _compute_dense_calibration(dense_sim: np.ndarray) -> tuple[float, float]:
 def fusion_vpt_balanced(
     sparse_probs: np.ndarray,
     vpt_dense_probs: np.ndarray,
-    weight: float = 0.5,
+    *,
+    sparse_weight: float = 1.0,
+    dense_weight: float = 1.0,
+    max_logit: float = 12.0,
 ) -> np.ndarray:
-    """Balanced log-odds fusion with VPT-calibrated dense probabilities.
+    """Additive log-odds fusion with VPT-calibrated dense probabilities.
 
-    Same pipeline as ``balanced_log_odds_fusion`` but accepts pre-calibrated
-    dense probabilities from ``VectorProbabilityTransform`` instead of raw
-    cosine similarities.
+    This keeps the benchmark closer to the paper's posterior view:
+    lexical log-odds evidence plus vector log-density-ratio evidence.
     """
     logit_sparse = np.asarray(
         logit(_clamp_probability(sparse_probs)), dtype=np.float64,
@@ -569,9 +858,18 @@ def fusion_vpt_balanced(
     logit_dense = np.asarray(
         logit(_clamp_probability(vpt_dense_probs)), dtype=np.float64,
     )
-    sparse_norm = _min_max_normalize(logit_sparse)
-    dense_norm = _min_max_normalize(logit_dense)
-    return weight * dense_norm + (1.0 - weight) * sparse_norm
+    logit_sparse = np.clip(logit_sparse, -max_logit, max_logit)
+    logit_dense = np.clip(logit_dense, -max_logit, max_logit)
+
+    sparse_std = max(float(np.std(logit_sparse)), 1e-6)
+    dense_std = max(float(np.std(logit_dense)), 1e-6)
+    dense_scale = dense_weight * min(1.0, sparse_std / dense_std)
+
+    fused_logit = sparse_weight * logit_sparse + dense_scale * logit_dense
+    return np.asarray(
+        sigmoid(np.clip(fused_logit, -max_logit, max_logit)),
+        dtype=np.float64,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1205,6 +1503,12 @@ def run_dataset(
     retrieve_k: int = 1000,
     tune: bool = False,
     cache_dir: str | None = None,
+    dense_backend: str = "exact",
+    ivf_cells: int | None = None,
+    ivf_nprobe: int | None = None,
+    ivf_iterations: int = 10,
+    ivf_seed: int = 42,
+    vpt_query_gating: bool = False,
 ) -> dict[str, dict[str, float]]:
     """Run all fusion methods on a single BEIR dataset.
 
@@ -1232,6 +1536,16 @@ def run_dataset(
         Root directory for embedding cache.  Embeddings are stored at
         ``{cache_dir}/{dataset_name}/{model}.npz``.  ``None`` disables
         caching entirely.
+    dense_backend : str
+        Dense retrieval backend: ``"exact"`` or ``"ivf"``.
+    ivf_cells : int or None
+        Number of IVF cells.  ``None`` uses an automatic heuristic.
+    ivf_nprobe : int or None
+        Number of IVF cells to probe at search time.
+    ivf_iterations : int
+        Lloyd iterations for the SimpleIVF k-means fit.
+    ivf_seed : int
+        RNG seed for the SimpleIVF build.
     """
     print(f"\n{'=' * 70}")
     print(f"  {dataset_name}")
@@ -1324,6 +1638,27 @@ def run_dataset(
     print(f"  Dense encoded: corpus {corpus_emb.shape}, queries {query_emb.shape} "
           f"({time.time() - t0:.1f}s)")
 
+    dense_index: SimpleIVF | None = None
+    ivf_nprobe_eff: int | None = None
+    if dense_backend == "ivf":
+        t0 = time.time()
+        dense_index = SimpleIVF.build(
+            corpus_emb,
+            n_cells=ivf_cells,
+            max_iterations=ivf_iterations,
+            seed=ivf_seed,
+        )
+        ivf_nprobe_eff = _resolve_ivf_nprobe(
+            dense_index,
+            retrieve_k=retrieve_k,
+            ivf_nprobe=ivf_nprobe,
+        )
+        print(
+            f"  Dense IVF built -- cells={dense_index.n_cells}, "
+            f"nprobe={ivf_nprobe_eff}, avg_pop={dense_index.avg_population:.1f} "
+            f"({time.time() - t0:.1f}s)"
+        )
+
     # 5. Retrieve-then-evaluate
     t0 = time.time()
     qrels_pytrec: dict[str, dict[str, int]] = {}
@@ -1349,18 +1684,40 @@ def run_dataset(
 
     # Per-query cache for attention model training
     attn_cache: dict[str, dict] = {}
+    vpt_gate_values: list[float] = []
 
     for q_idx in range(n_queries):
         qid = query_ids[q_idx]
         qtokens = query_tokens_list[q_idx]
+        query_vec = query_emb[q_idx]
 
-        # -- Full-array scores (fast, needed to find top-R) --
+        # -- BM25 full-array scores --
         raw_bm25 = scorer._bm25.get_scores(qtokens)
-        dense_sim = (query_emb[q_idx] @ corpus_emb.T).astype(np.float64)
+
+        # -- Dense retrieval via exact scan or IVF --
+        dense_info = _retrieve_dense_candidates(
+            query_vec,
+            corpus_emb,
+            effective_R,
+            dense_backend=dense_backend,
+            dense_index=dense_index,
+            ivf_nprobe=ivf_nprobe_eff,
+        )
+        dense_topR = np.asarray(dense_info["top_idx"], dtype=np.int32)
+        dense_top_scores_run = np.asarray(
+            dense_info["top_scores"], dtype=np.float64,
+        )
+        dense_sample_idx = np.asarray(
+            dense_info["sample_idx"], dtype=np.int32,
+        )
+        dense_sample_scores = np.asarray(
+            dense_info["sample_scores"], dtype=np.float64,
+        )
+        dense_sample_cell_populations = dense_info["sample_cell_populations"]
+        dense_full_scores = dense_info["full_scores"]
 
         # -- Retrieve top-R from each signal --
         bm25_topR = np.argsort(-raw_bm25)[:effective_R]
-        dense_topR = np.argsort(-dense_sim)[:effective_R]
 
         # BM25 run: top-R BM25 results
         runs["BM25"][qid] = {
@@ -1369,53 +1726,54 @@ def run_dataset(
 
         # Dense run: top-R dense results
         runs["Dense"][qid] = {
-            corpus_ids[i]: float(dense_sim[i]) for i in dense_topR
+            corpus_ids[i]: float(score)
+            for i, score in zip(dense_topR, dense_top_scores_run, strict=True)
         }
 
         # -- Union candidates for hybrid methods --
         union_set = set(bm25_topR.tolist()) | set(dense_topR.tolist())
-        union_idx = np.array(sorted(union_set))
+        union_idx = np.array(sorted(union_set), dtype=np.int32)
 
-        cand_bm25 = raw_bm25[union_idx]
-        cand_dense = dense_sim[union_idx]
-
-        # Bayesian BM25 probs for union candidates only (fast: only TF for candidates)
-        cand_bayesian_probs = np.zeros(len(union_idx), dtype=np.float64)
-        active = cand_bm25 > 0
-        active_doc_ids = np.array([], dtype=int)
-        active_scores = np.array([], dtype=np.float64)
-        tfs = np.array([], dtype=np.float64)
-        doc_len_ratios = np.array([], dtype=np.float64)
-
-        # Per-candidate tf and doc_len_ratio arrays (zero for inactive)
-        cand_tfs = np.zeros(len(union_idx), dtype=np.float64)
-        cand_doc_len_ratios = np.ones(len(union_idx), dtype=np.float64)
-
-        if np.any(active):
-            active_doc_ids = union_idx[active]
-            active_scores = cand_bm25[active]
-            doc_len_ratios = scorer._doc_lengths[active_doc_ids] / scorer._avgdl
-            tfs = scorer._compute_tf_batch(active_doc_ids, qtokens)
-            cand_tfs[active] = tfs
-            cand_doc_len_ratios[active] = doc_len_ratios
-            cand_bayesian_probs[active] = scorer._transform.score_to_probability(
-                active_scores, tfs, doc_len_ratios,
+        cand_dense = np.asarray(
+            query_vec @ corpus_emb[union_idx].T, dtype=np.float64,
+        )
+        cand_bm25, active, cand_tfs, cand_doc_len_ratios = (
+            _compute_bm25_features_for_docs(
+                scorer, raw_bm25, union_idx, qtokens,
             )
+        )
+        active_scores = cand_bm25[active]
+        tfs = cand_tfs[active]
+        doc_len_ratios = cand_doc_len_ratios[active]
 
-        # Bayesian BM25 probs with base rate prior for union candidates
-        cand_bayesian_probs_br = np.zeros(len(union_idx), dtype=np.float64)
-        cand_bayesian_probs_mix = np.zeros(len(union_idx), dtype=np.float64)
-        cand_bayesian_probs_elbow = np.zeros(len(union_idx), dtype=np.float64)
-        if np.any(active):
-            cand_bayesian_probs_br[active] = scorer_br._transform.score_to_probability(
-                active_scores, tfs, doc_len_ratios,
-            )
-            cand_bayesian_probs_mix[active] = scorer_br_mix._transform.score_to_probability(
-                active_scores, tfs, doc_len_ratios,
-            )
-            cand_bayesian_probs_elbow[active] = scorer_br_elbow._transform.score_to_probability(
-                active_scores, tfs, doc_len_ratios,
-            )
+        cand_bayesian_probs = _apply_bm25_transform(
+            scorer._transform,
+            cand_bm25,
+            active,
+            cand_tfs,
+            cand_doc_len_ratios,
+        )
+        cand_bayesian_probs_br = _apply_bm25_transform(
+            scorer_br._transform,
+            cand_bm25,
+            active,
+            cand_tfs,
+            cand_doc_len_ratios,
+        )
+        cand_bayesian_probs_mix = _apply_bm25_transform(
+            scorer_br_mix._transform,
+            cand_bm25,
+            active,
+            cand_tfs,
+            cand_doc_len_ratios,
+        )
+        cand_bayesian_probs_elbow = _apply_bm25_transform(
+            scorer_br_elbow._transform,
+            cand_bm25,
+            active,
+            cand_tfs,
+            cand_doc_len_ratios,
+        )
 
         # Cache for tuning
         if tune:
@@ -1496,18 +1854,81 @@ def run_dataset(
         )
 
         # VPT-calibrated dense fusion (Paper 3, Theorem 3.1.1)
-        # Background fitted from full query-corpus distance distribution;
-        # candidates calibrated via likelihood ratio f_R/f_G.
-        dense_dist_full = 1.0 - dense_sim
-        vpt = VectorProbabilityTransform.fit_background(dense_dist_full)
-        cand_dense_dist = 1.0 - cand_dense
-        vpt_dense_probs = vpt.calibrate(cand_dense_dist)
+        # Exact backend uses query-corpus distances for f_G; IVF backend
+        # uses build-time intra-cell distances and probed-cell statistics.
+        if dense_backend == "ivf" and dense_index is not None:
+            vpt = VectorProbabilityTransform.fit_background(
+                dense_index.background_distances,
+            )
+        else:
+            assert dense_full_scores is not None
+            vpt = VectorProbabilityTransform.fit_background(1.0 - dense_full_scores)
 
-        hybrid_scores["Bayesian-Vector-Balanced"] = fusion_vpt_balanced(
-            cand_bayesian_probs_br, vpt_dense_probs,
+        sample_distances = 1.0 - dense_sample_scores
+        cand_dense_dist = 1.0 - cand_dense
+        sample_bm25_scores, sample_active, sample_tfs, sample_doc_len_ratios = (
+            _compute_bm25_features_for_docs(
+                scorer, raw_bm25, dense_sample_idx, qtokens,
+            )
         )
+        sample_bm25_probs_br = _apply_bm25_transform(
+            scorer_br._transform,
+            sample_bm25_scores,
+            sample_active,
+            sample_tfs,
+            sample_doc_len_ratios,
+        )
+        sample_density_prior = None
+        if dense_sample_cell_populations is not None and dense_index is not None:
+            sample_density_prior = np.asarray(
+                ivf_density_prior(
+                    dense_sample_cell_populations,
+                    dense_index.avg_population,
+                ),
+                dtype=np.float64,
+            )
+        sample_vpt_weights = _combine_vpt_sample_guidance(
+            sample_bm25_probs_br,
+            sample_active,
+            sample_density_prior,
+        )
+        raw_vpt_dense_probs = vpt.calibrate_with_sample(
+            cand_dense_dist,
+            sample_distances,
+            weights=sample_vpt_weights,
+        )
+        vpt_gate: float | None = None
+        vpt_dense_probs_balanced = raw_vpt_dense_probs
+        if vpt_query_gating:
+            vpt_gate = _resolve_vpt_query_gate(
+                sample_active,
+                dense_top_scores_run,
+                bm25_topR,
+                dense_topR,
+                cand_dense,
+                raw_vpt_dense_probs,
+            )
+            vpt_gate_values.append(vpt_gate)
+            vpt_dense_probs_balanced = _blend_probability_signal(
+                np.asarray(cosine_to_probability(cand_dense), dtype=np.float64),
+                raw_vpt_dense_probs,
+                vpt_gate,
+            )
+
+        vector_balanced_scores = fusion_vpt_balanced(
+            cand_bayesian_probs_br, vpt_dense_probs_balanced,
+        )
+        if vpt_gate is not None:
+            safe_balanced_scores = np.asarray(
+                hybrid_scores["Bayesian-Balanced"], dtype=np.float64,
+            )
+            vector_balanced_scores = (
+                vpt_gate * vector_balanced_scores
+                + (1.0 - vpt_gate) * safe_balanced_scores
+            )
+        hybrid_scores["Bayesian-Vector-Balanced"] = vector_balanced_scores
         vpt_gated_input = np.column_stack(
-            [cand_bayesian_probs_br, vpt_dense_probs],
+            [cand_bayesian_probs_br, raw_vpt_dense_probs],
         )
         hybrid_scores["Bayesian-Vector-Softplus"] = log_odds_conjunction(
             vpt_gated_input, gating="softplus", max_logit=10.0,
@@ -1530,9 +1951,11 @@ def run_dataset(
             # MultiField-Bal: MultiField probs + dense via balanced_log_odds_fusion
             # Union of MultiField top-R and Dense top-R
             mf_union_set = set(mf_topR.tolist()) | set(dense_topR.tolist())
-            mf_union_idx = np.array(sorted(mf_union_set))
+            mf_union_idx = np.array(sorted(mf_union_set), dtype=np.int32)
             mf_cand_probs = mf_probs_full[mf_union_idx]
-            mf_cand_dense = dense_sim[mf_union_idx]
+            mf_cand_dense = np.asarray(
+                query_vec @ corpus_emb[mf_union_idx].T, dtype=np.float64,
+            )
             mf_balanced_scores = balanced_log_odds_fusion(mf_cand_probs, mf_cand_dense)
             runs["Bayesian-MultiField-Bal"][qid] = {
                 corpus_ids[mf_union_idx[j]]: float(mf_balanced_scores[j])
@@ -1544,17 +1967,21 @@ def run_dataset(
         bm25_hit_ratio = float(np.count_nonzero(raw_bm25)) / n_docs
         max_bm25_log = float(np.log1p(np.max(raw_bm25))) if np.any(raw_bm25 > 0) else 0.0
 
-        # Dense-side features (per-query, computed from full score arrays)
-        top10_k = min(10, n_docs)
-        dense_top_scores = np.sort(dense_sim)[-top10_k:]
-        dense_top10_mean = float(np.mean(dense_top_scores))
+        # Dense-side features derived from the backend's retrieved results.
+        top10_k = min(10, len(dense_top_scores_run))
+        dense_top_scores = dense_top_scores_run[:top10_k]
+        dense_top10_mean = float(np.mean(dense_top_scores)) if top10_k > 0 else 0.0
         dense_top10_std = float(np.std(dense_top_scores)) if top10_k > 1 else 0.0
-        max_dense_log = float(np.log1p(max(0.0, float(np.max(dense_sim)))))
+        max_dense_log = (
+            float(np.log1p(max(0.0, float(dense_top_scores_run[0]))))
+            if len(dense_top_scores_run) > 0
+            else 0.0
+        )
 
         # Cross-signal feature: top-100 retrieval overlap (Jaccard)
         top100_k = min(100, n_docs)
         bm25_top100 = set(np.argsort(-raw_bm25)[:top100_k].tolist())
-        dense_top100 = set(np.argsort(-dense_sim)[:top100_k].tolist())
+        dense_top100 = set(dense_topR[:top100_k].tolist())
         union_sz = len(bm25_top100 | dense_top100)
         overlap_ratio = float(len(bm25_top100 & dense_top100)) / union_sz if union_sz > 0 else 0.0
 
@@ -1563,7 +1990,7 @@ def run_dataset(
             "cand_probs": cand_bayesian_probs.copy(),
             "cand_probs_br": cand_bayesian_probs_br.copy(),
             "cand_dense": cand_dense.copy(),
-            "vpt_dense_probs": vpt_dense_probs.copy(),
+            "vpt_dense_probs": raw_vpt_dense_probs.copy(),
             "features": np.array(
                 [np.log1p(qlen), bm25_hit_ratio, max_bm25_log],
                 dtype=np.float64,
@@ -1578,6 +2005,15 @@ def run_dataset(
 
     print(f"  Scored {n_queries} queries x {len(methods)} methods, "
           f"R={effective_R} ({time.time() - t0:.1f}s)")
+    if vpt_query_gating and vpt_gate_values:
+        gate_arr = np.asarray(vpt_gate_values, dtype=np.float64)
+        print(
+            "  VPT query gate -- "
+            f"mean={np.mean(gate_arr):.3f}, "
+            f"p10={np.percentile(gate_arr, 10):.3f}, "
+            f"p50={np.percentile(gate_arr, 50):.3f}, "
+            f"p90={np.percentile(gate_arr, 90):.3f}"
+        )
 
     # 5b. Train and score AttentionLogOddsWeights (Paper 2, Section 8)
     # Collect (probability_pair, label, query_features) from qrels.
@@ -1863,22 +2299,30 @@ def run_dataset(
                 if not tqtokens:
                     continue
                 raw_bm25 = scorer._bm25.get_scores(tqtokens)
-                dense_sim = (train_emb[tq_idx] @ corpus_emb.T).astype(np.float64)
+                query_vec = train_emb[tq_idx]
+                dense_info = _retrieve_dense_candidates(
+                    query_vec,
+                    corpus_emb,
+                    effective_R,
+                    dense_backend=dense_backend,
+                    dense_index=dense_index,
+                    ivf_nprobe=ivf_nprobe_eff,
+                )
                 bm25_topR = np.argsort(-raw_bm25)[:effective_R]
-                dense_topR = np.argsort(-dense_sim)[:effective_R]
+                dense_topR = np.asarray(dense_info["top_idx"], dtype=np.int32)
                 union_set = set(bm25_topR.tolist()) | set(dense_topR.tolist())
-                union_idx = np.array(sorted(union_set))
-                cand_bm25 = raw_bm25[union_idx]
-                cand_dense = dense_sim[union_idx]
-                active = cand_bm25 > 0
-                a_scores = np.array([], dtype=np.float64)
-                a_tfs = np.array([], dtype=np.float64)
-                a_dlr = np.array([], dtype=np.float64)
-                if np.any(active):
-                    a_doc_ids = union_idx[active]
-                    a_scores = cand_bm25[active]
-                    a_dlr = scorer._doc_lengths[a_doc_ids] / scorer._avgdl
-                    a_tfs = scorer._compute_tf_batch(a_doc_ids, tqtokens)
+                union_idx = np.array(sorted(union_set), dtype=np.int32)
+                cand_dense = np.asarray(
+                    query_vec @ corpus_emb[union_idx].T, dtype=np.float64,
+                )
+                cand_bm25, active, cand_tfs, cand_doc_len_ratios = (
+                    _compute_bm25_features_for_docs(
+                        scorer, raw_bm25, union_idx, tqtokens,
+                    )
+                )
+                a_scores = cand_bm25[active]
+                a_tfs = cand_tfs[active]
+                a_dlr = cand_doc_len_ratios[active]
                 train_tune_cache[tqid] = {
                     "union_idx": union_idx,
                     "cand_dense": cand_dense,
@@ -2093,6 +2537,32 @@ def main() -> None:
         help="Sentence-transformers model (default: all-MiniLM-L6-v2)",
     )
     parser.add_argument(
+        "--dense-backend",
+        choices=["exact", "ivf"],
+        default="exact",
+        help="Dense retrieval backend (default: exact)",
+    )
+    parser.add_argument(
+        "--ivf-cells", type=int, default=None,
+        help="Number of IVF cells when --dense-backend ivf (default: auto)",
+    )
+    parser.add_argument(
+        "--ivf-nprobe", type=int, default=None,
+        help="Number of IVF cells to probe at query time (default: auto)",
+    )
+    parser.add_argument(
+        "--ivf-iterations", type=int, default=10,
+        help="K-means iterations for SimpleIVF (default: 10)",
+    )
+    parser.add_argument(
+        "--ivf-seed", type=int, default=42,
+        help="Random seed for SimpleIVF build (default: 42)",
+    )
+    parser.add_argument(
+        "--vpt-query-gating", action="store_true",
+        help="Apply unsupervised VPT gating to Bayesian-Vector-Balanced",
+    )
+    parser.add_argument(
         "-k", "--top-k", type=int, default=10,
         help="Evaluation depth (default: 10)",
     )
@@ -2138,8 +2608,18 @@ def main() -> None:
     print("=" * 70)
     print(f"  BEIR Hybrid Search Benchmark -- Bayesian BM25{tune_label}")
     print(f"  Model: {args.model}")
+    print(f"  Dense backend: {args.dense_backend}")
     print(f"  Datasets: {', '.join(args.datasets)}")
     print(f"  k={args.top_k}, R={args.retrieve_k}")
+    if args.dense_backend == "ivf":
+        ivf_cells_label = "auto" if args.ivf_cells is None else str(args.ivf_cells)
+        ivf_nprobe_label = "auto" if args.ivf_nprobe is None else str(args.ivf_nprobe)
+        print(
+            f"  IVF: cells={ivf_cells_label}, nprobe={ivf_nprobe_label}, "
+            f"iters={args.ivf_iterations}, seed={args.ivf_seed}"
+        )
+    if args.vpt_query_gating:
+        print("  VPT query gating: enabled")
     print(f"  Cache: {cache_label}")
     if args.download:
         print("  Download: enabled")
@@ -2164,6 +2644,12 @@ def main() -> None:
             k=args.top_k, retrieve_k=args.retrieve_k,
             tune=args.tune,
             cache_dir=effective_cache_dir,
+            dense_backend=args.dense_backend,
+            ivf_cells=args.ivf_cells,
+            ivf_nprobe=args.ivf_nprobe,
+            ivf_iterations=args.ivf_iterations,
+            ivf_seed=args.ivf_seed,
+            vpt_query_gating=args.vpt_query_gating,
         )
 
     print_results_table(all_results, k=args.top_k)
