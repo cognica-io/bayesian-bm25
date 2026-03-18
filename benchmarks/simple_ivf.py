@@ -8,11 +8,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import numpy as np
-
 
 _EPSILON = 1e-12
 
