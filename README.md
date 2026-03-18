@@ -21,7 +21,7 @@ Key capabilities:
 - **External prior features** — `prior_fn` callable on `BayesianProbabilityTransform` allows custom document priors to replace the composite prior, enabling features like recency or popularity weighting (Section 12.2 #6)
 - **Temporal adaptation** — `TemporalBayesianTransform` uses exponential decay to weight recent observations more heavily in `fit()`, tracking concept drift in non-stationary relevance patterns (Section 12.2 #3)
 - **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
-- **Vector score calibration** — `VectorProbabilityTransform` converts vector distances into calibrated probabilities via likelihood ratio framework: `P(R|d) = sigmoid(log(f_R(d) / f_G(d)) + logit(P_base))`, with KDE/GMM density estimation, gap detection, and auto-routing (Paper 3, Theorem 3.1.1)
+- **Vector score calibration** — `VectorProbabilityTransform` converts vector distances into calibrated probabilities via likelihood ratio framework: `P(R|d) = sigmoid(log(f_R(d) / f_G(d)) + logit(P_base))`, with KDE/GMM density estimation, gap detection, and auto-routing (Paper 3, Theorem 3.1.1); `calibrate_with_sample()` decouples density estimation from evaluation points for index-aware calibration where ANN neighborhoods inform the density model
 - **Index-aware density priors** — `ivf_density_prior()` and `knn_density_prior()` provide density-based prior weights from IVF cell populations and k-NN distances for informing the vector calibration (Paper 3, Strategy 4.6.2)
 - **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval; `BlockMaxIndex` provides tighter block-level bounds for BMW-style pruning (Section 6.2, Corollary 7.4.2)
 - **Calibration metrics** — `expected_calibration_error()`, `brier_score()`, `reliability_diagram()`, and `calibration_report()` for evaluating probability quality, with `CalibrationReport` bundling all metrics into a single diagnostic
@@ -183,6 +183,14 @@ knn_prior = knn_density_prior(kth_distance=0.5, global_median_kth=0.8)
 
 # Use density prior to inform calibration
 probabilities = vpt.calibrate(query_distances, density_prior=np.full(5, cell_prior))
+
+# Index-aware calibration: density estimated from local ANN sample,
+# probabilities produced for a separate evaluation set
+sample_distances = np.array([0.10, 0.15, 0.20, 0.50, 0.75, 0.80, 0.85])
+eval_distances = np.array([0.12, 0.30, 0.70])
+probabilities = vpt.calibrate_with_sample(
+    eval_distances, sample_distances, weights=bm25_probs[:3],
+)
 ```
 
 ### Learning Fusion Weights from Data

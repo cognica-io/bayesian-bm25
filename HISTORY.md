@@ -1,5 +1,37 @@
 # History
 
+## 0.12.0 (2026-03-18)
+
+- Add `calibrate_with_sample()` to `VectorProbabilityTransform` for index-aware calibration (Paper 3)
+  - Decouples density estimation sample from evaluation points so local ANN neighborhoods (e.g. IVF probed cells) inform f_R while probabilities are produced for an arbitrary evaluation set
+  - Uses the same auto-routing logic (gap detection, KDE/GMM selection) as `calibrate()`
+- Add `eval_points` keyword argument to `estimate_kde()` and `estimate_gmm()`
+  - Allows density estimation on training data with evaluation at different points
+  - Defaults to `None` (evaluate at the training distances, preserving existing behavior)
+- Extract `_estimate_relevant_density()` private method in `VectorProbabilityTransform`
+  - Unified density estimation dispatcher shared by `calibrate()` and `calibrate_with_sample()`
+  - Accepts separate `eval_points` and `sample_distances` arrays
+- Add `_signal_mass()` static helper for safe weight summation
+- Add `SimpleIVF` benchmark helper (`benchmarks/simple_ivf.py`)
+  - Cosine-similarity IVF index backed by NumPy for benchmark experiments
+  - `build()`: k-means clustering with L2-normalized centroids, automatic cell count heuristic
+  - `search()`: multi-probe search returning `IVFSearchResult` with full candidate and cell statistics
+  - `score_documents()`: exact dot-product scoring for arbitrary document subsets
+  - Stores `background_distances` (1 - centroid score) for `VectorProbabilityTransform.fit_background()`
+- Update hybrid BEIR benchmark (`benchmarks/hybrid_beir.py`) with IVF backend support
+  - Add `--dense-backend` flag (`exact` or `ivf`) with `--ivf-cells`, `--ivf-nprobe`, `--ivf-iterations`, `--ivf-seed` options
+  - Add `_retrieve_dense_candidates()` for unified exact/IVF dense retrieval
+  - Add `_resolve_ivf_nprobe()` for automatic nprobe selection based on top-k and cell population
+  - Add `_compute_bm25_features_for_docs()` and `_apply_bm25_transform()` helpers for arbitrary doc subsets
+  - Add `_combine_vpt_sample_guidance()` for blending lexical and density prior hints in logit space
+  - Add `_resolve_vpt_query_gate()` for unsupervised per-query VPT confidence gating
+  - Add `_blend_probability_signal()` for gated logit-space interpolation
+  - Refactor VPT fusion methods to use `calibrate_with_sample()` with IVF neighborhood samples
+  - Change `fusion_vpt_balanced()` from min-max normalized to additive log-odds with std-ratio scaling
+- Add tests for `eval_points` in `estimate_kde()` and `estimate_gmm()`
+- Add test for `calibrate_with_sample()` verifying external local sample usage
+- Add tests for `SimpleIVF` (`tests/test_vector_index.py`): build stats, nearest cluster search, exact dot-product agreement
+
 ## 0.11.0 (2026-03-17)
 
 - Add `VectorProbabilityTransform` for likelihood ratio calibration of vector similarity scores (Paper 3, Theorem 3.1.1)
