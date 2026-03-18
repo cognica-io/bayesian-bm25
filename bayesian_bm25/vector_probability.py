@@ -566,12 +566,13 @@ def ivf_density_prior(
 ) -> float | np.ndarray:
     """IVF cell density prior (Strategy 4.6.2).
 
-    Estimates local density from the population of the IVF cell:
+    Estimates informativeness from the population of the IVF cell:
 
-        prior = sigmoid(gamma * (cell_population / avg_population - 1))
+        prior = sigmoid(gamma * (avg_population / cell_population - 1))
 
-    Dense cells (population > average) receive higher prior probability,
-    reflecting higher local document density.
+    Sparse cells (population < average) receive higher prior weight,
+    reflecting that vector proximity is more discriminative in sparse
+    regions -- analogous to IDF in lexical retrieval.
 
     Parameters
     ----------
@@ -588,7 +589,8 @@ def ivf_density_prior(
         Density prior weight(s) in (0, 1).
     """
     cell_population = np.asarray(cell_population, dtype=np.float64)
-    ratio = cell_population / max(avg_population, _EPSILON) - 1.0
+    safe_pop = np.maximum(cell_population, _EPSILON)
+    ratio = avg_population / safe_pop - 1.0
     result = sigmoid(gamma * ratio)
     return float(result) if np.ndim(result) == 0 else result
 
@@ -601,11 +603,13 @@ def knn_density_prior(
 ) -> float | np.ndarray:
     """HNSW k-th neighbor density proxy.
 
-    Estimates local density from the k-th nearest neighbor distance:
+    Estimates informativeness from the k-th nearest neighbor distance:
 
-        prior = sigmoid(gamma * (global_median_kth / kth_distance - 1))
+        prior = sigmoid(gamma * (kth_distance / global_median_kth - 1))
 
-    Smaller k-th distances (denser neighborhoods) receive higher prior.
+    Sparse neighborhoods (large kth_distance) receive higher prior
+    weight, reflecting that vector proximity is more discriminative
+    in sparse regions -- analogous to IDF in lexical retrieval.
 
     Parameters
     ----------
@@ -622,7 +626,6 @@ def knn_density_prior(
         Density prior weight(s) in (0, 1).
     """
     kth_distance = np.asarray(kth_distance, dtype=np.float64)
-    safe_d = np.maximum(kth_distance, _EPSILON)
-    ratio = global_median_kth / safe_d - 1.0
+    ratio = kth_distance / max(global_median_kth, _EPSILON) - 1.0
     result = sigmoid(gamma * ratio)
     return float(result) if np.ndim(result) == 0 else result

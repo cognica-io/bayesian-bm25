@@ -392,39 +392,54 @@ def fusion_bayesian_bm25_or(
 
 
 def fusion_bayesian_bm25_logodds(
-    bayesian_probs: np.ndarray,
+    bm25_scores: np.ndarray,
+    bm25_alpha: float,
+    bm25_beta: float,
+    tfs: np.ndarray,
+    doc_len_ratios: np.ndarray,
     dense_sim: np.ndarray,
     dense_median: float,
     dense_alpha: float,
 ) -> np.ndarray:
-    """Per-query calibrated log-odds fusion.
+    """Per-query calibrated log-odds fusion (Theorem 7.1.1).
 
-    Documents with only one signal active use single-signal logit
-    (not penalized for missing the other).
-
-    Returns raw log-odds (not probabilities).  The sparse input has
-    already been through sigmoid in score_to_probability, so applying
-    sigmoid here would create a double sigmoid(logit(...)) round-trip
-    that accumulates numerical error.
+    Full BM25 posterior is assembled directly in logit space:
+        logit(L) + logit(prior)
+    avoiding the prob->logit round-trip.  Sigmoid once at the end.
     """
+    from bayesian_bm25.probability import (
+        BayesianProbabilityTransform,
+    )
+    from bayesian_bm25.probability import (
+        sigmoid as _sigmoid,
+    )
+
     n_signals = 2
     alpha = 0.5
     scale = n_signals ** alpha
     w_dense = 0.5
     w_sparse = 0.5
-    epsilon = 1e-10
 
-    logit_d = np.clip(dense_alpha * (dense_sim - dense_median), -500.0, 500.0)
+    logit_d = np.clip(
+        dense_alpha * (dense_sim - dense_median), -500.0, 500.0,
+    )
 
-    has_sparse = bayesian_probs > epsilon
-    p_s = np.clip(bayesian_probs, epsilon, 1.0 - epsilon)
-    logit_s = np.asarray(logit(p_s), dtype=np.float64)
+    # BM25 evidence: logit(L) + logit(prior) in logit space directly
+    logit_likelihood = bm25_alpha * (bm25_scores - bm25_beta)
+    prior = BayesianProbabilityTransform.composite_prior(
+        tfs, doc_len_ratios,
+    )
+    logit_prior = np.asarray(logit(prior), dtype=np.float64)
+    logit_s = np.clip(logit_likelihood + logit_prior, -500.0, 500.0)
+
+    has_sparse = bm25_scores > 0
 
     l_bar = w_dense * logit_d + w_sparse * logit_s
     scores_both = l_bar * scale
     scores_dense_only = logit_d * w_dense
 
-    return np.where(has_sparse, scores_both, scores_dense_only)
+    raw = np.where(has_sparse, scores_both, scores_dense_only)
+    return np.asarray(_sigmoid(raw), dtype=np.float64)
 
 
 def fusion_logodds_local(
@@ -463,35 +478,58 @@ def fusion_logodds_local(
 
 
 def fusion_bayesian_bm25_logodds_br(
-    bayesian_probs_br: np.ndarray,
+    bm25_scores: np.ndarray,
+    bm25_alpha: float,
+    bm25_beta: float,
+    base_rate: float,
+    tfs: np.ndarray,
+    doc_len_ratios: np.ndarray,
     dense_sim: np.ndarray,
     dense_median: float,
     dense_alpha: float,
 ) -> np.ndarray:
-    """Bayesian BM25 log-odds with base rate prior.
+    """Log-odds fusion with base rate prior (Theorem 7.1.1).
 
-    Returns raw log-odds (not probabilities).  Same rationale as
-    fusion_bayesian_bm25_logodds: the sparse input has already been
-    through sigmoid, so a second sigmoid would accumulate error.
+    Full BM25 posterior assembled directly in logit space:
+        logit(L) + logit(prior) + logit(base_rate)
+    Sigmoid applied once at the end.
     """
+    from bayesian_bm25.probability import (
+        BayesianProbabilityTransform,
+    )
+    from bayesian_bm25.probability import (
+        sigmoid as _sigmoid,
+    )
+
     n_signals = 2
     alpha = 0.5
     scale = n_signals ** alpha
     w_dense = 0.5
     w_sparse = 0.5
-    epsilon = 1e-10
 
-    logit_d = np.clip(dense_alpha * (dense_sim - dense_median), -500.0, 500.0)
+    logit_base = float(logit(base_rate))
 
-    has_sparse = bayesian_probs_br > epsilon
-    p_s = np.clip(bayesian_probs_br, epsilon, 1.0 - epsilon)
-    logit_s = np.asarray(logit(p_s), dtype=np.float64)
+    logit_d = np.clip(
+        dense_alpha * (dense_sim - dense_median), -500.0, 500.0,
+    )
+
+    logit_likelihood = bm25_alpha * (bm25_scores - bm25_beta)
+    prior = BayesianProbabilityTransform.composite_prior(
+        tfs, doc_len_ratios,
+    )
+    logit_prior = np.asarray(logit(prior), dtype=np.float64)
+    logit_s = np.clip(
+        logit_likelihood + logit_prior + logit_base, -500.0, 500.0,
+    )
+
+    has_sparse = bm25_scores > 0
 
     l_bar = w_dense * logit_d + w_sparse * logit_s
     scores_both = l_bar * scale
     scores_dense_only = logit_d * w_dense
 
-    return np.where(has_sparse, scores_both, scores_dense_only)
+    raw = np.where(has_sparse, scores_both, scores_dense_only)
+    return np.asarray(_sigmoid(raw), dtype=np.float64)
 
 
 def _min_max_normalize(arr: np.ndarray) -> np.ndarray:
@@ -1349,11 +1387,17 @@ def run_dataset(
         tfs = np.array([], dtype=np.float64)
         doc_len_ratios = np.array([], dtype=np.float64)
 
+        # Per-candidate tf and doc_len_ratio arrays (zero for inactive)
+        cand_tfs = np.zeros(len(union_idx), dtype=np.float64)
+        cand_doc_len_ratios = np.ones(len(union_idx), dtype=np.float64)
+
         if np.any(active):
             active_doc_ids = union_idx[active]
             active_scores = cand_bm25[active]
             doc_len_ratios = scorer._doc_lengths[active_doc_ids] / scorer._avgdl
             tfs = scorer._compute_tf_batch(active_doc_ids, qtokens)
+            cand_tfs[active] = tfs
+            cand_doc_len_ratios[active] = doc_len_ratios
             cand_bayesian_probs[active] = scorer._transform.score_to_probability(
                 active_scores, tfs, doc_len_ratios,
             )
@@ -1404,14 +1448,19 @@ def run_dataset(
                 cand_bayesian_probs, cand_dense,
             ),
             "Bayesian-LogOdds": fusion_bayesian_bm25_logodds(
-                cand_bayesian_probs, cand_dense, dense_median, dense_alpha,
+                cand_bm25, scorer._transform.alpha, scorer._transform.beta,
+                cand_tfs, cand_doc_len_ratios,
+                cand_dense, dense_median, dense_alpha,
             ),
             "Bayesian-LogOdds-Local": fusion_logodds_local(
                 cand_bm25, cand_dense,
                 bm25_median, bm25_alpha, dense_median, dense_alpha,
             ),
             "Bayesian-LogOdds-BR": fusion_bayesian_bm25_logodds_br(
-                cand_bayesian_probs_br, cand_dense, dense_median, dense_alpha,
+                cand_bm25, scorer_br._transform.alpha,
+                scorer_br._transform.beta, scorer_br.base_rate,
+                cand_tfs, cand_doc_len_ratios,
+                cand_dense, dense_median, dense_alpha,
             ),
             "Bayesian-Balanced": balanced_log_odds_fusion(
                 cand_bayesian_probs_br, cand_dense,
@@ -1895,7 +1944,8 @@ def run_dataset(
 # ---------------------------------------------------------------------------
 
 CALIBRATION_METHODS = [
-    "Bayesian-OR", "Bayesian-LogOdds-Local",
+    "Bayesian-OR",
+    "Bayesian-LogOdds", "Bayesian-LogOdds-Local", "Bayesian-LogOdds-BR",
     "Bayesian-Balanced",
     "Bayesian-Balanced-Mix", "Bayesian-Balanced-Elbow",
     "Bayesian-Gated-ReLU", "Bayesian-Gated-Swish", "Bayesian-Gated-GELU",

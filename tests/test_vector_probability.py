@@ -514,12 +514,14 @@ class TestLogOddsConjunctionIntegration:
 
 
 class TestIVFDensityPrior:
-    def test_dense_cell_gets_high_prior(self):
-        result = ivf_density_prior(200, 100.0)
+    def test_sparse_cell_gets_high_prior(self):
+        # Sparse cell (pop < avg): proximity is more informative (IDF analogy)
+        result = ivf_density_prior(50, 100.0)
         assert result > 0.5
 
-    def test_sparse_cell_gets_low_prior(self):
-        result = ivf_density_prior(50, 100.0)
+    def test_dense_cell_gets_low_prior(self):
+        # Dense cell (pop > avg): proximity is less discriminative
+        result = ivf_density_prior(200, 100.0)
         assert result < 0.5
 
     def test_average_cell_near_half(self):
@@ -527,18 +529,18 @@ class TestIVFDensityPrior:
         assert result == pytest.approx(0.5, abs=0.01)
 
     def test_gamma_increases_sensitivity(self):
-        dense_low_gamma = ivf_density_prior(200, 100.0, gamma=0.5)
-        dense_high_gamma = ivf_density_prior(200, 100.0, gamma=2.0)
-        # Higher gamma should push dense cells further from 0.5
-        assert dense_high_gamma > dense_low_gamma
+        sparse_low_gamma = ivf_density_prior(50, 100.0, gamma=0.5)
+        sparse_high_gamma = ivf_density_prior(50, 100.0, gamma=2.0)
+        # Higher gamma pushes sparse cells further above 0.5
+        assert sparse_high_gamma > sparse_low_gamma
 
     def test_array_input(self):
         populations = np.array([50, 100, 200, 300])
         result = ivf_density_prior(populations, 100.0)
         assert isinstance(result, np.ndarray)
         assert result.shape == (4,)
-        # Should be monotonically increasing
-        assert np.all(np.diff(result) > 0)
+        # Monotonically decreasing: sparser cells get higher weight
+        assert np.all(np.diff(result) < 0)
 
     def test_scalar_returns_float(self):
         result = ivf_density_prior(100, 100.0)
@@ -546,12 +548,14 @@ class TestIVFDensityPrior:
 
 
 class TestKNNDensityPrior:
-    def test_small_distance_gets_high_prior(self):
-        result = knn_density_prior(0.5, 1.0)
+    def test_sparse_neighborhood_gets_high_prior(self):
+        # Large kth_distance = sparse region = more informative match
+        result = knn_density_prior(2.0, 1.0)
         assert result > 0.5
 
-    def test_large_distance_gets_low_prior(self):
-        result = knn_density_prior(2.0, 1.0)
+    def test_dense_neighborhood_gets_low_prior(self):
+        # Small kth_distance = dense region = less discriminative
+        result = knn_density_prior(0.5, 1.0)
         assert result < 0.5
 
     def test_median_distance_near_half(self):
@@ -559,17 +563,18 @@ class TestKNNDensityPrior:
         assert result == pytest.approx(0.5, abs=0.01)
 
     def test_gamma_effect(self):
-        close_low_gamma = knn_density_prior(0.5, 1.0, gamma=0.5)
-        close_high_gamma = knn_density_prior(0.5, 1.0, gamma=2.0)
-        assert close_high_gamma > close_low_gamma
+        sparse_low_gamma = knn_density_prior(2.0, 1.0, gamma=0.5)
+        sparse_high_gamma = knn_density_prior(2.0, 1.0, gamma=2.0)
+        # Higher gamma pushes sparse neighborhoods further above 0.5
+        assert sparse_high_gamma > sparse_low_gamma
 
     def test_array_input(self):
         distances = np.array([0.3, 0.5, 1.0, 2.0, 5.0])
         result = knn_density_prior(distances, 1.0)
         assert isinstance(result, np.ndarray)
         assert result.shape == (5,)
-        # Should be monotonically decreasing (further = lower prior)
-        assert np.all(np.diff(result) < 0)
+        # Monotonically increasing: sparser (larger distance) = higher weight
+        assert np.all(np.diff(result) > 0)
 
     def test_scalar_returns_float(self):
         result = knn_density_prior(1.0, 1.0)
