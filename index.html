@@ -148,6 +148,7 @@ graph LR
     PROB --> FUSE["Fusion<br/>Log-Odds / AND / OR"]
     VEC["Vector Score"] --> COS["cosine_to_probability()"]
     VEC --> VPT["VectorProbabilityTransform<br/>P = sigmoid(log(f_R/f_G) + logit(base))"]
+    ANN["ANN Index<br/>(IVF / HNSW)"] -.->|"local sample"| VPT
     COS --> FUSE
     VPT --> FUSE
     FUSE --> RANK["Final<br/>Ranking"]
@@ -182,7 +183,8 @@ graph LR
     <div class="card">
       <h3>Vector Calibration</h3>
       <p>Likelihood ratio framework replaces $\frac{1+\cos\theta}{2}$ with
-        density ratio estimation (KDE/GMM). Index-free with optional IVF/HNSW density priors.</p>
+        density ratio estimation (KDE/GMM). <code>calibrate_with_sample()</code>
+        decouples eval from density sample for index-aware ANN calibration.</p>
     </div>
     <div class="card">
       <h3>WAND Pruning</h3>
@@ -311,9 +313,18 @@ graph LR
     $P(R|d) = \sigma(\log(f_R(d) / f_G(d)) + \text{logit}(P_{base}))$,
     where $f_R$ is estimated via weighted KDE or GMM-EM, and $f_G$ is the
     background Gaussian. Auto-routing selects KDE (gap detected, $K \geq 50$)
-    or GMM (small $K$ or smooth distributions). Index-free standalone helpers
-    <code>ivf_density_prior()</code> and <code>knn_density_prior()</code>
-    provide optional density priors from IVF cell populations or HNSW neighbor distances.
+    or GMM (small $K$ or smooth distributions).
+  </p>
+  <p>
+    <code>calibrate_with_sample()</code> decouples density estimation from
+    evaluation: the local ANN neighborhood (e.g. IVF probed cells) provides
+    the training sample for $f_R$, while probabilities are produced for an
+    arbitrary evaluation set. This is the index-aware calibration path where
+    the density landscape comes from one set of distances and the output
+    probabilities are needed at different points.
+    Standalone helpers <code>ivf_density_prior()</code> and
+    <code>knn_density_prior()</code> provide optional density priors from
+    IVF cell populations or HNSW neighbor distances.
   </p>
 </div>
 </section>
@@ -392,8 +403,11 @@ graph LR
   </p>
 
   <h4>Reproduce</h4>
-<pre><code><span class="cm"># Zero-shot (26 methods)</span>
+<pre><code><span class="cm"># Zero-shot (26 methods, exact dense retrieval)</span>
 python benchmarks/hybrid_beir.py -d &lt;beir-data-dir&gt;
+
+<span class="cm"># With IVF dense backend (index-aware calibration)</span>
+python benchmarks/hybrid_beir.py -d &lt;beir-data-dir&gt; --dense-backend ivf
 
 <span class="cm"># With tuning (supervised + grid search)</span>
 python benchmarks/hybrid_beir.py -d &lt;beir-data-dir&gt; --tune

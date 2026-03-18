@@ -33,6 +33,7 @@
     <li><a href="#multi-field">Multi-Field Search</a></li>
     <li><a href="#signal-fusion">Signal Fusion</a></li>
     <li><a href="#hybrid">Hybrid Text + Vector</a></li>
+    <li><a href="#vector-cal">Vector Calibration</a></li>
     <li><a href="#learnable">Learnable Weights</a></li>
     <li><a href="#attention">Attention Fusion</a></li>
     <li><a href="#multi-head">Multi-Head Fusion</a></li>
@@ -170,6 +171,46 @@ fused_softplus = log_odds_conjunction(stacked, gating=<span class="st">"softplus
 
 <span class="cm"># Generalized beta controls gate sharpness (Theorem 6.7.6)</span>
 fused_soft = log_odds_conjunction(stacked, gating=<span class="st">"swish"</span>, gating_beta=<span class="mi">0.5</span>)</code></pre>
+</section>
+
+<!-- ============ Vector Score Calibration ============ -->
+<section id="vector-cal">
+  <h2>Vector Score Calibration</h2>
+  <p>Calibrate vector distances into probabilities via likelihood ratio framework.
+    <code>calibrate()</code> uses the same distances for density estimation and evaluation.
+    <code>calibrate_with_sample()</code> decouples the two for index-aware ANN calibration.</p>
+
+  <span class="example-tag tag-python">Python</span>
+<pre><code><span class="kw">import</span> numpy <span class="kw">as</span> np
+<span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> VectorProbabilityTransform, ivf_density_prior
+
+<span class="cm"># Estimate background distribution from corpus distances</span>
+corpus_distances = np.random.normal(<span class="mi">0.8</span>, <span class="mi">0.15</span>, size=<span class="mi">10000</span>)
+vpt = VectorProbabilityTransform.fit_background(corpus_distances, base_rate=<span class="mi">0.01</span>)
+
+<span class="cm"># Basic calibration: same distances for density estimation and evaluation</span>
+query_distances = np.array([<span class="mi">0.3</span>, <span class="mi">0.5</span>, <span class="mi">0.7</span>, <span class="mi">0.9</span>, <span class="mi">1.1</span>])
+probabilities = vpt.calibrate(query_distances)
+
+<span class="cm"># With BM25 probability weights for informed density estimation</span>
+bm25_probs = np.array([<span class="mi">0.85</span>, <span class="mi">0.60</span>, <span class="mi">0.40</span>, <span class="mi">0.20</span>, <span class="mi">0.10</span>])
+probabilities = vpt.calibrate(query_distances, weights=bm25_probs)
+
+<span class="cm"># Index-aware calibration: density from local ANN sample,</span>
+<span class="cm"># probabilities for a separate evaluation set</span>
+sample_distances = np.array([<span class="mi">0.10</span>, <span class="mi">0.15</span>, <span class="mi">0.20</span>, <span class="mi">0.50</span>, <span class="mi">0.75</span>, <span class="mi">0.80</span>, <span class="mi">0.85</span>])
+eval_distances = np.array([<span class="mi">0.12</span>, <span class="mi">0.30</span>, <span class="mi">0.70</span>])
+probabilities = vpt.calibrate_with_sample(
+    eval_distances, sample_distances,
+    weights=bm25_probs[:<span class="mi">3</span>],
+)
+
+<span class="cm"># IVF density prior: denser cells suggest more relevant neighborhoods</span>
+cell_prior = ivf_density_prior(cell_population=<span class="mi">150</span>, avg_population=<span class="mi">100</span>)
+probabilities = vpt.calibrate_with_sample(
+    eval_distances, sample_distances,
+    density_prior=np.full(<span class="mi">7</span>, cell_prior),
+)</code></pre>
 </section>
 
 <!-- ============ Learnable Weights ============ -->

@@ -48,6 +48,11 @@
     <li><a href="#learnable">LearnableLogOddsWeights</a></li>
     <li><a href="#attention">AttentionLogOddsWeights</a></li>
     <li><a href="#multi-head">MultiHeadAttentionLogOddsWeights</a></li>
+    <li><a href="#vpt">VectorProbabilityTransform</a></li>
+    <li class="toc-h3"><a href="#vpt-fit">fit_background</a></li>
+    <li class="toc-h3"><a href="#vpt-calibrate">calibrate</a></li>
+    <li class="toc-h3"><a href="#vpt-calibrate-sample">calibrate_with_sample</a></li>
+    <li class="toc-h3"><a href="#vpt-priors">Density Priors</a></li>
     <li><a href="#calibrators">Calibrators</a></li>
     <li class="toc-h3"><a href="#platt">PlattCalibrator</a></li>
     <li class="toc-h3"><a href="#isotonic">IsotonicCalibrator</a></li>
@@ -287,6 +292,83 @@ fused = mh(test_probs, test_features, use_averaged=<span class="kw">True</span>)
 surviving_idx, fused_probs = mh.<span class="fn">prune</span>(
     candidate_probs, query_features, threshold=<span class="mi">0.5</span>,
     upper_bound_probs=candidate_upper_bounds,
+)</code></pre>
+</section>
+
+<!-- ============ VectorProbabilityTransform ============ -->
+<section id="vpt">
+  <h2>VectorProbabilityTransform</h2>
+  <p>
+    Converts vector distances into calibrated relevance probabilities via a
+    likelihood ratio framework (Paper 3, Theorem 3.1.1):
+    $P(R|d) = \sigma(\log(f_R(d) / f_G(d)) + \text{logit}(P_{base}))$.
+  </p>
+
+  <h3 id="vpt-fit">fit_background(distances, base_rate)</h3>
+  <p>Estimate the background Gaussian ($\mu_G$, $\sigma_G$) from a corpus distance sample.</p>
+<pre><code>vpt = <span class="fn">VectorProbabilityTransform</span>.<span class="fn">fit_background</span>(
+    corpus_distances,    <span class="cm"># ndarray -- distances from a corpus sample</span>
+    base_rate=<span class="mi">0.01</span>,      <span class="cm"># corpus-level relevance prior</span>
+)</code></pre>
+  <p>Returns a configured <code>VectorProbabilityTransform</code> instance. The
+    background distribution models how distances look for random (non-relevant)
+    documents.</p>
+
+  <h3 id="vpt-calibrate">calibrate(distances, weights, method, ...)</h3>
+  <p>Full calibration pipeline. Uses the input distances as both the density estimation
+    sample and the evaluation points.</p>
+<pre><code>probabilities = vpt.<span class="fn">calibrate</span>(
+    distances,            <span class="cm"># float or ndarray -- vector distances</span>
+    weights=<span class="kw">None</span>,         <span class="cm"># ndarray or None -- per-doc weights (e.g. BM25 probs)</span>
+    method=<span class="st">"auto"</span>,        <span class="cm"># "auto", "kde", or "gmm"</span>
+    bandwidth_factor=<span class="mi">2.0</span>, <span class="cm"># multiplicative KDE bandwidth factor</span>
+    density_prior=<span class="kw">None</span>,   <span class="cm"># ndarray or None -- external density prior weights</span>
+)</code></pre>
+  <p>Auto-routing selects between KDE and GMM based on gap detection and sample size.</p>
+
+  <h3 id="vpt-calibrate-sample">calibrate_with_sample(eval_distances, sample_distances, ...)</h3>
+  <p>Index-aware calibration path. Density $f_R$ is estimated from a local ANN neighborhood
+    sample, while probabilities are produced for a separate evaluation set.</p>
+<pre><code>probabilities = vpt.<span class="fn">calibrate_with_sample</span>(
+    eval_distances,       <span class="cm"># float or ndarray -- distances to calibrate</span>
+    sample_distances,     <span class="cm"># ndarray -- local neighborhood (e.g. IVF probed cells)</span>
+    weights=<span class="kw">None</span>,         <span class="cm"># ndarray or None -- weights for the sample</span>
+    method=<span class="st">"auto"</span>,        <span class="cm"># "auto", "kde", or "gmm"</span>
+    bandwidth_factor=<span class="mi">2.0</span>, <span class="cm"># multiplicative KDE bandwidth factor</span>
+    density_prior=<span class="kw">None</span>,   <span class="cm"># ndarray or None -- external density prior weights</span>
+)</code></pre>
+  <table>
+    <thead><tr><th>Parameter</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>eval_distances</code></td><td>Distances at which to produce output probabilities. Can differ from the sample.</td></tr>
+      <tr><td><code>sample_distances</code></td><td>Distances used to estimate $f_R$. Typically from ANN index probed cells.</td></tr>
+      <tr><td><code>weights</code></td><td>Per-sample weights (e.g. BM25 probabilities from the sample documents).</td></tr>
+      <tr><td><code>density_prior</code></td><td>External density prior (e.g. from <code>ivf_density_prior()</code>).</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <strong>When to use which:</strong> Use <code>calibrate()</code> when the same
+    distances serve as both the density sample and the evaluation points (e.g. exact
+    search). Use <code>calibrate_with_sample()</code> when the density landscape
+    comes from one set of distances (ANN neighborhood) and you need probabilities
+    at different points (the final candidates).
+  </div>
+
+  <h3 id="vpt-priors">Density Priors</h3>
+  <p>Standalone helper functions that provide density-based prior weights for
+    informing the vector calibration (Strategy 4.6.2).</p>
+<pre><code><span class="kw">from</span> bayesian_bm25 <span class="kw">import</span> ivf_density_prior, knn_density_prior
+
+<span class="cm"># IVF cell density: denser cells suggest more relevant neighborhoods</span>
+prior = <span class="fn">ivf_density_prior</span>(
+    cell_population=<span class="mi">150</span>,   <span class="cm"># population of the cell containing the document</span>
+    avg_population=<span class="mi">100</span>,    <span class="cm"># average cell population across the index</span>
+)
+
+<span class="cm"># k-NN density: closer k-th neighbor suggests denser (more relevant) region</span>
+prior = <span class="fn">knn_density_prior</span>(
+    kth_distance=<span class="mi">0.5</span>,        <span class="cm"># distance to the k-th neighbor</span>
+    global_median_kth=<span class="mi">0.8</span>,   <span class="cm"># median k-th neighbor distance across corpus</span>
 )</code></pre>
 </section>
 
