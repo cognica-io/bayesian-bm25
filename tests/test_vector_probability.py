@@ -470,6 +470,7 @@ class TestCalibrateEndToEnd:
             vct.calibrate(np.array([0.3, 0.5]), method="invalid")
 
 
+
 # ---------------------------------------------------------------------------
 # Integration with log_odds_conjunction
 # ---------------------------------------------------------------------------

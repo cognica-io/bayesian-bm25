@@ -175,6 +175,7 @@ def log_odds_conjunction(
     weights: np.ndarray | None = None,
     gating: str = "none",
     gating_beta: float = 1.0,
+    max_logit: float | None = None,
 ) -> np.ndarray | float:
     """Log-odds conjunction with multiplicative confidence scaling (Paper 2, Section 4).
 
@@ -227,6 +228,13 @@ def log_odds_conjunction(
         Sharpness parameter for swish and softplus gating.  Only used
         when ``gating="swish"`` or ``gating="softplus"``.  Default 1.0
         preserves existing behavior.
+    max_logit : float or None
+        Maximum absolute logit value.  Logits are clipped to
+        [-max_logit, +max_logit] after gating and before scaling.
+        Prevents sigmoid saturation that destroys ranking
+        discrimination when input probabilities are extreme
+        (e.g., density-ratio calibrated vector scores near 0 or 1).
+        None (default) disables clipping for backward compatibility.
 
     Returns
     -------
@@ -236,6 +244,9 @@ def log_odds_conjunction(
     n = probs.shape[-1]
     raw_logits = logit(probs)
     gated_logits = _apply_gating(raw_logits, gating, beta=gating_beta)
+
+    if max_logit is not None:
+        gated_logits = np.clip(gated_logits, -max_logit, max_logit)
 
     if weights is not None:
         weights = np.asarray(weights, dtype=np.float64)

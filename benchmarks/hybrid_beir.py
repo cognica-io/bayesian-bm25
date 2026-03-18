@@ -1510,7 +1510,7 @@ def run_dataset(
             [cand_bayesian_probs_br, vpt_dense_probs],
         )
         hybrid_scores["Bayesian-Vector-Softplus"] = log_odds_conjunction(
-            vpt_gated_input, gating="softplus",
+            vpt_gated_input, gating="softplus", max_logit=10.0,
         )
 
         for method_name, scores in hybrid_scores.items():
