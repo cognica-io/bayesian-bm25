@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Live Ranking Demo &mdash; Bayesian BM25</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
 <link rel="stylesheet" href="style.css">
 <style>
 /* --- Demo-specific styles --- */
@@ -78,12 +82,12 @@
     composite prior (term frequency + document length) dominates. As you feed relevance clicks,
     the model learns a steeper sigmoid and higher threshold &mdash; the BM25 score signal overtakes
     the prior, causing documents to swap ranks. Watch pairs D02/D09 and D03/D10.<br><br>
-    <strong>Click a document row</strong> to boost it. Each click increases
-    that document's log-odds with diminishing returns
-    (boost = 1.5 * log(1 + clicks)), so it rises quickly at first
-    then levels off without reaching 1.0.
-    The <strong>Step/Run</strong> buttons use simulated editorial feedback
-    to train the global sigmoid (alpha, beta) via SGD.
+    <strong>Click a document row</strong> to boost it. Each click adds a
+    diminishing increment to that document's log-odds:
+    $\Delta\!\operatorname{logit} = 1.5 \cdot \ln(1 + n_{\text{clicks}})$,
+    with probability mass conserved across all documents.
+    The <strong>Step/Run</strong> buttons train the global sigmoid
+    $(\alpha, \beta)$ via SGD with a hidden user model.
   </div>
 
   <div class="controls">
