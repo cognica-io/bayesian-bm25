@@ -54,6 +54,20 @@
 
 .speed-control { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; color: var(--muted); margin-top: 0.75rem; }
 .speed-control input[type="range"] { flex: 1; }
+
+details.note { padding: 0; }
+details.note summary { padding: 0.75rem 1rem; cursor: pointer; list-style: none; }
+details.note summary::-webkit-details-marker { display: none; }
+details.note summary::before { content: "\25B6"; display: inline-block; margin-right: 0.5rem; font-size: 0.7em; transition: transform 0.2s; }
+details.note[open] summary::before { transform: rotate(90deg); }
+details.note .note-body { padding: 0 1rem 0.75rem; }
+details.note .note-body p { margin-bottom: 0.75rem; }
+details.note .note-body p:last-child { margin-bottom: 0; }
+
+.toggle-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.88rem; cursor: pointer; margin-bottom: 0.5rem; }
+.toggle-row input[type="checkbox"] { width: 1rem; height: 1rem; accent-color: var(--accent); cursor: pointer; }
+.temporal-hint { font-size: 0.78rem; color: var(--muted); margin: 0.5rem 0 0; line-height: 1.5; }
+.option-select { font-size: 0.82rem; padding: 0.25rem 0.4rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg); cursor: pointer; }
 </style>
 </head>
 <body>
@@ -77,18 +91,44 @@
 <section>
 <div class="container">
 
-  <div class="note">
-    <strong>How it works:</strong> The model starts with a flat sigmoid (low alpha) where the
-    composite prior (term frequency + document length) dominates. As you feed relevance clicks,
-    the model learns a steeper sigmoid and higher threshold &mdash; the BM25 score signal overtakes
-    the prior, causing documents to swap ranks. Watch pairs D02/D09 and D03/D10.<br><br>
-    <strong>Click a document row</strong> to boost it. Each click adds a
+  <details class="note">
+    <summary><strong>How it works:</strong> The model starts with a flat sigmoid
+    (low alpha) where the composite prior dominates. Click a row to boost it;
+    use Step/Run to train the global sigmoid via SGD. &hellip;</summary>
+    <div class="note-body">
+    <p>As you feed relevance clicks, the model learns a steeper sigmoid and
+    higher threshold &mdash; the BM25 score signal overtakes the prior,
+    causing documents to swap ranks. Watch pairs D02/D09 and D03/D10.</p>
+    <p><strong>Click a document row</strong> to boost it. Each click adds a
     diminishing increment to that document's log-odds:
     $\Delta\!\operatorname{logit} = 1.5 \cdot \ln(1 + n_{\text{clicks}})$,
     with probability mass conserved across all documents.
     The <strong>Step/Run</strong> buttons train the global sigmoid
-    $(\alpha, \beta)$ via SGD with a hidden user model.
-  </div>
+    $(\alpha, \beta)$ via SGD with a hidden user model.</p>
+    <p><strong>Temporal weighting</strong> (sidebar toggle): click boosts decay
+    exponentially &mdash;
+    $\Delta\!\operatorname{logit} = 1.5 \cdot \sum_i e^{-\lambda(t - t_i)}$
+    where $\lambda = \ln 2 / h$ and $h$ is the half-life in steps.
+    Old clicks gradually lose influence unless reinforced.
+    The global model also uses time-weighted Polyak averaging so recent
+    SGD updates carry more weight.</p>
+    <p><strong>Attention fusion</strong> (sidebar toggle): decomposes each
+    document's score into three signals &mdash; BM25 likelihood, TF prior,
+    and doc-length prior &mdash; and learns softmax weights to combine them
+    via log-odds conjunction. Watch the weights shift as the model
+    discovers which signals matter most.
+    <strong>Gating</strong> (relu/swish/gelu) filters weak signals in
+    logit space before aggregation.</p>
+    <p><strong>Training mode:</strong>
+    <em>balanced</em> (C1) trains on sigmoid likelihood;
+    <em>prior-aware</em> (C2) trains on the full Bayesian posterior;
+    <em>prior-free</em> (C3) trains on likelihood but uses prior=0.5
+    at inference, ignoring TF and doc-length priors entirely.</p>
+    <p><strong>Base rate</strong> (Model Parameters slider): corpus-level
+    fraction of relevant documents. Lower values produce more conservative
+    probabilities; higher values are more generous.</p>
+    </div>
+  </details>
 
   <div class="controls">
     <button class="btn btn-primary" id="btn-step">Step (1 review)</button>
@@ -135,10 +175,77 @@
     <!-- Right: parameters sidebar -->
     <div class="sidebar">
       <div class="param-box">
+        <h4>Temporal Weighting</h4>
+        <label class="toggle-row">
+          <input type="checkbox" id="temporal-toggle">
+          <span>Enable temporal decay</span>
+        </label>
+        <div id="temporal-controls" style="display:none;">
+          <div class="speed-control" style="margin-top:0;">
+            <span style="white-space:nowrap;">Half-life:</span>
+            <input type="range" id="halflife-slider" min="5" max="200" value="50" step="5">
+            <span id="halflife-label" style="min-width:3em; text-align:right; font-weight:600;">50</span>
+          </div>
+          <div class="param-row" style="margin-top:0.5rem;">
+            <span class="label">lambda</span>
+            <span class="value" id="p-decay-rate">0.0139</span>
+          </div>
+          <p class="temporal-hint">
+            Click boosts halve every <em>h</em> steps.
+            Try clicking a document, then running 50+ SGD steps
+            to watch its boost fade.
+          </p>
+        </div>
+      </div>
+      <div class="param-box">
+        <h4>Attention Fusion</h4>
+        <label class="toggle-row">
+          <input type="checkbox" id="attention-toggle">
+          <span>Enable learned signal weights</span>
+        </label>
+        <div id="attention-controls" style="display:none;">
+          <div class="param-row"><span class="label">w<sub>likelihood</sub></span><span class="value" id="p-w-lik">0.333</span></div>
+          <div class="param-row"><span class="label">w<sub>tf_prior</sub></span><span class="value" id="p-w-tf">0.333</span></div>
+          <div class="param-row"><span class="label">w<sub>norm_prior</sub></span><span class="value" id="p-w-norm">0.333</span></div>
+          <div class="param-row" style="margin-top:0.5rem;">
+            <span class="label">gating</span>
+            <select id="gating-select" class="option-select" style="width:auto;">
+              <option value="none">none</option>
+              <option value="relu">relu</option>
+              <option value="swish">swish</option>
+              <option value="gelu">gelu</option>
+            </select>
+          </div>
+          <p class="temporal-hint">
+            Decomposes scoring into 3 signals and learns
+            which matter most via log-odds conjunction.
+            Gating filters weak logit signals before aggregation.
+          </p>
+        </div>
+      </div>
+      <div class="param-box">
+        <h4>Training Mode</h4>
+        <select id="training-mode" class="option-select" style="width:100%;">
+          <option value="balanced">Balanced (C1)</option>
+          <option value="prior_aware">Prior-aware (C2)</option>
+          <option value="prior_free">Prior-free (C3)</option>
+        </select>
+        <p class="temporal-hint">
+          C1: train on likelihood. C2: train on full posterior.
+          C3: train on likelihood, ignore priors at inference.
+        </p>
+      </div>
+      <div class="param-box">
         <h4>Model Parameters</h4>
         <div class="param-row"><span class="label">alpha</span><span class="value" id="p-alpha">0.200</span></div>
         <div class="param-row"><span class="label">beta</span><span class="value" id="p-beta">0.000</span></div>
-        <div class="param-row"><span class="label">base_rate</span><span class="value" id="p-br">0.050</span></div>
+        <div class="param-row">
+          <span class="label">base_rate</span>
+          <span class="value" style="display:flex; align-items:center; gap:0.4rem;">
+            <input type="range" id="baserate-slider" min="0.01" max="0.50" value="0.05" step="0.01" style="width:80px;">
+            <span id="p-br">0.050</span>
+          </span>
+        </div>
         <div class="param-row"><span class="label">avg alpha</span><span class="value" id="p-avg-alpha">0.200</span></div>
         <div class="param-row"><span class="label">avg beta</span><span class="value" id="p-avg-beta">0.000</span></div>
       </div>
@@ -181,6 +288,8 @@
 <script type="module">
 import {
   BayesianProbabilityTransform,
+  LearnableLogOddsWeights,
+  logOddsConjunction,
   sigmoid,
   logit,
   clampProbability,
@@ -207,7 +316,7 @@ const TRUE_BETA = 5.0;
 // have large effect but repeated clicks saturate gracefully
 // instead of pushing probability to 1.0.
 const BOOST_SCALE = 1.5;
-let clickCounts = {};
+let clickHistory = {};  // {docId: [stepNumber, ...]} for temporal decay
 
 // --- Seeded RNG (xoshiro128**) ---
 function makeRng(seed) {
@@ -226,8 +335,39 @@ function makeRng(seed) {
 
 let rng = makeRng(42);
 
+// --- Temporal weighting helpers ---
+function isTemporalEnabled() {
+  return document.getElementById('temporal-toggle').checked;
+}
+
+function getHalfLife() {
+  return parseInt(document.getElementById('halflife-slider').value, 10);
+}
+
+function computeBoost(docId) {
+  const history = clickHistory[docId] || [];
+  if (history.length === 0) return 0;
+  if (!isTemporalEnabled()) {
+    // Original: diminishing log returns
+    return BOOST_SCALE * Math.log(1 + history.length);
+  }
+  // Temporal: exponential decay -- each click's weight decays over time
+  const lambda = Math.log(2) / getHalfLife();
+  let weight = 0;
+  for (const t of history) {
+    weight += Math.exp(-lambda * (reviewCount - t));
+  }
+  return BOOST_SCALE * weight;
+}
+
+// --- Attention fusion helpers ---
+function isAttentionEnabled() {
+  return document.getElementById('attention-toggle').checked;
+}
+
 // --- State ---
 let transform;
+let fusion;  // LearnableLogOddsWeights for attention mode
 let reviewCount;
 let prevRanks;
 let initialRanks;
@@ -235,11 +375,14 @@ const logEl = document.getElementById("log-box");
 let running = false;
 
 function init() {
-  transform = new BayesianProbabilityTransform(0.2, 0.0, 0.05);
+  const br = parseFloat(document.getElementById('baserate-slider').value);
+  transform = new BayesianProbabilityTransform(0.2, 0.0, br);
+  transform._trainingMode = document.getElementById('training-mode').value;
+  fusion = new LearnableLogOddsWeights(3);  // likelihood, tf_prior, norm_prior
   reviewCount = 0;
   prevRanks = {};
   initialRanks = {};
-  clickCounts = {};
+  clickHistory = {};
   rng = makeRng(42);
   logEl.innerHTML = "";
   render();
@@ -255,16 +398,32 @@ function simulateClick(score) {
 
 function rankDocuments() {
   // 1. Compute base probabilities from the global model
+  const attentionOn = isAttentionEnabled();
   const entries = DOCUMENTS.map(doc => {
-    const baseProb = transform.scoreToProbability(doc.bm25, doc.tf, doc.dlr);
-    const clicks = clickCounts[doc.id] || 0;
+    let baseProb;
+    if (attentionOn) {
+      // Decompose into 3 signals and combine via learned weights
+      const lik = transform.likelihood(doc.bm25);
+      const tfP = BayesianProbabilityTransform.tfPrior(doc.tf);
+      const normP = BayesianProbabilityTransform.normPrior(doc.dlr);
+      const gating = document.getElementById('gating-select').value;
+      if (gating === 'none') {
+        baseProb = fusion.combine([lik, tfP, normP]);
+      } else {
+        baseProb = logOddsConjunction([lik, tfP, normP], fusion.alpha, fusion.weights, gating);
+      }
+    } else {
+      baseProb = transform.scoreToProbability(doc.bm25, doc.tf, doc.dlr);
+    }
+    const clicks = (clickHistory[doc.id] || []).length;
     return { ...doc, baseProb, clicks, relevant: RELEVANT_IDS.has(doc.id) };
   });
 
   // 2. Apply per-document boost in logit space
   const boostedLogits = entries.map(d => {
     let l = logit(clampProbability(d.baseProb));
-    if (d.clicks > 0) l += BOOST_SCALE * Math.log(1 + d.clicks);
+    const boost = computeBoost(d.id);
+    if (boost > 0) l += boost;
     return l;
   });
 
@@ -353,9 +512,15 @@ function render() {
 function updateParams() {
   document.getElementById("p-alpha").textContent = transform.alpha.toFixed(3);
   document.getElementById("p-beta").textContent = transform.beta.toFixed(3);
-  document.getElementById("p-br").textContent = (transform.baseRate || 0).toFixed(3);
   document.getElementById("p-avg-alpha").textContent = transform.averagedAlpha.toFixed(3);
   document.getElementById("p-avg-beta").textContent = transform.averagedBeta.toFixed(3);
+  // Attention weights
+  if (isAttentionEnabled() && fusion) {
+    const w = fusion.weights;
+    document.getElementById("p-w-lik").textContent = w[0].toFixed(3);
+    document.getElementById("p-w-tf").textContent = w[1].toFixed(3);
+    document.getElementById("p-w-norm").textContent = w[2].toFixed(3);
+  }
 }
 
 function feedbackOnDoc(docId) {
@@ -370,11 +535,12 @@ function feedbackOnDoc(docId) {
   // documents keep their baseline probabilities.  Only the clicked
   // document's log-odds increases, producing a clean rank change
   // without inflating the entire list toward 1.0.
-  clickCounts[clickedDoc.id] = (clickCounts[clickedDoc.id] || 0) + 1;
+  if (!clickHistory[clickedDoc.id]) clickHistory[clickedDoc.id] = [];
+  clickHistory[clickedDoc.id].push(reviewCount);
   reviewCount++;
 
-  const clicks = clickCounts[clickedDoc.id];
-  const boost = (BOOST_SCALE * Math.log(1 + clicks)).toFixed(2);
+  const clicks = clickHistory[clickedDoc.id].length;
+  const boost = computeBoost(clickedDoc.id).toFixed(2);
   logEl.innerHTML += `<span class="click">[${String(reviewCount).padStart(3)}] ${clickedDoc.id} score=${clickedDoc.bm25.toFixed(1)}  CLICK(${clicks})  boost=${boost}</span>\n`;
 
   logEl.scrollTop = logEl.scrollHeight;
@@ -389,12 +555,41 @@ function stepOnce() {
   const lr = reviewCount < 10 ? 0.15 : reviewCount < 30 ? 0.08 : 0.03;
   const mom = reviewCount < 10 ? 0.8 : reviewCount < 30 ? 0.9 : 0.95;
 
-  const score = reviewCount < 30
-    ? rng.choice(DOCUMENTS.map(d => d.bm25))
-    : rng.uniform(1.0, 10.0);
+  const attentionOn = isAttentionEnabled();
+  const mode = document.getElementById('training-mode').value;
+
+  // Sample: always pick a document when attention or prior_aware needs features
+  let score;
+  let sampledDoc = null;
+  if (reviewCount < 30 || attentionOn || mode === 'prior_aware') {
+    sampledDoc = rng.choice(DOCUMENTS);
+    score = sampledDoc.bm25;
+  } else {
+    score = rng.uniform(1.0, 10.0);
+  }
   const label = simulateClick(score);
 
-  transform.update(score, label, { learningRate: lr, momentum: mom });
+  const updateOpts = { learningRate: lr, momentum: mom, mode: mode };
+  if (isTemporalEnabled()) {
+    // Mirror TemporalBayesianTransform: reduce Polyak avg_decay over time
+    // so averaged parameters respond faster to recent observations
+    updateOpts.avgDecay = 0.995 * (1.0 - 1.0 / (1.0 + reviewCount + 1));
+  }
+  if (mode === 'prior_aware' && sampledDoc) {
+    updateOpts.tf = sampledDoc.tf;
+    updateOpts.docLenRatio = sampledDoc.dlr;
+  }
+  transform.update(score, label, updateOpts);
+
+  // Update fusion weights alongside the sigmoid
+  if (attentionOn && fusion && sampledDoc) {
+    const lik = transform.likelihood(sampledDoc.bm25);
+    const tfP = BayesianProbabilityTransform.tfPrior(sampledDoc.tf);
+    const normP = BayesianProbabilityTransform.normPrior(sampledDoc.dlr);
+    fusion.update([lik, tfP, normP], label, {
+      learningRate: lr, momentum: mom,
+    });
+  }
   reviewCount++;
 
   const cls = label === 1.0 ? "click" : "skip";
@@ -441,6 +636,47 @@ document.getElementById("btn-run50").addEventListener("click", () => runN(50));
 document.getElementById("btn-reset").addEventListener("click", () => { running = false; setTimeout(init, 50); });
 document.getElementById("speed-slider").addEventListener("input", (e) => {
   document.getElementById("speed-label").textContent = e.target.value + "ms";
+});
+
+// --- Temporal weighting controls ---
+document.getElementById("temporal-toggle").addEventListener("change", (e) => {
+  document.getElementById("temporal-controls").style.display = e.target.checked ? "block" : "none";
+  render();
+  updateParams();
+});
+
+// --- Attention fusion controls ---
+document.getElementById("attention-toggle").addEventListener("change", (e) => {
+  document.getElementById("attention-controls").style.display = e.target.checked ? "block" : "none";
+  render();
+  updateParams();
+});
+document.getElementById("halflife-slider").addEventListener("input", (e) => {
+  const hl = parseInt(e.target.value, 10);
+  document.getElementById("halflife-label").textContent = hl;
+  document.getElementById("p-decay-rate").textContent = (Math.log(2) / hl).toFixed(4);
+  render();
+});
+
+// --- Training mode ---
+document.getElementById("training-mode").addEventListener("change", (e) => {
+  transform._trainingMode = e.target.value;
+  render();
+  updateParams();
+});
+
+// --- Base rate slider ---
+document.getElementById("baserate-slider").addEventListener("input", (e) => {
+  const br = parseFloat(e.target.value);
+  transform.baseRate = br;
+  transform._logitBaseRate = logit(br);
+  document.getElementById("p-br").textContent = br.toFixed(3);
+  render();
+});
+
+// --- Gating ---
+document.getElementById("gating-select").addEventListener("change", () => {
+  render();
 });
 
 init();
