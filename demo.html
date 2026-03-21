@@ -22,9 +22,7 @@
 .ranking-table tbody tr { cursor: pointer; }
 .ranking-table tbody tr:hover td { background: #f0f7ff; }
 .ranking-table tbody tr.flash-click td { animation: flashGreen 0.4s ease; }
-.ranking-table tbody tr.flash-skip td { animation: flashRed 0.4s ease; }
 @keyframes flashGreen { 0% { background: #bbf7d0; } 100% { background: transparent; } }
-@keyframes flashRed { 0% { background: #fecaca; } 100% { background: transparent; } }
 
 .prob-bar { display: inline-block; height: 6px; background: var(--accent); border-radius: 3px; vertical-align: middle; margin-left: 0.4rem; transition: width 0.4s ease; }
 
@@ -81,7 +79,7 @@
     the model learns a steeper sigmoid and higher threshold &mdash; the BM25 score signal overtakes
     the prior, causing documents to swap ranks. Watch pairs D02/D09 and D03/D10.<br><br>
     <strong>Click a document row</strong> to mark it as relevant.
-    <strong>Right-click</strong> to mark it as not relevant.
+    Non-clicked documents below it become implicit negatives (contrastive learning).
     Or use the buttons below for simulated feedback.
   </div>
 
@@ -300,13 +298,7 @@ function render() {
     tr.addEventListener("click", () => {
       tr.classList.add("flash-click");
       setTimeout(() => tr.classList.remove("flash-click"), 400);
-      feedbackOnDoc(doc.id, 1.0);
-    });
-    tr.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      tr.classList.add("flash-skip");
-      setTimeout(() => tr.classList.remove("flash-skip"), 400);
-      feedbackOnDoc(doc.id, 0.0);
+      feedbackOnDoc(doc.id);
     });
     tbody.appendChild(tr);
   }
@@ -328,22 +320,33 @@ function updateParams() {
   document.getElementById("p-avg-beta").textContent = transform.averagedBeta.toFixed(3);
 }
 
-function feedbackOnDoc(docId, label) {
+function feedbackOnDoc(docId) {
   if (running) return;
-  const doc = DOCUMENTS.find(d => d.id === docId);
-  if (!doc) return;
+  const results = rankDocuments();
+  const clickedRank = results.findIndex(d => d.id === docId);
+  if (clickedRank < 0) return;
+  const clickedDoc = results[clickedRank];
 
   const lr = reviewCount < 10 ? 0.15 : reviewCount < 30 ? 0.08 : 0.03;
   const mom = reviewCount < 10 ? 0.8 : reviewCount < 30 ? 0.9 : 0.95;
 
-  transform.update(doc.bm25, label, { learningRate: lr, momentum: mom });
+  // Positive: the clicked document is relevant
+  transform.update(clickedDoc.bm25, 1.0, { learningRate: lr, momentum: mom });
   reviewCount++;
+  logEl.innerHTML += `<span class="click">[${String(reviewCount).padStart(3)}] ${clickedDoc.id} score=${clickedDoc.bm25.toFixed(1)}  CLICK  alpha=${transform.alpha.toFixed(3)}  beta=${transform.beta.toFixed(3)}</span>\n`;
 
-  const cls = label === 1.0 ? "click" : "skip";
-  const txt = label === 1.0 ? "CLICK" : "skip ";
-  logEl.innerHTML += `<span class="${cls}">[${String(reviewCount).padStart(3)}] ${doc.id} score=${doc.bm25.toFixed(1)}  ${txt}  alpha=${transform.alpha.toFixed(3)}  beta=${transform.beta.toFixed(3)}</span>\n`;
+  // Implicit negatives: documents ranked below the clicked one
+  // Sample one from the bottom half as a contrastive negative
+  const below = results.filter((_, i) => i > clickedRank);
+  if (below.length > 0) {
+    // Pick the document furthest from the clicked one (bottom of list)
+    const negDoc = below[below.length - 1];
+    transform.update(negDoc.bm25, 0.0, { learningRate: lr * 0.5, momentum: mom });
+    reviewCount++;
+    logEl.innerHTML += `<span class="skip">[${String(reviewCount).padStart(3)}] ${negDoc.id} score=${negDoc.bm25.toFixed(1)}  skip   (implicit)  alpha=${transform.alpha.toFixed(3)}  beta=${transform.beta.toFixed(3)}</span>\n`;
+  }
+
   logEl.scrollTop = logEl.scrollHeight;
-
   document.getElementById("phase-label").textContent = `Manual feedback (${reviewCount} reviews)`;
   document.getElementById("review-count").textContent = reviewCount;
 
