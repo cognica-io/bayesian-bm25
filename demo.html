@@ -19,6 +19,12 @@
 .ranking-table .move-up { color: #059669; font-weight: 600; }
 .ranking-table .move-down { color: #dc2626; font-weight: 600; }
 .ranking-table .move-none { color: var(--muted); }
+.ranking-table tbody tr { cursor: pointer; }
+.ranking-table tbody tr:hover td { background: #f0f7ff; }
+.ranking-table tbody tr.flash-click td { animation: flashGreen 0.4s ease; }
+.ranking-table tbody tr.flash-skip td { animation: flashRed 0.4s ease; }
+@keyframes flashGreen { 0% { background: #bbf7d0; } 100% { background: transparent; } }
+@keyframes flashRed { 0% { background: #fecaca; } 100% { background: transparent; } }
 
 .prob-bar { display: inline-block; height: 6px; background: var(--accent); border-radius: 3px; vertical-align: middle; margin-left: 0.4rem; transition: width 0.4s ease; }
 
@@ -72,8 +78,11 @@
   <div class="note">
     <strong>How it works:</strong> The model starts with a flat sigmoid (low alpha) where the
     composite prior (term frequency + document length) dominates. As you feed relevance clicks,
-    the model learns a steeper sigmoid and higher threshold -- the BM25 score signal overtakes
-    the prior, causing documents to swap ranks. Watch pairs D02/D09 and D03/D10.
+    the model learns a steeper sigmoid and higher threshold &mdash; the BM25 score signal overtakes
+    the prior, causing documents to swap ranks. Watch pairs D02/D09 and D03/D10.<br><br>
+    <strong>Click a document row</strong> to mark it as relevant.
+    <strong>Right-click</strong> to mark it as not relevant.
+    Or use the buttons below for simulated feedback.
   </div>
 
   <div class="controls">
@@ -98,7 +107,8 @@
             <th>DLR</th>
             <th>P(R)</th>
             <th></th>
-            <th>Move</th>
+            <th>Step</th>
+            <th>Total</th>
           </tr>
         </thead>
         <tbody id="ranking-body"></tbody>
@@ -206,6 +216,7 @@ let rng = makeRng(42);
 let transform;
 let reviewCount;
 let prevRanks;
+let initialRanks;
 const logEl = document.getElementById("log-box");
 let running = false;
 
@@ -213,6 +224,7 @@ function init() {
   transform = new BayesianProbabilityTransform(0.2, 0.0, 0.05);
   reviewCount = 0;
   prevRanks = {};
+  initialRanks = {};
   rng = makeRng(42);
   logEl.innerHTML = "";
   render();
@@ -241,20 +253,35 @@ function render() {
   const tbody = document.getElementById("ranking-body");
   tbody.innerHTML = "";
 
+  // Capture initial ranks on first render
+  if (Object.keys(initialRanks).length === 0) {
+    for (const doc of results) initialRanks[doc.id] = doc.rank;
+  }
+
   for (const doc of results) {
     const tr = document.createElement("tr");
     if (doc.relevant) tr.classList.add("relevant");
 
-    let moveHtml = '<span class="move-none">-</span>';
+    // Step delta (vs previous render)
+    let stepHtml = '<span class="move-none">-</span>';
     if (prevRanks[doc.id] !== undefined) {
       const delta = prevRanks[doc.id] - doc.rank;
       if (delta > 0) {
-        moveHtml = `<span class="move-up">+${delta}</span>`;
+        stepHtml = `<span class="move-up">+${delta}</span>`;
         tr.classList.add("swap-up");
       } else if (delta < 0) {
-        moveHtml = `<span class="move-down">${delta}</span>`;
+        stepHtml = `<span class="move-down">${delta}</span>`;
         tr.classList.add("swap-down");
       }
+    }
+
+    // Total delta (vs initial ranking)
+    let totalHtml = '<span class="move-none">-</span>';
+    const totalDelta = initialRanks[doc.id] - doc.rank;
+    if (totalDelta > 0) {
+      totalHtml = `<span class="move-up">+${totalDelta}</span>`;
+    } else if (totalDelta < 0) {
+      totalHtml = `<span class="move-down">${totalDelta}</span>`;
     }
 
     const barW = Math.round(doc.prob * 80);
@@ -267,8 +294,20 @@ function render() {
       <td>${doc.dlr.toFixed(1)}</td>
       <td>${doc.prob.toFixed(4)}</td>
       <td><span class="prob-bar" style="width:${barW}px"></span></td>
-      <td>${moveHtml}</td>
+      <td>${stepHtml}</td>
+      <td>${totalHtml}</td>
     `;
+    tr.addEventListener("click", () => {
+      tr.classList.add("flash-click");
+      setTimeout(() => tr.classList.remove("flash-click"), 400);
+      feedbackOnDoc(doc.id, 1.0);
+    });
+    tr.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      tr.classList.add("flash-skip");
+      setTimeout(() => tr.classList.remove("flash-skip"), 400);
+      feedbackOnDoc(doc.id, 0.0);
+    });
     tbody.appendChild(tr);
   }
 
@@ -287,6 +326,29 @@ function updateParams() {
   document.getElementById("p-br").textContent = (transform.baseRate || 0).toFixed(3);
   document.getElementById("p-avg-alpha").textContent = transform.averagedAlpha.toFixed(3);
   document.getElementById("p-avg-beta").textContent = transform.averagedBeta.toFixed(3);
+}
+
+function feedbackOnDoc(docId, label) {
+  if (running) return;
+  const doc = DOCUMENTS.find(d => d.id === docId);
+  if (!doc) return;
+
+  const lr = reviewCount < 10 ? 0.15 : reviewCount < 30 ? 0.08 : 0.03;
+  const mom = reviewCount < 10 ? 0.8 : reviewCount < 30 ? 0.9 : 0.95;
+
+  transform.update(doc.bm25, label, { learningRate: lr, momentum: mom });
+  reviewCount++;
+
+  const cls = label === 1.0 ? "click" : "skip";
+  const txt = label === 1.0 ? "CLICK" : "skip ";
+  logEl.innerHTML += `<span class="${cls}">[${String(reviewCount).padStart(3)}] ${doc.id} score=${doc.bm25.toFixed(1)}  ${txt}  alpha=${transform.alpha.toFixed(3)}  beta=${transform.beta.toFixed(3)}</span>\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+
+  document.getElementById("phase-label").textContent = `Manual feedback (${reviewCount} reviews)`;
+  document.getElementById("review-count").textContent = reviewCount;
+
+  render();
+  updateParams();
 }
 
 function stepOnce() {
