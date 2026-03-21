@@ -78,9 +78,8 @@
     composite prior (term frequency + document length) dominates. As you feed relevance clicks,
     the model learns a steeper sigmoid and higher threshold &mdash; the BM25 score signal overtakes
     the prior, causing documents to swap ranks. Watch pairs D02/D09 and D03/D10.<br><br>
-    <strong>Click a document row</strong> to mark it as relevant.
-    Non-clicked documents below it become implicit negatives (contrastive learning).
-    Or use the buttons below for simulated feedback.
+    <strong>Click a document row</strong> to mark it as relevant (steepens the sigmoid).
+    Or use the buttons below for simulated feedback with the hidden user model.
   </div>
 
   <div class="controls">
@@ -327,24 +326,16 @@ function feedbackOnDoc(docId) {
   if (clickedRank < 0) return;
   const clickedDoc = results[clickedRank];
 
-  const lr = reviewCount < 10 ? 0.15 : reviewCount < 30 ? 0.08 : 0.03;
-  const mom = reviewCount < 10 ? 0.8 : reviewCount < 30 ? 0.9 : 0.95;
+  // Positive-only update with aggressive learning rate and low
+  // momentum so alpha grows quickly per click.  As alpha increases,
+  // the sigmoid steepens and BM25 score dominates the composite
+  // prior, driving the expected rank swaps.
+  const lr = 0.30;
+  const mom = 0.5;
 
-  // Positive: the clicked document is relevant
   transform.update(clickedDoc.bm25, 1.0, { learningRate: lr, momentum: mom });
   reviewCount++;
   logEl.innerHTML += `<span class="click">[${String(reviewCount).padStart(3)}] ${clickedDoc.id} score=${clickedDoc.bm25.toFixed(1)}  CLICK  alpha=${transform.alpha.toFixed(3)}  beta=${transform.beta.toFixed(3)}</span>\n`;
-
-  // Implicit negatives: documents ranked below the clicked one
-  // Sample one from the bottom half as a contrastive negative
-  const below = results.filter((_, i) => i > clickedRank);
-  if (below.length > 0) {
-    // Pick the document furthest from the clicked one (bottom of list)
-    const negDoc = below[below.length - 1];
-    transform.update(negDoc.bm25, 0.0, { learningRate: lr * 0.5, momentum: mom });
-    reviewCount++;
-    logEl.innerHTML += `<span class="skip">[${String(reviewCount).padStart(3)}] ${negDoc.id} score=${negDoc.bm25.toFixed(1)}  skip   (implicit)  alpha=${transform.alpha.toFixed(3)}  beta=${transform.beta.toFixed(3)}</span>\n`;
-  }
 
   logEl.scrollTop = logEl.scrollHeight;
   document.getElementById("phase-label").textContent = `Manual feedback (${reviewCount} reviews)`;
