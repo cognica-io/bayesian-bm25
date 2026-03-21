@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Ranking Demo &mdash; Bayesian BM25</title>
+<link rel="stylesheet" href="style.css">
+<style>
+/* --- Demo-specific styles --- */
+.demo-grid { display: grid; grid-template-columns: 1fr 320px; gap: 2rem; margin-bottom: 2rem; }
+@media (max-width: 900px) { .demo-grid { grid-template-columns: 1fr; } }
+
+.ranking-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; font-variant-numeric: tabular-nums; }
+.ranking-table th { text-align: left; font-weight: 600; padding: 0.5rem 0.6rem; border-bottom: 2px solid var(--border); font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.ranking-table td { padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--border); transition: background 0.3s, transform 0.3s; }
+.ranking-table tr.relevant td:first-child { border-left: 3px solid var(--accent); }
+.ranking-table tr.swap-up td { background: #ecfdf5; }
+.ranking-table tr.swap-down td { background: #fef2f2; }
+.ranking-table .move-up { color: #059669; font-weight: 600; }
+.ranking-table .move-down { color: #dc2626; font-weight: 600; }
+.ranking-table .move-none { color: var(--muted); }
+
+.prob-bar { display: inline-block; height: 6px; background: var(--accent); border-radius: 3px; vertical-align: middle; margin-left: 0.4rem; transition: width 0.4s ease; }
+
+.sidebar { position: sticky; top: 60px; align-self: flex-start; }
+.param-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1rem; }
+.param-box h4 { margin: 0 0 0.75rem; font-size: 0.95rem; }
+.param-row { display: flex; justify-content: space-between; margin-bottom: 0.4rem; font-size: 0.88rem; }
+.param-row .label { color: var(--muted); }
+.param-row .value { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.controls { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.btn { display: inline-block; padding: 0.5rem 1rem; border: 1px solid var(--border); border-radius: 6px; font-size: 0.85rem; font-weight: 600; cursor: pointer; background: var(--surface); color: var(--fg); transition: background 0.15s, border-color 0.15s; }
+.btn:hover { border-color: var(--accent); background: #eff6ff; }
+.btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.btn-primary:hover { background: var(--accent-dark); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.phase-label { font-size: 0.82rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.5rem; }
+
+.log-box { background: var(--code-bg); color: var(--code-fg); padding: 0.75rem 1rem; border-radius: 8px; font-family: "JetBrains Mono", "Fira Code", monospace; font-size: 0.78rem; max-height: 200px; overflow-y: auto; line-height: 1.6; margin-top: 1rem; }
+.log-box .click { color: #4ade80; }
+.log-box .skip { color: #f87171; }
+
+.precision-badge { display: inline-block; background: var(--accent); color: #fff; padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.82rem; font-weight: 700; }
+
+.speed-control { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; color: var(--muted); margin-top: 0.75rem; }
+.speed-control input[type="range"] { flex: 1; }
+</style>
+</head>
+<body>
+
+<!-- ====== Hero ====== -->
+<header class="hero hero-compact">
+  <h1><span>Bayesian BM25</span> Live Ranking Demo</h1>
+  <p class="tagline">Watch document rankings shift in real time as user feedback trains the Bayesian probability model.</p>
+</header>
+
+<!-- ====== Nav ====== -->
+<nav>
+  <ul>
+    <li><a href="index.html">Overview</a></li>
+    <li><a href="docs.html">Docs</a></li>
+    <li><a href="examples.html">Examples</a></li>
+    <li><a href="demo.html" class="active">Demo</a></li>
+  </ul>
+</nav>
+
+<section>
+<div class="container">
+
+  <div class="note">
+    <strong>How it works:</strong> The model starts with a flat sigmoid (low alpha) where the
+    composite prior (term frequency + document length) dominates. As you feed relevance clicks,
+    the model learns a steeper sigmoid and higher threshold -- the BM25 score signal overtakes
+    the prior, causing documents to swap ranks. Watch pairs D02/D09 and D03/D10.
+  </div>
+
+  <div class="controls">
+    <button class="btn btn-primary" id="btn-step">Step (1 review)</button>
+    <button class="btn" id="btn-run10">Run 10</button>
+    <button class="btn" id="btn-run50">Run 50</button>
+    <button class="btn" id="btn-reset">Reset</button>
+  </div>
+
+  <div class="demo-grid">
+    <!-- Left: ranking table -->
+    <div>
+      <div class="phase-label" id="phase-label">Initial Ranking (prior-dominated)</div>
+      <table class="ranking-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>ID</th>
+            <th>Title</th>
+            <th>BM25</th>
+            <th>TF</th>
+            <th>DLR</th>
+            <th>P(R)</th>
+            <th></th>
+            <th>Move</th>
+          </tr>
+        </thead>
+        <tbody id="ranking-body"></tbody>
+      </table>
+      <p style="margin-top:0.75rem; font-size:0.88rem;">
+        Precision@5: <span class="precision-badge" id="precision">0/5</span>
+        &nbsp; Total reviews: <span id="review-count" style="font-weight:600;">0</span>
+      </p>
+
+      <div class="speed-control">
+        <span>Speed:</span>
+        <input type="range" id="speed-slider" min="10" max="500" value="150" step="10">
+        <span id="speed-label">150ms</span>
+      </div>
+
+      <div class="log-box" id="log-box"></div>
+    </div>
+
+    <!-- Right: parameters sidebar -->
+    <div class="sidebar">
+      <div class="param-box">
+        <h4>Model Parameters</h4>
+        <div class="param-row"><span class="label">alpha</span><span class="value" id="p-alpha">0.200</span></div>
+        <div class="param-row"><span class="label">beta</span><span class="value" id="p-beta">0.000</span></div>
+        <div class="param-row"><span class="label">base_rate</span><span class="value" id="p-br">0.050</span></div>
+        <div class="param-row"><span class="label">avg alpha</span><span class="value" id="p-avg-alpha">0.200</span></div>
+        <div class="param-row"><span class="label">avg beta</span><span class="value" id="p-avg-beta">0.000</span></div>
+      </div>
+      <div class="param-box">
+        <h4>Hidden User Model</h4>
+        <div class="param-row"><span class="label">true alpha</span><span class="value">2.000</span></div>
+        <div class="param-row"><span class="label">true beta</span><span class="value">5.000</span></div>
+        <p style="font-size:0.8rem; color:var(--muted); margin:0.5rem 0 0;">
+          The system does not know these values. It learns them from clicks.
+        </p>
+      </div>
+      <div class="param-box">
+        <h4>Key Pairs to Watch</h4>
+        <p style="font-size:0.82rem; margin:0;">
+          <strong>D02</strong> (BM25=7.3, tf=1, long) vs<br>
+          <strong>D09</strong> (BM25=6.5, tf=9, ideal)<br><br>
+          <strong>D03</strong> (BM25=5.8, tf=1, short) vs<br>
+          <strong>D10</strong> (BM25=4.9, tf=8, ideal)
+        </p>
+      </div>
+    </div>
+  </div>
+
+</div>
+</section>
+
+<!-- ====== Footer ====== -->
+<footer>
+  <div class="container">
+    <p>
+      Bayesian BM25
+      &middot; <a href="https://github.com/cognica-io/bayesian-bm25">GitHub</a>
+      &middot; <a href="https://pypi.org/project/bayesian-bm25/">PyPI</a>
+      &middot; <a href="https://cognica.io">Cognica</a>
+      &middot; Apache-2.0
+    </p>
+  </div>
+</footer>
+
+<script type="module">
+import {
+  BayesianProbabilityTransform,
+  sigmoid,
+} from "https://cdn.jsdelivr.net/npm/bayesian-bm25@0.8.0/dist/index.js";
+
+// --- Corpus ---
+const DOCUMENTS = [
+  { id: "D01", title: "EU AI Act: Full Text",              bm25: 9.2, tf: 8, dlr: 0.5 },
+  { id: "D06", title: "AI Regulation: US vs EU",           bm25: 8.5, tf: 7, dlr: 0.6 },
+  { id: "D02", title: "AI Law Overview (Long Report)",     bm25: 7.3, tf: 1, dlr: 2.5 },
+  { id: "D09", title: "Regulatory Compliance for AI",      bm25: 6.5, tf: 9, dlr: 0.5 },
+  { id: "D03", title: "AI Governance Brief",               bm25: 5.8, tf: 1, dlr: 0.1 },
+  { id: "D10", title: "Global AI Policy Landscape 2026",   bm25: 4.9, tf: 8, dlr: 0.5 },
+  { id: "D07", title: "Tech Stocks Rally on AI Hype",      bm25: 3.0, tf: 1, dlr: 1.8 },
+  { id: "D08", title: "Deep Learning Tutorial",            bm25: 1.5, tf: 1, dlr: 2.0 },
+];
+
+const RELEVANT_IDS = new Set(["D01", "D02", "D03", "D06", "D09", "D10"]);
+const TRUE_ALPHA = 2.0;
+const TRUE_BETA = 5.0;
+
+// --- Seeded RNG (xoshiro128**) ---
+function makeRng(seed) {
+  let s = [seed, seed ^ 0xdeadbeef, seed ^ 0x12345678, seed ^ 0x87654321];
+  function next() {
+    const r = (s[1] * 5) | 0;
+    const result = (((r << 7) | (r >>> 25)) * 9) | 0;
+    const t = (s[1] << 9) | 0;
+    s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3];
+    s[2] ^= t; s[3] = ((s[3] << 11) | (s[3] >>> 21)) | 0;
+    return (result >>> 0) / 4294967296;
+  }
+  return { random: next, choice(arr) { return arr[Math.floor(next() * arr.length)]; },
+           uniform(lo, hi) { return lo + next() * (hi - lo); } };
+}
+
+let rng = makeRng(42);
+
+// --- State ---
+let transform;
+let reviewCount;
+let prevRanks;
+const logEl = document.getElementById("log-box");
+let running = false;
+
+function init() {
+  transform = new BayesianProbabilityTransform(0.2, 0.0, 0.05);
+  reviewCount = 0;
+  prevRanks = {};
+  rng = makeRng(42);
+  logEl.innerHTML = "";
+  render();
+  updateParams();
+  document.getElementById("phase-label").textContent = "Initial Ranking (prior-dominated)";
+  document.getElementById("review-count").textContent = "0";
+}
+
+function simulateClick(score) {
+  const p = sigmoid(TRUE_ALPHA * (score - TRUE_BETA));
+  return rng.random() < p ? 1.0 : 0.0;
+}
+
+function rankDocuments() {
+  const results = DOCUMENTS.map(doc => {
+    const prob = transform.scoreToProbability(doc.bm25, doc.tf, doc.dlr);
+    return { ...doc, prob, relevant: RELEVANT_IDS.has(doc.id) };
+  });
+  results.sort((a, b) => b.prob - a.prob);
+  results.forEach((d, i) => { d.rank = i + 1; });
+  return results;
+}
+
+function render() {
+  const results = rankDocuments();
+  const tbody = document.getElementById("ranking-body");
+  tbody.innerHTML = "";
+
+  for (const doc of results) {
+    const tr = document.createElement("tr");
+    if (doc.relevant) tr.classList.add("relevant");
+
+    let moveHtml = '<span class="move-none">-</span>';
+    if (prevRanks[doc.id] !== undefined) {
+      const delta = prevRanks[doc.id] - doc.rank;
+      if (delta > 0) {
+        moveHtml = `<span class="move-up">+${delta}</span>`;
+        tr.classList.add("swap-up");
+      } else if (delta < 0) {
+        moveHtml = `<span class="move-down">${delta}</span>`;
+        tr.classList.add("swap-down");
+      }
+    }
+
+    const barW = Math.round(doc.prob * 80);
+    tr.innerHTML = `
+      <td>${doc.rank}</td>
+      <td><strong>${doc.id}</strong></td>
+      <td>${doc.title}</td>
+      <td>${doc.bm25.toFixed(1)}</td>
+      <td>${doc.tf}</td>
+      <td>${doc.dlr.toFixed(1)}</td>
+      <td>${doc.prob.toFixed(4)}</td>
+      <td><span class="prob-bar" style="width:${barW}px"></span></td>
+      <td>${moveHtml}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+
+  // Update prevRanks
+  prevRanks = {};
+  for (const doc of results) prevRanks[doc.id] = doc.rank;
+
+  // Precision@5
+  const top5rel = results.slice(0, 5).filter(d => d.relevant).length;
+  document.getElementById("precision").textContent = `${top5rel}/5`;
+}
+
+function updateParams() {
+  document.getElementById("p-alpha").textContent = transform.alpha.toFixed(3);
+  document.getElementById("p-beta").textContent = transform.beta.toFixed(3);
+  document.getElementById("p-br").textContent = (transform.baseRate || 0).toFixed(3);
+  document.getElementById("p-avg-alpha").textContent = transform.averagedAlpha.toFixed(3);
+  document.getElementById("p-avg-beta").textContent = transform.averagedBeta.toFixed(3);
+}
+
+function stepOnce() {
+  const lr = reviewCount < 10 ? 0.15 : reviewCount < 30 ? 0.08 : 0.03;
+  const mom = reviewCount < 10 ? 0.8 : reviewCount < 30 ? 0.9 : 0.95;
+
+  const score = reviewCount < 30
+    ? rng.choice(DOCUMENTS.map(d => d.bm25))
+    : rng.uniform(1.0, 10.0);
+  const label = simulateClick(score);
+
+  transform.update(score, label, { learningRate: lr, momentum: mom });
+  reviewCount++;
+
+  const cls = label === 1.0 ? "click" : "skip";
+  const txt = label === 1.0 ? "CLICK" : "skip ";
+  logEl.innerHTML += `<span class="${cls}">[${String(reviewCount).padStart(3)}] score=${score.toFixed(1)}  ${txt}  alpha=${transform.alpha.toFixed(3)}  beta=${transform.beta.toFixed(3)}</span>\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+
+  // Phase label
+  const el = document.getElementById("phase-label");
+  if (reviewCount <= 10) el.textContent = `Phase 1: First editorial session (${reviewCount}/10)`;
+  else if (reviewCount <= 30) el.textContent = `Phase 2: Second session (${reviewCount}/30)`;
+  else el.textContent = `Phase 3: Continuous adaptation (${reviewCount} reviews)`;
+
+  document.getElementById("review-count").textContent = reviewCount;
+
+  render();
+  updateParams();
+}
+
+function getDelay() { return parseInt(document.getElementById("speed-slider").value, 10); }
+
+async function runN(n) {
+  if (running) return;
+  running = true;
+  setButtonsDisabled(true);
+  for (let i = 0; i < n; i++) {
+    stepOnce();
+    await new Promise(r => setTimeout(r, getDelay()));
+    if (!running) break;
+  }
+  running = false;
+  setButtonsDisabled(false);
+}
+
+function setButtonsDisabled(disabled) {
+  document.getElementById("btn-step").disabled = disabled;
+  document.getElementById("btn-run10").disabled = disabled;
+  document.getElementById("btn-run50").disabled = disabled;
+}
+
+document.getElementById("btn-step").addEventListener("click", () => { if (!running) stepOnce(); });
+document.getElementById("btn-run10").addEventListener("click", () => runN(10));
+document.getElementById("btn-run50").addEventListener("click", () => runN(50));
+document.getElementById("btn-reset").addEventListener("click", () => { running = false; setTimeout(init, 50); });
+document.getElementById("speed-slider").addEventListener("input", (e) => {
+  document.getElementById("speed-label").textContent = e.target.value + "ms";
+});
+
+init();
+</script>
+
+</body>
+</html>
