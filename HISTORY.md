@@ -1,6 +1,6 @@
 # History
 
-## 0.12.0 (2026-03-18)
+## 0.12.0 (2026-03-21)
 
 - Add `calibrate_with_sample()` to `VectorProbabilityTransform` for index-aware calibration (Paper 3)
   - Decouples density estimation sample from evaluation points so local ANN neighborhoods (e.g. IVF probed cells) inform f_R while probabilities are produced for an arbitrary evaluation set
@@ -14,23 +14,30 @@
 - Add `_signal_mass()` static helper for safe weight summation
 - Add `SimpleIVF` benchmark helper (`benchmarks/simple_ivf.py`)
   - Cosine-similarity IVF index backed by NumPy for benchmark experiments
-  - `build()`: k-means clustering with L2-normalized centroids, automatic cell count heuristic
-  - `search()`: multi-probe search returning `IVFSearchResult` with full candidate and cell statistics
+  - `build()`: k-means clustering with L2-normalized centroids, automatic cell count heuristic, per-cell residual statistics (`cell_residual_means`, `cell_residual_q90`)
+  - `search()`: multi-probe search returning `IVFSearchResult` with full candidate, cell statistics, and `centroid_scores`
   - `score_documents()`: exact dot-product scoring for arbitrary document subsets
   - Stores `background_distances` (1 - centroid score) for `VectorProbabilityTransform.fit_background()`
+- Add `SearchDiagnostics` and separability gating (`benchmarks/search_diagnostics.py`)
+  - `SearchDiagnostics`: query-local retrieval diagnostics with accepted/contrast distance shells, purity, and coverage
+  - `build_exact_search_diagnostics()`: diagnostics from exact top-rank distance shells
+  - `build_ivf_search_diagnostics()`: diagnostics from IVF primary-cell purity and cross-cell contrast
+  - `separability_gate()`: silhouette-like gate mapping cohesion/separation ratio to `[min_gate, max_gate]`
 - Update hybrid BEIR benchmark (`benchmarks/hybrid_beir.py`) with IVF backend support
   - Add `--dense-backend` flag (`exact` or `ivf`) with `--ivf-cells`, `--ivf-nprobe`, `--ivf-iterations`, `--ivf-seed` options
   - Add `_retrieve_dense_candidates()` for unified exact/IVF dense retrieval
   - Add `_resolve_ivf_nprobe()` for automatic nprobe selection based on top-k and cell population
   - Add `_compute_bm25_features_for_docs()` and `_apply_bm25_transform()` helpers for arbitrary doc subsets
   - Add `_combine_vpt_sample_guidance()` for blending lexical and density prior hints in logit space
-  - Add `_resolve_vpt_query_gate()` for unsupervised per-query VPT confidence gating
   - Add `_blend_probability_signal()` for gated logit-space interpolation
+  - Refactor VPT query gating to use `SearchDiagnostics` and `separability_gate()` from `search_diagnostics` module
   - Refactor VPT fusion methods to use `calibrate_with_sample()` with IVF neighborhood samples
   - Change `fusion_vpt_balanced()` from min-max normalized to additive log-odds with std-ratio scaling
+- Add example: `examples/live_ranking.py` -- live ranking demo showing online learning rank swaps with simulated editorial feedback
 - Add tests for `eval_points` in `estimate_kde()` and `estimate_gmm()`
 - Add test for `calibrate_with_sample()` verifying external local sample usage
-- Add tests for `SimpleIVF` (`tests/test_vector_index.py`): build stats, nearest cluster search, exact dot-product agreement
+- Add tests for `SimpleIVF` (`tests/test_vector_index.py`): build stats, cell residual statistics, nearest cluster search, exact dot-product agreement
+- Add tests for `SearchDiagnostics` (`tests/test_search_diagnostics.py`): exact/IVF diagnostics builders, reliability penalty, separability gating
 
 ## 0.11.0 (2026-03-17)
 

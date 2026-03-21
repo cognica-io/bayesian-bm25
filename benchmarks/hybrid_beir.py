@@ -95,6 +95,11 @@ from bayesian_bm25.vector_probability import (
     VectorProbabilityTransform,
     ivf_density_prior,
 )
+from benchmarks.search_diagnostics import (
+    build_exact_search_diagnostics,
+    build_ivf_search_diagnostics,
+    separability_gate,
+)
 from benchmarks.simple_ivf import IVFSearchResult, SimpleIVF
 
 STEMMER = Stemmer.Stemmer("english")
@@ -514,107 +519,6 @@ def _combine_vpt_sample_guidance(
         sigmoid(np.clip(blended_logit, -max_logit, max_logit)),
         dtype=np.float64,
     )
-
-
-def _resolve_vpt_query_gate(
-    sample_active: np.ndarray,
-    dense_top_scores: np.ndarray,
-    bm25_top_idx: np.ndarray,
-    dense_top_idx: np.ndarray,
-    dense_candidate_scores: np.ndarray | None = None,
-    vpt_dense_probs: np.ndarray | None = None,
-    *,
-    overlap_k: int = 100,
-    min_gate: float = 0.02,
-    max_gate: float = 0.98,
-) -> float:
-    """Estimate how much VPT evidence should influence this query.
-
-    Unsupervised continuous gate based only on query-time observables:
-    confidence from lexical/dense agreement and dense separation, divided by
-    confidence plus VPT distortion risk.
-    """
-    def _squash_positive(value: float, scale: float) -> float:
-        value = max(float(value), 0.0)
-        scale = max(float(scale), 1e-6)
-        return value / (value + scale)
-
-    sample_active = np.asarray(sample_active, dtype=bool)
-    dense_top_scores = np.asarray(dense_top_scores, dtype=np.float64)
-    bm25_top_idx = np.asarray(bm25_top_idx, dtype=np.int32)
-    dense_top_idx = np.asarray(dense_top_idx, dtype=np.int32)
-
-    sample_active_ratio = (
-        float(np.mean(sample_active)) if len(sample_active) > 0 else 0.0
-    )
-
-    top_k = min(overlap_k, len(bm25_top_idx), len(dense_top_idx))
-    if top_k > 0:
-        bm25_top = set(bm25_top_idx[:top_k].tolist())
-        dense_top = set(dense_top_idx[:top_k].tolist())
-        union_sz = len(bm25_top | dense_top)
-        overlap_ratio = (
-            float(len(bm25_top & dense_top)) / union_sz if union_sz > 0 else 0.0
-        )
-    else:
-        overlap_ratio = 0.0
-
-    if len(dense_top_scores) == 0:
-        dense_margin = 0.0
-        dense_spread = 0.0
-    else:
-        top1 = float(dense_top_scores[0])
-        top2 = float(dense_top_scores[1]) if len(dense_top_scores) > 1 else top1
-        top10_mean = float(np.mean(dense_top_scores[: min(10, len(dense_top_scores))]))
-        dense_margin = max(top1 - top2, 0.0)
-        dense_spread = max(top1 - top10_mean, 0.0)
-
-    confidence = (
-        0.35 * _squash_positive(sample_active_ratio, 0.08)
-        + 0.25 * _squash_positive(overlap_ratio, 0.10)
-        + 0.20 * _squash_positive(dense_margin, 0.01)
-        + 0.20 * _squash_positive(dense_spread, 0.02)
-    )
-    risk = 0.0
-
-    if dense_candidate_scores is not None and vpt_dense_probs is not None:
-        dense_candidate_scores = np.asarray(
-            dense_candidate_scores, dtype=np.float64,
-        )
-        vpt_dense_probs = np.asarray(vpt_dense_probs, dtype=np.float64)
-        if (
-            len(dense_candidate_scores) > 1
-            and len(vpt_dense_probs) == len(dense_candidate_scores)
-        ):
-            base_logits = np.asarray(
-                logit(cosine_to_probability(dense_candidate_scores)),
-                dtype=np.float64,
-            )
-            vpt_logits = np.asarray(
-                logit(_clamp_probability(vpt_dense_probs)),
-                dtype=np.float64,
-            )
-            base_std = max(float(np.std(base_logits)), 1e-6)
-            vpt_std = max(float(np.std(vpt_logits)), 1e-6)
-            std_log_ratio = abs(float(np.log(vpt_std / base_std)))
-            mean_shift = float(np.mean(np.abs(vpt_logits - base_logits)))
-            sat_ratio = float(
-                np.mean((vpt_dense_probs <= 0.02) | (vpt_dense_probs >= 0.98))
-            )
-            p95_shift = abs(
-                float(np.percentile(np.abs(vpt_logits), 95))
-                - float(np.percentile(np.abs(base_logits), 95))
-            )
-
-            risk = (
-                0.35 * _squash_positive(std_log_ratio, 0.30)
-                + 0.35 * _squash_positive(mean_shift, 1.25)
-                + 0.20 * _squash_positive(sat_ratio, 0.08)
-                + 0.10 * _squash_positive(p95_shift, 1.0)
-            )
-
-    gate = confidence / max(confidence + risk, 1e-6)
-    return float(np.clip(gate, min_gate, max_gate))
 
 
 def _blend_probability_signal(
@@ -1715,6 +1619,7 @@ def run_dataset(
         )
         dense_sample_cell_populations = dense_info["sample_cell_populations"]
         dense_full_scores = dense_info["full_scores"]
+        dense_search_result = dense_info["search_result"]
 
         # -- Retrieve top-R from each signal --
         bm25_topR = np.argsort(-raw_bm25)[:effective_R]
@@ -1900,14 +1805,21 @@ def run_dataset(
         vpt_gate: float | None = None
         vpt_dense_probs_balanced = raw_vpt_dense_probs
         if vpt_query_gating:
-            vpt_gate = _resolve_vpt_query_gate(
-                sample_active,
-                dense_top_scores_run,
-                bm25_topR,
-                dense_topR,
-                cand_dense,
-                raw_vpt_dense_probs,
-            )
+            diagnostics = None
+            if (
+                dense_backend == "ivf"
+                and dense_index is not None
+                and isinstance(dense_search_result, IVFSearchResult)
+            ):
+                diagnostics = build_ivf_search_diagnostics(
+                    dense_top_scores_run,
+                    dense_search_result.cell_ids,
+                    dense_search_result,
+                    dense_index,
+                )
+            else:
+                diagnostics = build_exact_search_diagnostics(dense_top_scores_run)
+            vpt_gate = separability_gate(diagnostics)
             vpt_gate_values.append(vpt_gate)
             vpt_dense_probs_balanced = _blend_probability_signal(
                 np.asarray(cosine_to_probability(cand_dense), dtype=np.float64),

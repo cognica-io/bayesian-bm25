@@ -36,6 +36,7 @@ class IVFSearchResult:
     candidate_cell_populations: np.ndarray
     probed_cell_ids: np.ndarray
     probed_cell_scores: np.ndarray
+    centroid_scores: np.ndarray
 
 
 class SimpleIVF:
@@ -51,6 +52,8 @@ class SimpleIVF:
         *,
         default_nprobe: int,
         background_distances: np.ndarray,
+        cell_residual_means: np.ndarray,
+        cell_residual_q90: np.ndarray,
     ) -> None:
         self.embeddings = np.asarray(embeddings, dtype=np.float32)
         self.centroids = np.asarray(centroids, dtype=np.float32)
@@ -61,6 +64,10 @@ class SimpleIVF:
         self.background_distances = np.asarray(
             background_distances, dtype=np.float64,
         )
+        self.cell_residual_means = np.asarray(
+            cell_residual_means, dtype=np.float64,
+        )
+        self.cell_residual_q90 = np.asarray(cell_residual_q90, dtype=np.float64)
 
         self.n_docs = int(self.embeddings.shape[0])
         self.dim = int(self.embeddings.shape[1])
@@ -130,6 +137,18 @@ class SimpleIVF:
             embeddings * centroids[assignments], axis=1, dtype=np.float32,
         )
         background_distances = 1.0 - centroid_scores.astype(np.float64)
+        global_residual_mean = float(np.mean(background_distances))
+        global_residual_q90 = float(np.percentile(background_distances, 90))
+
+        cell_residual_means = np.full(n_cells, global_residual_mean, dtype=np.float64)
+        cell_residual_q90 = np.full(n_cells, global_residual_q90, dtype=np.float64)
+        for cell_id in range(n_cells):
+            mask = assignments == cell_id
+            if not np.any(mask):
+                continue
+            cell_res = background_distances[mask]
+            cell_residual_means[cell_id] = float(np.mean(cell_res))
+            cell_residual_q90[cell_id] = float(np.percentile(cell_res, 90))
 
         default_nprobe = max(1, int(round(math.sqrt(n_cells))))
         return cls(
@@ -140,6 +159,8 @@ class SimpleIVF:
             cell_offsets=offsets,
             default_nprobe=default_nprobe,
             background_distances=background_distances,
+            cell_residual_means=cell_residual_means,
+            cell_residual_q90=cell_residual_q90,
         )
 
     def _docs_for_cells(self, cell_ids: np.ndarray) -> np.ndarray:
@@ -217,6 +238,7 @@ class SimpleIVF:
                 candidate_cell_populations=candidate_cell_populations,
                 probed_cell_ids=probed_cell_ids,
                 probed_cell_scores=probed_cell_scores,
+                centroid_scores=np.asarray(centroid_scores, dtype=np.float64),
             )
 
         if k_eff == len(candidate_indices):
@@ -243,4 +265,5 @@ class SimpleIVF:
             ),
             probed_cell_ids=probed_cell_ids,
             probed_cell_scores=probed_cell_scores,
+            centroid_scores=np.asarray(centroid_scores, dtype=np.float64),
         )

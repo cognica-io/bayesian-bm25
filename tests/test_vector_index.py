@@ -38,6 +38,8 @@ class TestSimpleIVF:
         assert len(index.background_distances) == 6
         assert np.all(index.background_distances >= 0.0)
         assert index.avg_population > 0.0
+        assert len(index.cell_residual_means) == 2
+        assert len(index.cell_residual_q90) == 2
 
     def test_search_returns_nearest_cluster(self):
         emb = _normalize_rows(
@@ -61,6 +63,7 @@ class TestSimpleIVF:
         assert len(result.candidate_indices) >= 3
         assert set(result.indices.tolist()).issubset({0, 1, 2})
         assert np.all(np.diff(result.scores) <= 1e-12)
+        assert len(result.centroid_scores) == index.n_cells
 
     def test_score_documents_matches_exact_dot_product(self):
         emb = _normalize_rows(
