@@ -78,8 +78,12 @@
     composite prior (term frequency + document length) dominates. As you feed relevance clicks,
     the model learns a steeper sigmoid and higher threshold &mdash; the BM25 score signal overtakes
     the prior, causing documents to swap ranks. Watch pairs D02/D09 and D03/D10.<br><br>
-    <strong>Click a document row</strong> to mark it as relevant (steepens the sigmoid).
-    Or use the buttons below for simulated feedback with the hidden user model.
+    <strong>Click a document row</strong> to boost it. Each click increases
+    that document's log-odds with diminishing returns
+    (boost = 1.5 * log(1 + clicks)), so it rises quickly at first
+    then levels off without reaching 1.0.
+    The <strong>Step/Run</strong> buttons use simulated editorial feedback
+    to train the global sigmoid (alpha, beta) via SGD.
   </div>
 
   <div class="controls">
@@ -174,6 +178,8 @@
 import {
   BayesianProbabilityTransform,
   sigmoid,
+  logit,
+  clampProbability,
 } from "https://cdn.jsdelivr.net/npm/bayesian-bm25@0.8.0/dist/index.js";
 
 // --- Corpus ---
@@ -191,6 +197,13 @@ const DOCUMENTS = [
 const RELEVANT_IDS = new Set(["D01", "D02", "D03", "D06", "D09", "D10"]);
 const TRUE_ALPHA = 2.0;
 const TRUE_BETA = 5.0;
+
+// Per-document click boost with diminishing returns.
+// Total boost = BOOST_SCALE * log(1 + clicks), so early clicks
+// have large effect but repeated clicks saturate gracefully
+// instead of pushing probability to 1.0.
+const BOOST_SCALE = 1.5;
+let clickCounts = {};
 
 // --- Seeded RNG (xoshiro128**) ---
 function makeRng(seed) {
@@ -222,6 +235,7 @@ function init() {
   reviewCount = 0;
   prevRanks = {};
   initialRanks = {};
+  clickCounts = {};
   rng = makeRng(42);
   logEl.innerHTML = "";
   render();
@@ -236,10 +250,31 @@ function simulateClick(score) {
 }
 
 function rankDocuments() {
-  const results = DOCUMENTS.map(doc => {
-    const prob = transform.scoreToProbability(doc.bm25, doc.tf, doc.dlr);
-    return { ...doc, prob, relevant: RELEVANT_IDS.has(doc.id) };
+  // 1. Compute base probabilities from the global model
+  const entries = DOCUMENTS.map(doc => {
+    const baseProb = transform.scoreToProbability(doc.bm25, doc.tf, doc.dlr);
+    const clicks = clickCounts[doc.id] || 0;
+    return { ...doc, baseProb, clicks, relevant: RELEVANT_IDS.has(doc.id) };
   });
+
+  // 2. Apply per-document boost in logit space
+  const boostedLogits = entries.map(d => {
+    let l = logit(clampProbability(d.baseProb));
+    if (d.clicks > 0) l += BOOST_SCALE * Math.log(1 + d.clicks);
+    return l;
+  });
+
+  // 3. Normalize: softmax-style competition so boosting one document
+  //    reduces others.  Total probability mass is preserved.
+  const baseSum = entries.reduce((s, d) => s + d.baseProb, 0);
+  const rawProbs = boostedLogits.map(l => sigmoid(l));
+  const rawSum = rawProbs.reduce((s, p) => s + p, 0);
+  const scale = rawSum > 0 ? baseSum / rawSum : 1;
+
+  const results = entries.map((d, i) => ({
+    ...d,
+    prob: Math.min(rawProbs[i] * scale, 0.9999),
+  }));
   results.sort((a, b) => b.prob - a.prob);
   results.forEach((d, i) => { d.rank = i + 1; });
   return results;
@@ -326,16 +361,17 @@ function feedbackOnDoc(docId) {
   if (clickedRank < 0) return;
   const clickedDoc = results[clickedRank];
 
-  // Positive-only update with aggressive learning rate and low
-  // momentum so alpha grows quickly per click.  As alpha increases,
-  // the sigmoid steepens and BM25 score dominates the composite
-  // prior, driving the expected rank swaps.
-  const lr = 0.30;
-  const mom = 0.5;
-
-  transform.update(clickedDoc.bm25, 1.0, { learningRate: lr, momentum: mom });
+  // Per-document boost only -- no global update().
+  // The global sigmoid (alpha, beta) stays fixed so non-clicked
+  // documents keep their baseline probabilities.  Only the clicked
+  // document's log-odds increases, producing a clean rank change
+  // without inflating the entire list toward 1.0.
+  clickCounts[clickedDoc.id] = (clickCounts[clickedDoc.id] || 0) + 1;
   reviewCount++;
-  logEl.innerHTML += `<span class="click">[${String(reviewCount).padStart(3)}] ${clickedDoc.id} score=${clickedDoc.bm25.toFixed(1)}  CLICK  alpha=${transform.alpha.toFixed(3)}  beta=${transform.beta.toFixed(3)}</span>\n`;
+
+  const clicks = clickCounts[clickedDoc.id];
+  const boost = (BOOST_SCALE * Math.log(1 + clicks)).toFixed(2);
+  logEl.innerHTML += `<span class="click">[${String(reviewCount).padStart(3)}] ${clickedDoc.id} score=${clickedDoc.bm25.toFixed(1)}  CLICK(${clicks})  boost=${boost}</span>\n`;
 
   logEl.scrollTop = logEl.scrollHeight;
   document.getElementById("phase-label").textContent = `Manual feedback (${reviewCount} reviews)`;
