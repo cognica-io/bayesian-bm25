@@ -2,7 +2,7 @@
 
 [[Blog](https://www.cognica.io/en/blog/posts/2026-02-01-bayesian-bm25-hybrid-search)] [[Papers](docs/papers)]
 
-The reference implementation of the [Bayesian BM25](https://doi.org/10.5281/zenodo.18414940) and [From Bayesian Inference to Neural Computation](https://doi.org/10.5281/zenodo.18512411) papers, by the original author. Converts raw BM25 retrieval scores into calibrated relevance probabilities using Bayesian inference.
+The reference implementation of the [Bayesian BM25](https://doi.org/10.5281/zenodo.18414940), [From Bayesian Inference to Neural Computation](https://doi.org/10.5281/zenodo.18512411), and [Vector Scores as Likelihood Ratios](https://doi.org/10.5281/zenodo.19181568) papers, by the original author. Converts raw BM25 retrieval scores into calibrated relevance probabilities using Bayesian inference.
 
 ## Overview
 
@@ -13,16 +13,16 @@ Key capabilities:
 - **Score-to-probability transform** — convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
 - **Base rate calibration** — corpus-level base rate prior estimated from score distribution (95th percentile, mixture model, or elbow detection) decomposes the posterior into three additive log-odds terms, reducing expected calibration error by 68–77% without relevance labels
 - **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
-- **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling, optional per-signal reliability weights (Log-OP), and sparse signal gating (ReLU/Swish/GELU/Softplus activations from Paper 2, Theorems 6.5.3/6.7.4/6.8.1/Remark 6.5.4) with generalized beta control (Theorem 6.7.6)
+- **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling, optional per-signal reliability weights (Log-OP), and sparse signal gating (ReLU/Swish/GELU/Softplus activations from [Jeong, 2026b](https://doi.org/10.5281/zenodo.18512411), Theorems 6.5.3/6.7.4/6.8.1/Remark 6.5.4) with generalized beta control (Theorem 6.7.6)
 - **Learnable fusion weights** — `LearnableLogOddsWeights` learns per-signal reliability from labeled data via a Hebbian gradient that is backprop-free, starting from Naive Bayes uniform initialization (Remark 5.3.2); supports optional `base_rate` additive bias in log-odds space
-- **Attention-based fusion** — `AttentionLogOddsWeights` learns query-dependent signal weights via attention mechanism (Paper 2, Section 8), with exact attention pruning via `compute_upper_bounds()` and `prune()` (Theorem 8.7.1); supports optional `base_rate`
+- **Attention-based fusion** — `AttentionLogOddsWeights` learns query-dependent signal weights via attention mechanism ([Jeong, 2026b](https://doi.org/10.5281/zenodo.18512411), Section 8), with exact attention pruning via `compute_upper_bounds()` and `prune()` (Theorem 8.7.1); supports optional `base_rate`
 - **Multi-head attention** — `MultiHeadAttentionLogOddsWeights` creates multiple independent attention heads with different initializations and averages their log-odds for more robust fusion (Remark 8.6, Corollary 8.7.2)
 - **Neural score calibration** — `PlattCalibrator` (sigmoid) and `IsotonicCalibrator` (PAVA) convert raw neural model scores into calibrated probabilities for Bayesian fusion (Section 12.2 #5)
 - **External prior features** — `prior_fn` callable on `BayesianProbabilityTransform` allows custom document priors to replace the composite prior, enabling features like recency or popularity weighting (Section 12.2 #6)
 - **Temporal adaptation** — `TemporalBayesianTransform` uses exponential decay to weight recent observations more heavily in `fit()`, tracking concept drift in non-stationary relevance patterns (Section 12.2 #3)
 - **Hybrid search** — `cosine_to_probability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
-- **Vector score calibration** — `VectorProbabilityTransform` converts vector distances into calibrated probabilities via likelihood ratio framework: `P(R|d) = sigmoid(log(f_R(d) / f_G(d)) + logit(P_base))`, with KDE/GMM density estimation, gap detection, and auto-routing (Paper 3, Theorem 3.1.1); `calibrate_with_sample()` decouples density estimation from evaluation points for index-aware calibration where ANN neighborhoods inform the density model
-- **Index-aware density priors** — `ivf_density_prior()` and `knn_density_prior()` provide density-based prior weights from IVF cell populations and k-NN distances for informing the vector calibration (Paper 3, Strategy 4.6.2)
+- **Vector score calibration** — `VectorProbabilityTransform` converts vector distances into calibrated probabilities via likelihood ratio framework: `P(R|d) = sigmoid(log(f_R(d) / f_G(d)) + logit(P_base))`, with KDE/GMM density estimation, gap detection, and auto-routing ([Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568), Theorem 3.1.1); `calibrate_with_sample()` decouples density estimation from evaluation points for index-aware calibration where ANN neighborhoods inform the density model
+- **Index-aware density priors** — `ivf_density_prior()` and `knn_density_prior()` provide density-based prior weights from IVF cell populations and k-NN distances for informing the vector calibration ([Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568), Strategy 4.6.2)
 - **WAND pruning** — `wand_upper_bound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval; `BlockMaxIndex` provides tighter block-level bounds for BMW-style pruning (Section 6.2, Corollary 7.4.2)
 - **Calibration metrics** — `expected_calibration_error()`, `brier_score()`, `reliability_diagram()`, and `calibration_report()` for evaluating probability quality, with `CalibrationReport` bundling all metrics into a single diagnostic
 - **Fusion debugger** — `FusionDebugger` records every intermediate value through the full pipeline (likelihood, prior, posterior, fusion) for transparent inspection, document comparison, and crossover detection; supports hierarchical fusion tracing with AND/OR/NOT composition and gating trace fields
@@ -138,7 +138,7 @@ fused = log_odds_conjunction(stacked, weights=np.array([0.6, 0.4]))
 # Fuse with weights and confidence scaling (alpha + weights compose)
 fused = log_odds_conjunction(stacked, alpha=0.5, weights=np.array([0.6, 0.4]))
 
-# Gated fusion: ReLU/Swish/GELU/Softplus activation in logit space (Paper 2, Theorems 6.5-6.8)
+# Gated fusion: ReLU/Swish/GELU/Softplus activation in logit space (Jeong, 2026b, Theorems 6.5-6.8)
 fused_relu = log_odds_conjunction(stacked, gating="relu")         # MAP estimation
 fused_swish = log_odds_conjunction(stacked, gating="swish")       # Bayes estimation
 fused_gelu = log_odds_conjunction(stacked, gating="gelu")         # Gaussian noise model
@@ -537,9 +537,9 @@ All methods above are zero-shot (no relevance labels required). With `--tune`, a
 
 \*Bayesian-MultiField-Bal delta computed over 4 datasets (FiQA corpus lacks title field).
 
-#### Vector Calibration Experiments (Paper 3)
+#### Vector Calibration Experiments ([Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568))
 
-The following experiments evaluate the vector calibration framework from Paper 3 ("Vector Scores as Likelihood Ratios"). All methods use `VectorProbabilityTransform` with additive log-odds fusion (Theorem 7.1.1).
+The following experiments evaluate the vector calibration framework from [Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568) ("Vector Scores as Likelihood Ratios"). All methods use `VectorProbabilityTransform` with additive log-odds fusion (Theorem 7.1.1).
 
 **Calibration baselines** (Section 8.2) — monotone transforms that preserve ranking but differ in calibration quality (ECE / Brier / LogLoss, lower is better):
 
@@ -584,40 +584,40 @@ All bandwidth variants produce 0.02 NDCG@10 on ArguAna, confirming that the KDE 
 | **Bayesian-Balanced** | `balanced_log_odds_fusion`: Bayesian BM25 probs and dense sims to logit space, min-max normalize each, combine with equal weights |
 | Bayesian-Balanced-Mix | Bayesian-Balanced with mixture-model base rate estimation |
 | Bayesian-Balanced-Elbow | Bayesian-Balanced with elbow-detection base rate estimation |
-| Bayesian-Gated-ReLU | `log_odds_conjunction` with ReLU gating in logit space (Paper 2, Theorem 6.5.3) |
-| Bayesian-Gated-Swish | `log_odds_conjunction` with Swish gating in logit space (Paper 2, Theorem 6.7.4) |
-| Bayesian-Gated-GELU | `log_odds_conjunction` with GELU gating (Paper 2, Theorem 6.8.1): `logit * sigmoid(1.702 * logit)` |
-| Bayesian-Gated-Swish-B2 | Generalized swish with `gating_beta=2.0` (Paper 2, Theorem 6.7.6) |
+| Bayesian-Gated-ReLU | `log_odds_conjunction` with ReLU gating in logit space ([Jeong, 2026b](https://doi.org/10.5281/zenodo.18512411), Theorem 6.5.3) |
+| Bayesian-Gated-Swish | `log_odds_conjunction` with Swish gating in logit space ([Jeong, 2026b](https://doi.org/10.5281/zenodo.18512411), Theorem 6.7.4) |
+| Bayesian-Gated-GELU | `log_odds_conjunction` with GELU gating ([Jeong, 2026b](https://doi.org/10.5281/zenodo.18512411), Theorem 6.8.1): `logit * sigmoid(1.702 * logit)` |
+| Bayesian-Gated-Swish-B2 | Generalized swish with `gating_beta=2.0` ([Jeong, 2026b](https://doi.org/10.5281/zenodo.18512411), Theorem 6.7.6) |
 | Bayesian-Gated-Softplus | `log_odds_conjunction` with softplus gating (Remark 6.5.4): `log(1 + exp(logit))`, evidence-preserving smooth ReLU |
-| Bayesian-Attention | Query-dependent signal weighting via `AttentionLogOddsWeights` (Paper 2, Section 8) |
+| Bayesian-Attention | Query-dependent signal weighting via `AttentionLogOddsWeights` ([Jeong, 2026b](https://doi.org/10.5281/zenodo.18512411), Section 8) |
 | **Bayesian-Attn-Norm** | Attention with per-signal logit normalization (`normalize=True`) and 7 features (sparse + dense + cross-signal) |
 | Bayesian-Attn-Norm-CV | Bayesian-Attn-Norm with 5-fold cross-validation (train/test split per query) |
 | Bayesian-MultiHead | 4-head `MultiHeadAttentionLogOddsWeights`, averages log-odds across heads (Remark 8.6) |
 | Bayesian-MultiHead-Norm | Multi-head + logit normalization + 7 features (Corollary 8.7.2) |
 | Bayesian-MultiField | `MultiFieldScorer` (title + body) with `log_odds_conjunction`, sparse-only |
 | Bayesian-MultiField-Bal | MultiField probs + dense via `balanced_log_odds_fusion` |
-| Bayesian-Vector-Balanced | `VectorProbabilityTransform`-calibrated dense probabilities + BM25 via `balanced_log_odds_fusion` (Paper 3, Theorem 3.1.1) |
+| Bayesian-Vector-Balanced | `VectorProbabilityTransform`-calibrated dense probabilities + BM25 via `balanced_log_odds_fusion` ([Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568), Theorem 3.1.1) |
 | Bayesian-Vector-Softplus | VPT-calibrated dense + BM25 via softplus-gated `log_odds_conjunction` |
 | Bayesian-Vector-Attn | VPT-calibrated dense + attention with logit normalization + 7 features |
-| Dense-Kappa | Global sigmoid calibration: `P = sigmoid(kappa * (beta - d))` with corpus-level parameters (Paper 3, Section 8.4 Stage 1) |
-| Dense-Arctan | Arctangent normalization: `p = (2/pi) * arctan(alpha * s)` (Paper 3, Section 8.2) |
-| Dense-Platt | Supervised Platt scaling: `P = sigmoid(a * s + b)` with labeled data (Paper 3, Section 8.2) |
-| VPT-DensityPrior | VPT with gap detection / density prior only (CI-compliant, Paper 3, Stage 6) |
-| VPT-BM25Weights | VPT with BM25 cross-modal importance weights only (CI-violating, Paper 3, Stage 6) |
-| VPT-BW-{c} | VPT with bandwidth factor c applied to Silverman bandwidth (Paper 3, Stage 7) |
+| Dense-Kappa | Global sigmoid calibration: `P = sigmoid(kappa * (beta - d))` with corpus-level parameters ([Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568), Section 8.4 Stage 1) |
+| Dense-Arctan | Arctangent normalization: `p = (2/pi) * arctan(alpha * s)` ([Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568), Section 8.2) |
+| Dense-Platt | Supervised Platt scaling: `P = sigmoid(a * s + b)` with labeled data ([Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568), Section 8.2) |
+| VPT-DensityPrior | VPT with gap detection / density prior only (CI-compliant, [Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568), Stage 6) |
+| VPT-BM25Weights | VPT with BM25 cross-modal importance weights only (CI-violating, [Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568), Stage 6) |
+| VPT-BW-{c} | VPT with bandwidth factor c applied to Silverman bandwidth ([Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568), Stage 7) |
 | Bayesian-Balanced-Tuned | Bayesian-Balanced + supervised `BayesianProbabilityTransform.fit()` + grid search over base_rate and fusion_weight |
 | Bayesian-Hybrid-AND-Tuned | `log_odds_conjunction` of Bayesian BM25 and dense probs with tuned alpha |
 | Bayesian-Tuned | Sparse-only Bayesian BM25 with tuned alpha, beta, and base_rate (no dense signal) |
 
 **Why include underperforming methods?** The tables above deliberately include methods that underperform BM25. Each failure mode is informative:
 
-- **Bayesian-OR** (NDCG@10 avg 28.38) — Probabilistic OR assumes signal independence and catastrophically fails on ArguAna (0.06%). This demonstrates *why* the log-odds conjunction framework (Paper 2, Section 4) is needed: naive probability combination without logit-space calibration collapses when signal distributions differ.
-- **Bayesian-Gated-\*** — Sparse gating (Paper 2, Theorems 6.5-6.8) is too aggressive for the BEIR hybrid fusion task. These gates are designed for high-dimensional signal spaces where most inputs are noise — in a two-signal (sparse + dense) setting, there is no noise to suppress.
+- **Bayesian-OR** (NDCG@10 avg 28.38) — Probabilistic OR assumes signal independence and catastrophically fails on ArguAna (0.06%). This demonstrates *why* the log-odds conjunction framework ([Jeong, 2026b](https://doi.org/10.5281/zenodo.18512411), Section 4) is needed: naive probability combination without logit-space calibration collapses when signal distributions differ.
+- **Bayesian-Gated-\*** — Sparse gating ([Jeong, 2026b](https://doi.org/10.5281/zenodo.18512411), Theorems 6.5-6.8) is too aggressive for the BEIR hybrid fusion task. These gates are designed for high-dimensional signal spaces where most inputs are noise — in a two-signal (sparse + dense) setting, there is no noise to suppress.
 - **Bayesian-MultiField** (28.58 over 4 datasets) — Sparse-only multi-field search loses to concatenated BM25 because field separation fragments term statistics. However, **Bayesian-MultiField-Bal** (40.16) recovers most of the gap by fusing with dense embeddings.
 
 Reproduce:
 ```bash
-# Zero-shot (35 methods including Paper 3 experiments)
+# Zero-shot (35 methods including Jeong, 2026c experiments)
 python benchmarks/hybrid_beir.py -d <beir-data-dir>
 
 # With tuning (auto-estimation + supervised learning + grid search)
