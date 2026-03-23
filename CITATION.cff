@@ -37,3 +37,7 @@ references:
       - family-names: Jeong
         given-names: Jaepil
     year: 2026
+    publisher:
+      name: Zenodo
+    doi: "10.5281/zenodo.19181568"
+    url: "https://doi.org/10.5281/zenodo.19181568"

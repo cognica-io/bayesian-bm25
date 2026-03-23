@@ -722,7 +722,9 @@ If you use this work, please cite the following papers:
   title     = {Vector Scores as Likelihood Ratios: {Index-Derived} {Bayesian}
                Calibration for Hybrid Search},
   year      = {2026},
-  note      = {Draft}
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.19181568},
+  url       = {https://doi.org/10.5281/zenodo.19181568}
 }
 ```
 
