@@ -6,9 +6,9 @@
 
 """Calibration metrics for evaluating probability quality.
 
-Provides Expected Calibration Error (ECE), Brier score, and reliability
-diagram data for assessing how well predicted probabilities match actual
-relevance rates.
+Provides Expected Calibration Error (ECE), Brier score, log loss, and
+reliability diagram data for assessing how well predicted probabilities
+match actual relevance rates.
 """
 
 from __future__ import annotations
@@ -72,6 +72,27 @@ def brier_score(
     return float(np.mean((probabilities - labels) ** 2))
 
 
+def log_loss(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    *,
+    eps: float = 1e-15,
+) -> float:
+    """Negative log-likelihood (log loss / cross-entropy).
+
+    L = -(1/N) * sum[y * log(p) + (1 - y) * log(1 - p)]
+
+    Strictly proper scoring rule that penalizes confident wrong
+    predictions more severely than Brier score.  Lower is better.
+    Perfect prediction = 0.
+    """
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.float64)
+
+    p = np.clip(probabilities, eps, 1.0 - eps)
+    return float(-np.mean(labels * np.log(p) + (1.0 - labels) * np.log(1.0 - p)))
+
+
 def reliability_diagram(
     probabilities: np.ndarray,
     labels: np.ndarray,
@@ -106,6 +127,7 @@ class CalibrationReport:
 
     ece: float
     brier: float
+    logloss: float
     reliability: list[tuple[float, float, int]]
     n_samples: int
     n_bins: int
@@ -119,6 +141,7 @@ class CalibrationReport:
             f"  Bins    : {self.n_bins}",
             f"  ECE     : {self.ece:.6f}",
             f"  Brier   : {self.brier:.6f}",
+            f"  LogLoss : {self.logloss:.6f}",
             "",
             "  Reliability Diagram",
             "  -------------------",
@@ -154,11 +177,13 @@ def calibration_report(
 
     ece = expected_calibration_error(probabilities, labels, n_bins=n_bins)
     brier = brier_score(probabilities, labels)
+    ll = log_loss(probabilities, labels)
     reliability = reliability_diagram(probabilities, labels, n_bins=n_bins)
 
     return CalibrationReport(
         ece=ece,
         brier=brier,
+        logloss=ll,
         reliability=reliability,
         n_samples=len(probabilities),
         n_bins=n_bins,

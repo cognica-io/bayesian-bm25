@@ -2,8 +2,8 @@ cff-version: 1.2.0
 title: "Bayesian BM25"
 message: "If you use this software, please cite the following papers."
 type: software
-version: 0.12.0
-date-released: "2026-03-21"
+version: 0.12.1
+date-released: "2026-03-23"
 license: Apache-2.0
 repository-code: "https://github.com/cognica-io/bayesian-bm25"
 authors:
@@ -31,3 +31,9 @@ references:
       name: Zenodo
     doi: "10.5281/zenodo.18512411"
     url: "https://doi.org/10.5281/zenodo.18512411"
+  - type: article
+    title: "Vector Scores as Likelihood Ratios: Index-Derived Bayesian Calibration for Hybrid Search"
+    authors:
+      - family-names: Jeong
+        given-names: Jaepil
+    year: 2026

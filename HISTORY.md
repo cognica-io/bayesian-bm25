@@ -1,5 +1,30 @@
 # History
 
+## 0.12.1 (2026-03-23)
+
+- Add `log_loss()` metric to `bayesian_bm25.metrics` (Paper 3, Section 8.3)
+  - Negative log-likelihood: `-(1/N) * sum[y * log(p) + (1 - y) * log(1 - p)]`
+  - Strictly proper scoring rule that penalizes confident wrong predictions
+  - Epsilon clipping prevents `log(0)` divergence
+- Add `logloss` field to `CalibrationReport` dataclass
+  - `calibration_report()` now computes and returns log loss alongside ECE and Brier score
+  - `summary()` output includes `LogLoss` line
+- Add Paper 3 experimental baselines to hybrid BEIR benchmark (`benchmarks/hybrid_beir.py`)
+  - `Dense-Kappa`: global sigmoid calibration `P = sigmoid(kappa * (beta - d))` with corpus-level parameters (Section 8.4, Stage 1)
+  - `Dense-Arctan`: arctangent normalization `p = (2/pi) * arctan(alpha * s)` (Section 8.2)
+  - `Dense-Platt`: supervised Platt scaling via `PlattCalibrator` (Section 8.2)
+- Add conditional independence penalty experiment (Section 8.4, Stage 6)
+  - `VPT-DensityPrior`: VPT with gap detection / IVF density prior only (CI-compliant)
+  - `VPT-BM25Weights`: VPT with BM25 cross-modal importance weights only (CI-violating)
+  - Forces separate estimation paths (GMM vs KDE) to isolate the CI violation cost
+- Add bandwidth ablation experiment (Section 8.4, Stage 7)
+  - `VPT-BW-{0.2,0.5,1.0,2.0}`: KDE bandwidth scaling factors applied to Silverman bandwidth
+- Update hybrid BEIR benchmark calibration display to show LogLoss column
+- Update benchmark to 35 methods (was 26)
+- Export `log_loss` from `bayesian_bm25` package
+- Add `TestLogLoss` test class with 6 tests (perfect, worst, constant, bounds, ordering, eps safety)
+- Update `TestCalibrationReport` and `TestMainPackageExport` for `logloss` field
+
 ## 0.12.0 (2026-03-21)
 
 - Add `calibrate_with_sample()` to `VectorProbabilityTransform` for index-aware calibration (Paper 3)
@@ -33,7 +58,7 @@
   - Refactor VPT query gating to use `SearchDiagnostics` and `separability_gate()` from `search_diagnostics` module
   - Refactor VPT fusion methods to use `calibrate_with_sample()` with IVF neighborhood samples
   - Change `fusion_vpt_balanced()` from min-max normalized to additive log-odds with std-ratio scaling
-- Add example: `examples/live_ranking.py` -- live ranking demo showing online learning rank swaps with simulated editorial feedback
+- Add example: `examples/live_ranking.py` — live ranking demo showing online learning rank swaps with simulated editorial feedback
 - Add tests for `eval_points` in `estimate_kde()` and `estimate_gmm()`
 - Add test for `calibrate_with_sample()` verifying external local sample usage
 - Add tests for `SimpleIVF` (`tests/test_vector_index.py`): build stats, cell residual statistics, nearest cluster search, exact dot-product agreement

@@ -41,12 +41,21 @@ Methods compared:
  24. Bayesian-Vector-Balanced   -- VPT-calibrated dense + balanced fusion
  25. Bayesian-Vector-Softplus   -- VPT-calibrated dense + softplus gating
  26. Bayesian-Vector-Attn       -- VPT-calibrated dense + attention fusion
+ 27. Dense-Kappa                -- global sigmoid calibration (Paper 3, Stage 1)
+ 28. Dense-Arctan               -- arctangent normalization baseline
+ 29. Dense-Platt                -- supervised Platt scaling baseline
+ 30. VPT-DensityPrior           -- VPT with IVF density prior only (Stage 6a)
+ 31. VPT-BM25Weights            -- VPT with BM25 weights only (Stage 6b)
+ 32. VPT-BW-0.2                 -- VPT bandwidth ablation c=0.2 (Stage 7)
+ 33. VPT-BW-0.5                 -- VPT bandwidth ablation c=0.5
+ 34. VPT-BW-1.0                 -- VPT bandwidth ablation c=1.0
+ 35. VPT-BW-2.0                 -- VPT bandwidth ablation c=2.0
 
 With --tune, additional tuned methods are evaluated:
 
- 27. Bayesian-Tuned             -- tuned alpha, beta, base_rate
- 28. Bayesian-Balanced-Tuned    -- balanced fusion with tuned weight
- 29. Bayesian-Hybrid-AND-Tuned  -- log-odds conjunction with tuned alpha
+ 36. Bayesian-Tuned             -- tuned alpha, beta, base_rate
+ 37. Bayesian-Balanced-Tuned    -- balanced fusion with tuned weight
+ 38. Bayesian-Hybrid-AND-Tuned  -- log-odds conjunction with tuned alpha
 
 Dependencies:
     pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5
@@ -732,6 +741,63 @@ def _min_max_normalize(arr: np.ndarray) -> np.ndarray:
     return (arr - lo) / (hi - lo)
 
 
+def _arctan_normalize(scores: np.ndarray, alpha: float = 5.0) -> np.ndarray:
+    """Arctangent normalization: p = (2/pi) * arctan(alpha * s).
+
+    Paper 3, Section 8.2 baseline.  Maps similarity scores to [0, 1]
+    via the arctan function.  The scaling parameter alpha controls the
+    steepness of the transition.
+    """
+    return (2.0 / np.pi) * np.arctan(alpha * np.asarray(scores, dtype=np.float64))
+
+
+def _global_kappa_calibrate(
+    distances: np.ndarray,
+    *,
+    kappa: float | None = None,
+    beta: float | None = None,
+) -> np.ndarray:
+    """Global sigmoid calibration: P = sigmoid(kappa * (s - beta)).
+
+    Paper 3, Section 8.4 Stage 1 baseline.  Applies a corpus-level
+    sigmoid to cosine distances (converted to similarities).
+
+    Parameters
+    ----------
+    distances : array
+        Cosine distances d = 1 - s.
+    kappa : float or None
+        Sigmoid steepness.  If None, estimated as 1 / std(d).
+    beta : float or None
+        Sigmoid midpoint.  If None, estimated as median(d).
+    """
+    d = np.asarray(distances, dtype=np.float64)
+    if beta is None:
+        beta = float(np.median(d))
+    if kappa is None:
+        std = float(np.std(d))
+        kappa = 1.0 / std if std > 1e-12 else 1.0
+    # Negative sign: smaller distance = higher probability
+    return np.asarray(sigmoid(kappa * (beta - d)), dtype=np.float64)
+
+
+def _platt_calibrate_dense(
+    train_scores: np.ndarray,
+    train_labels: np.ndarray,
+    eval_scores: np.ndarray,
+) -> np.ndarray:
+    """Platt scaling for dense similarity scores.
+
+    Paper 3, Section 8.2 baseline.  Supervised sigmoid calibration
+    using (a, b) fitted on training data.
+    """
+    from bayesian_bm25.calibration import PlattCalibrator
+
+    calibrator = PlattCalibrator()
+    calibrator.fit(train_scores, train_labels)
+    return np.asarray(calibrator.calibrate(eval_scores), dtype=np.float64)
+
+
 def _compute_dense_calibration(dense_sim: np.ndarray) -> tuple[float, float]:
     """Per-query calibration: beta=median, alpha_eff=1/std of positive scores."""
     positive = dense_sim[dense_sim > 0]
@@ -1383,6 +1449,7 @@ def _train_attn_cv(
 
 BASELINE_METHODS = [
     "BM25", "Dense", "Convex", "RRF",
+    "Dense-Kappa", "Dense-Arctan", "Dense-Platt",
     "Bayesian-OR", "Bayesian-LogOdds", "Bayesian-LogOdds-Local",
     "Bayesian-LogOdds-BR", "Bayesian-Balanced",
     "Bayesian-Balanced-Mix", "Bayesian-Balanced-Elbow",
@@ -1392,6 +1459,8 @@ BASELINE_METHODS = [
     "Bayesian-MultiHead", "Bayesian-MultiHead-Norm",
     "Bayesian-MultiField", "Bayesian-MultiField-Bal",
     "Bayesian-Vector-Balanced", "Bayesian-Vector-Softplus", "Bayesian-Vector-Attn",
+    "VPT-DensityPrior", "VPT-BM25Weights",
+    "VPT-BW-0.2", "VPT-BW-0.5", "VPT-BW-1.0", "VPT-BW-2.0",
 ]
 
 TUNED_METHODS = [
@@ -1590,6 +1659,46 @@ def run_dataset(
     attn_cache: dict[str, dict] = {}
     vpt_gate_values: list[float] = []
 
+    # Global kappa background: estimate corpus-level cosine distance stats
+    # (Paper 3, Section 8.4 Stage 1).  Sample random query-document pairs.
+    rng = np.random.default_rng(42)
+    n_bg_sample = min(1000, n_docs)
+    bg_sample_idx = rng.choice(n_docs, size=n_bg_sample, replace=False)
+    bg_query_idx = rng.choice(n_queries, size=min(50, n_queries), replace=False)
+    bg_distances_list: list[float] = []
+    for qi in bg_query_idx:
+        sims = query_emb[qi] @ corpus_emb[bg_sample_idx].T
+        bg_distances_list.extend((1.0 - sims).tolist())
+    bg_distances = np.array(bg_distances_list, dtype=np.float64)
+    global_kappa_beta = float(np.median(bg_distances))
+    global_kappa_std = float(np.std(bg_distances))
+    global_kappa = 1.0 / global_kappa_std if global_kappa_std > 1e-12 else 1.0
+
+    # Platt scaling: first pass to collect (similarity, label) pairs
+    platt_scores_list: list[float] = []
+    platt_labels_list: list[float] = []
+    for q_idx_p in range(n_queries):
+        qid_p = query_ids[q_idx_p]
+        qrel_map = qrels.get(qid_p)
+        if qrel_map is None:
+            continue
+        qvec = query_emb[q_idx_p]
+        top_idx = np.argsort(-(qvec @ corpus_emb.T))[:effective_R]
+        for idx in top_idx:
+            did = corpus_ids[idx]
+            if did in qrel_map:
+                sim = float(qvec @ corpus_emb[idx])
+                platt_scores_list.append(sim)
+                platt_labels_list.append(1.0 if qrel_map[did] > 0 else 0.0)
+
+    platt_scores_arr = np.array(platt_scores_list, dtype=np.float64)
+    platt_labels_arr = np.array(platt_labels_list, dtype=np.float64)
+    platt_calibrator = None
+    if len(platt_scores_arr) >= 10:
+        from bayesian_bm25.calibration import PlattCalibrator
+        platt_calibrator = PlattCalibrator()
+        platt_calibrator.fit(platt_scores_arr, platt_labels_arr)
+
     for q_idx in range(n_queries):
         qid = query_ids[q_idx]
         qtokens = query_tokens_list[q_idx]
@@ -1736,6 +1845,21 @@ def run_dataset(
             ),
         }
 
+        # Paper 3, Section 8.2/8.4: vector calibration baselines
+        cand_dense_dist = 1.0 - cand_dense
+        hybrid_scores["Dense-Kappa"] = _global_kappa_calibrate(
+            cand_dense_dist, kappa=global_kappa, beta=global_kappa_beta,
+        )
+        hybrid_scores["Dense-Arctan"] = _arctan_normalize(cand_dense)
+        if platt_calibrator is not None:
+            hybrid_scores["Dense-Platt"] = np.asarray(
+                platt_calibrator.calibrate(cand_dense), dtype=np.float64,
+            )
+        else:
+            hybrid_scores["Dense-Platt"] = np.asarray(
+                cosine_to_probability(cand_dense), dtype=np.float64,
+            )
+
         # Gated log-odds conjunction: BM25 probs + dense probs (Phase 5.3)
         # Stacks two probability signals and applies gating in logit space
         dense_probs_cand = np.asarray(
@@ -1770,7 +1894,6 @@ def run_dataset(
             vpt = VectorProbabilityTransform.fit_background(1.0 - dense_full_scores)
 
         sample_distances = 1.0 - dense_sample_scores
-        cand_dense_dist = 1.0 - cand_dense
         sample_bm25_scores, sample_active, sample_tfs, sample_doc_len_ratios = (
             _compute_bm25_features_for_docs(
                 scorer, raw_bm25, dense_sample_idx, qtokens,
@@ -1845,6 +1968,69 @@ def run_dataset(
         hybrid_scores["Bayesian-Vector-Softplus"] = log_odds_conjunction(
             vpt_gated_input, gating="softplus", max_logit=10.0,
         )
+
+        # Paper 3, Section 8.4 Stage 6: Conditional independence penalty.
+        # Compare density-prior-only (structurally independent of vector
+        # distance) vs BM25-weights-only (approximately independent) to
+        # quantify the CI violation cost against information gain.
+        #
+        # VPT-DensityPrior: uses IVF cell density (Strategy 4.6.2) when
+        # available, otherwise gap detection (Strategy 4.6.1) or
+        # distance-based fallback.  Forces GMM estimation to ensure it
+        # takes a different path from BM25-weighted KDE.
+        if sample_density_prior is not None:
+            density_prior_w = sample_density_prior
+        else:
+            gap_w = vpt._gap_weights(sample_distances)
+            if gap_w is not None:
+                density_prior_w = gap_w
+            else:
+                density_prior_w = VectorProbabilityTransform._distance_density_weights(
+                    sample_distances,
+                )
+        vpt_density_only = vpt.calibrate_with_sample(
+            cand_dense_dist, sample_distances,
+            weights=density_prior_w,
+            method="gmm",
+        )
+        hybrid_scores["VPT-DensityPrior"] = fusion_vpt_balanced(
+            cand_bayesian_probs_br, vpt_density_only,
+        )
+
+        # VPT-BM25Weights: uses BM25 probabilities as importance weights
+        # (Section 4.3).  Forces KDE estimation to isolate the cross-modal
+        # weighting contribution.
+        bm25_only_weights = np.zeros(len(sample_distances), dtype=np.float64)
+        if np.any(sample_active):
+            bm25_only_weights[sample_active] = sample_bm25_probs_br[sample_active]
+        sharpened_bm25 = VectorProbabilityTransform._sharpen_weights(bm25_only_weights)
+        vpt_bm25_only = vpt.calibrate_with_sample(
+            cand_dense_dist, sample_distances,
+            weights=sharpened_bm25,
+            method="kde",
+        )
+        hybrid_scores["VPT-BM25Weights"] = fusion_vpt_balanced(
+            cand_bayesian_probs_br, vpt_bm25_only,
+        )
+
+        # Paper 3, Section 8.4 Stage 7: Bandwidth ablation.
+        # Evaluate bandwidth scaling factors c in {0.2, 0.5, 1.0, 2.0}
+        # applied to Silverman bandwidth (Remark 4.4.2).
+        for bw_factor, label in [
+            (0.2, "VPT-BW-0.2"),
+            (0.5, "VPT-BW-0.5"),
+            (1.0, "VPT-BW-1.0"),
+            (2.0, "VPT-BW-2.0"),
+        ]:
+            vpt_bw_probs = vpt.calibrate_with_sample(
+                cand_dense_dist, sample_distances,
+                weights=sample_vpt_weights,
+                method="kde",
+                bandwidth_factor=bw_factor,
+            )
+            hybrid_scores[label] = fusion_vpt_balanced(
+                cand_bayesian_probs_br, vpt_bw_probs,
+            )
 
         for method_name, scores in hybrid_scores.items():
             runs[method_name][qid] = {
@@ -2300,6 +2486,7 @@ def run_dataset(
 # ---------------------------------------------------------------------------
 
 CALIBRATION_METHODS = [
+    "Dense-Kappa", "Dense-Arctan", "Dense-Platt",
     "Bayesian-OR",
     "Bayesian-LogOdds", "Bayesian-LogOdds-Local", "Bayesian-LogOdds-BR",
     "Bayesian-Balanced",
@@ -2311,6 +2498,8 @@ CALIBRATION_METHODS = [
     "Bayesian-MultiField", "Bayesian-MultiField-Bal",
     "Bayesian-Vector-Balanced", "Bayesian-Vector-Softplus",
     "Bayesian-Vector-Attn",
+    "VPT-DensityPrior", "VPT-BM25Weights",
+    "VPT-BW-0.2", "VPT-BW-0.5", "VPT-BW-1.0", "VPT-BW-2.0",
 ]
 
 
@@ -2321,8 +2510,8 @@ def print_calibration_section(
 ) -> None:
     """Print calibration diagnostics for probability-producing methods."""
     print("\n  --- Calibration Diagnostics ---")
-    print(f"  {'Method':<22}  {'ECE':>10}  {'Brier':>10}  {'Samples':>8}")
-    print(f"  {'-' * 22}  {'-' * 10}  {'-' * 10}  {'-' * 8}")
+    print(f"  {'Method':<22}  {'ECE':>10}  {'Brier':>10}  {'LogLoss':>10}  {'Samples':>8}")
+    print(f"  {'-' * 22}  {'-' * 10}  {'-' * 10}  {'-' * 10}  {'-' * 8}")
 
     for method in methods:
         if method not in runs:
@@ -2344,7 +2533,7 @@ def print_calibration_section(
                     labels_list.append(1.0 if qrel_map[doc_id] > 0 else 0.0)
 
         if len(probs_list) < 2:
-            print(f"  {method:<22}  {'n/a':>10}  {'n/a':>10}  {len(probs_list):>8}")
+            print(f"  {method:<22}  {'n/a':>10}  {'n/a':>10}  {'n/a':>10}  {len(probs_list):>8}")
             continue
 
         probs_arr = np.array(probs_list, dtype=np.float64)
@@ -2352,7 +2541,7 @@ def print_calibration_section(
         report = calibration_report(probs_arr, labels_arr)
         print(
             f"  {method:<22}  {report.ece:>10.6f}  {report.brier:>10.6f}"
-            f"  {report.n_samples:>8}"
+            f"  {report.logloss:>10.6f}  {report.n_samples:>8}"
         )
 
 

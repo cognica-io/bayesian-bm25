@@ -14,6 +14,7 @@ from bayesian_bm25.metrics import (
     brier_score,
     calibration_report,
     expected_calibration_error,
+    log_loss,
     reliability_diagram,
 )
 
@@ -93,6 +94,51 @@ class TestBrierScore:
         assert brier_score(good_probs, labels) < brier_score(bad_probs, labels)
 
 
+class TestLogLoss:
+    def test_perfect_prediction(self):
+        """Log loss = 0 for perfect predictions (within eps)."""
+        probs = np.array([0.0, 0.0, 1.0, 1.0])
+        labels = np.array([0.0, 0.0, 1.0, 1.0])
+        ll = log_loss(probs, labels)
+        assert ll == pytest.approx(0.0, abs=1e-10)
+
+    def test_worst_prediction(self):
+        """Log loss is large for completely wrong predictions."""
+        probs = np.array([0.99, 0.99, 0.01, 0.01])
+        labels = np.array([0.0, 0.0, 1.0, 1.0])
+        ll = log_loss(probs, labels)
+        assert ll > 3.0
+
+    def test_constant_half(self):
+        """Log loss for constant 0.5 prediction = log(2) ~ 0.6931."""
+        probs = np.full(100, 0.5)
+        labels = np.concatenate([np.zeros(50), np.ones(50)])
+        ll = log_loss(probs, labels)
+        assert ll == pytest.approx(np.log(2), abs=1e-10)
+
+    def test_bounds(self):
+        """Log loss is non-negative."""
+        rng = np.random.default_rng(42)
+        probs = rng.uniform(0.01, 0.99, size=1000)
+        labels = (rng.random(1000) < 0.3).astype(float)
+        ll = log_loss(probs, labels)
+        assert ll >= 0.0
+
+    def test_better_calibration_lower_loss(self):
+        """Better-calibrated predictions have lower log loss."""
+        labels = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+        good_probs = np.array([0.1, 0.2, 0.1, 0.8, 0.9, 0.8])
+        bad_probs = np.array([0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
+        assert log_loss(good_probs, labels) < log_loss(bad_probs, labels)
+
+    def test_eps_prevents_infinity(self):
+        """Clipping at eps prevents log(0) = -inf."""
+        probs = np.array([0.0, 1.0])
+        labels = np.array([1.0, 0.0])
+        ll = log_loss(probs, labels)
+        assert np.isfinite(ll)
+
+
 class TestReliabilityDiagram:
     def test_returns_tuples(self):
         """Each entry is (avg_pred, avg_actual, count)."""
@@ -153,6 +199,7 @@ class TestCalibrationReport:
         assert isinstance(report, CalibrationReport)
         assert isinstance(report.ece, float)
         assert isinstance(report.brier, float)
+        assert isinstance(report.logloss, float)
         assert isinstance(report.reliability, list)
         assert report.n_samples == 4
         assert report.n_bins == 5
@@ -169,6 +216,7 @@ class TestCalibrationReport:
             expected_calibration_error(probs, labels, n_bins=10)
         )
         assert report.brier == pytest.approx(brier_score(probs, labels))
+        assert report.logloss == pytest.approx(log_loss(probs, labels))
         assert report.reliability == reliability_diagram(
             probs, labels, n_bins=10
         )
@@ -183,6 +231,7 @@ class TestCalibrationReport:
         assert len(text) > 0
         assert "ECE" in text
         assert "Brier" in text
+        assert "LogLoss" in text
         assert "Reliability" in text
 
     def test_report_from_main_package(self):
@@ -200,6 +249,7 @@ class TestMainPackageExport:
 
         assert hasattr(bayesian_bm25, "expected_calibration_error")
         assert hasattr(bayesian_bm25, "brier_score")
+        assert hasattr(bayesian_bm25, "log_loss")
         assert hasattr(bayesian_bm25, "reliability_diagram")
 
     def test_import_from_benchmarks(self):

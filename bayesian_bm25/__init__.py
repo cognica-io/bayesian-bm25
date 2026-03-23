@@ -24,6 +24,7 @@ from bayesian_bm25.metrics import (
     brier_score,
     calibration_report,
     expected_calibration_error,
+    log_loss,
     reliability_diagram,
 )
 from bayesian_bm25.probability import BayesianProbabilityTransform
@@ -43,6 +44,7 @@ __all__ = [
     "calibration_report",
     "cosine_to_probability",
     "expected_calibration_error",
+    "log_loss",
     "ivf_density_prior",
     "knn_density_prior",
     "log_odds_conjunction",
