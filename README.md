@@ -31,6 +31,7 @@ Key capabilities:
 
 ## Adoption
 
+- [Apache Lucene](https://github.com/apache/lucene/pull/15827) — merged as `BayesianScoreQuery` and `LogOddsFusionQuery` for probabilistic hybrid search
 - [MTEB](https://github.com/embeddings-benchmark/mteb) — included as a baseline retrieval model (`bb25`) for the Massive Text Embedding Benchmark
 - [txtai](https://github.com/neuml/txtai) — used for BM25 score normalization in hybrid search (`normalize="bayesian-bm25"`)
 - [Vespa.ai](https://github.com/vespa-engine/sample-apps/tree/master/examples/bayesian_bm25) — adopted as an official sample application
