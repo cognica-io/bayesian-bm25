@@ -4,6 +4,8 @@
 
 The reference implementation of the [Bayesian BM25](https://doi.org/10.5281/zenodo.18414940), [From Bayesian Inference to Neural Computation](https://doi.org/10.5281/zenodo.18512411), and [Vector Scores as Likelihood Ratios](https://doi.org/10.5281/zenodo.19181568) papers, by the original author. Converts raw BM25 retrieval scores into calibrated relevance probabilities using Bayesian inference.
 
+These three papers are consolidated and refined for an information retrieval audience in the follow-up paper [A Unified Bayesian Framework for Hybrid Search](https://doi.org/10.5281/zenodo.20768747), which derives lexical calibration, vector calibration, and log-odds fusion from a single Bayesian principle: every retrieval signal becomes a calibrated relevance probability through its log-likelihood ratio, and calibrated signals combine additively in log-odds space — a normalized Logarithmic Opinion Pool that fuses an arbitrary number of conditionally independent signals while preserving the exact WAND / Block-Max WAND pruning of the underlying BM25 retrieval.
+
 ## Overview
 
 Standard BM25 produces unbounded scores that lack consistent meaning across queries, making threshold-based filtering and multi-signal fusion unreliable. Bayesian BM25 addresses this by applying a sigmoid likelihood model with a composite prior (term frequency + document length normalization) and computing Bayesian posteriors that output well-calibrated probabilities in [0, 1]. A corpus-level base rate prior further improves calibration by 68–77% without requiring relevance labels.
@@ -726,6 +728,16 @@ If you use this work, please cite the following papers:
   publisher = {Zenodo},
   doi       = {10.5281/zenodo.19181568},
   url       = {https://doi.org/10.5281/zenodo.19181568}
+}
+
+@preprint{Jeong2026UnifiedHybrid,
+  author    = {Jeong, Jaepil},
+  title     = {A Unified {Bayesian} Framework for Hybrid Search: Calibration
+               and Log-Odds Fusion of Lexical and Vector Retrieval},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.20768747},
+  url       = {https://doi.org/10.5281/zenodo.20768747}
 }
 ```
 
