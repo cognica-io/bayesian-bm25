@@ -455,6 +455,16 @@ python benchmarks/hybrid_beir.py -d &lt;beir-data-dir&gt; --download</code></pre
 <section id="citation">
 <div class="container">
   <h2>Citation</h2>
+  <p>
+    These papers develop a single Bayesian principle for hybrid search: every
+    retrieval signal becomes a calibrated relevance probability through its
+    log-likelihood ratio, and calibrated signals combine additively in log-odds
+    space. The lexical calibration, neural fusion operators, and vector
+    calibration of the first three are consolidated and refined for an
+    information retrieval audience in the follow-up
+    <a href="https://doi.org/10.5281/zenodo.20768747">A Unified Bayesian
+    Framework for Hybrid Search</a>.
+  </p>
 <pre><code>@preprint{Jeong2026BayesianBM25,
   author    = {Jeong, Jaepil},
   title     = {Bayesian {BM25}: {A} Probabilistic Framework for Hybrid Text
@@ -476,11 +486,24 @@ python benchmarks/hybrid_beir.py -d &lt;beir-data-dir&gt; --download</code></pre
   url       = {https://doi.org/10.5281/zenodo.18512411}
 }
 
-@preprint{Jeong2026VectorCalibration,
+@preprint{Jeong2026VectorLikelihoodRatios,
   author    = {Jeong, Jaepil},
-  title     = {Vector Scores as Likelihood Ratios: Index-Derived {Bayesian}
+  title     = {Vector Scores as Likelihood Ratios: {Index-Derived} {Bayesian}
                Calibration for Hybrid Search},
-  year      = {2026}
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.19181568},
+  url       = {https://doi.org/10.5281/zenodo.19181568}
+}
+
+@preprint{Jeong2026UnifiedHybrid,
+  author    = {Jeong, Jaepil},
+  title     = {A Unified {Bayesian} Framework for Hybrid Search: Calibration
+               and Log-Odds Fusion of Lexical and Vector Retrieval},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.20768747},
+  url       = {https://doi.org/10.5281/zenodo.20768747}
 }</code></pre>
 </div>
 </section>
