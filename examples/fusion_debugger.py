@@ -17,7 +17,6 @@ The FusionDebugger records every intermediate value so you can:
   3. Diagnose cases where signals disagree (crossover)
 """
 
-import numpy as np
 
 from bayesian_bm25 import BayesianProbabilityTransform
 from bayesian_bm25.debug import FusionDebugger
@@ -156,7 +155,7 @@ print()
 print(f"  prob_not  = {not_trace.final_probability:.3f}")
 print(f"  prob_or   = {or_trace.final_probability:.3f}")
 print(f"  1 - or    = {1 - or_trace.final_probability:.3f}")
-print(f"  (prob_not == 1 - prob_or)")
+print("  (prob_not == 1 - prob_or)")
 
 # =========================================================================
 # Example 9: Hierarchical fusion -- AND, OR, NOT composed

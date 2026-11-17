@@ -27,3 +27,8 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local benchmark data, generated results, and backups
+benchmarks/.cache/
+benchmarks/results/
+benchmarks/*.bak

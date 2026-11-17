@@ -22,27 +22,45 @@ from bayesian_bm25.scorer import BayesianBM25Scorer
 documents = [
     {
         "title": "introduction to machine learning",
-        "body": "machine learning is a branch of artificial intelligence that focuses on building systems that learn from data",
+        "body": (
+            "machine learning is a branch of artificial intelligence "
+            "that focuses on building systems that learn from data"
+        ),
     },
     {
         "title": "deep learning with neural networks",
-        "body": "deep learning uses multiple layers of neural networks to model complex patterns in large datasets",
+        "body": (
+            "deep learning uses multiple layers of neural networks "
+            "to model complex patterns in large datasets"
+        ),
     },
     {
         "title": "python programming basics",
-        "body": "python is a versatile programming language used in web development data science and machine learning",
+        "body": (
+            "python is a versatile programming language used in "
+            "web development data science and machine learning"
+        ),
     },
     {
         "title": "data science workflow",
-        "body": "a typical data science project involves data collection cleaning analysis visualization and machine learning",
+        "body": (
+            "a typical data science project involves data collection "
+            "cleaning analysis visualization and machine learning"
+        ),
     },
     {
         "title": "natural language processing overview",
-        "body": "natural language processing uses machine learning to help computers understand and generate human language",
+        "body": (
+            "natural language processing uses machine learning "
+            "to help computers understand and generate human language"
+        ),
     },
     {
         "title": "computer vision applications",
-        "body": "computer vision applies deep learning to image recognition object detection and video analysis",
+        "body": (
+            "computer vision applies deep learning to image recognition "
+            "object detection and video analysis"
+        ),
     },
 ]
 
@@ -85,7 +103,7 @@ for i in range(len(documents)):
 
 # --- Rank by combined probability ---
 ranked = np.argsort(-combined_probs)
-print(f"\nFinal ranking:")
+print("\nFinal ranking:")
 for rank, did in enumerate(ranked, 1):
     if combined_probs[did] > 0:
         print(f"  {rank}. [{combined_probs[did]:.4f}] {documents[did]['title']}")

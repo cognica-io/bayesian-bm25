@@ -23,7 +23,7 @@ This example shows:
 import numpy as np
 
 from bayesian_bm25 import AttentionLogOddsWeights, MultiHeadAttentionLogOddsWeights
-from bayesian_bm25.probability import logit, sigmoid
+from bayesian_bm25.probability import sigmoid
 
 # =====================================================================
 # Setup: synthetic 2-signal data (one reliable, one noisy)

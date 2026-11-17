@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from bayesian_bm25.calibration_context import CalibrationContext
+
 
 def _bin_mask(probabilities: np.ndarray, lo: float, hi: float) -> np.ndarray:
     """Create a boolean mask for probabilities falling in a bin (lo, hi].
@@ -128,9 +130,15 @@ class CalibrationReport:
     ece: float
     brier: float
     logloss: float
-    reliability: list[tuple[float, float, int]]
+    reliability: list[tuple[float, float, int | float]]
     n_samples: int
     n_bins: int
+    log_loss_skill: float = float("nan")
+    count_ratio: float = float("nan")
+    calibration_slope: float = float("nan")
+    calibration_intercept: float = float("nan")
+    context: CalibrationContext | None = None
+    population_weight: float | None = None
 
     def summary(self) -> str:
         """Formatted text summary of calibration metrics."""
@@ -149,6 +157,15 @@ class CalibrationReport:
         ]
         for avg_pred, avg_actual, count in self.reliability:
             lines.append(f"  {avg_pred:>10.4f}  {avg_actual:>10.4f}  {count:>6}")
+        if self.context is not None:
+            lines.extend([
+                "",
+                f"  Population : {self.context.reference_population}",
+                f"  Target     : {self.context.relevance_target}",
+                f"  LogLoss skill : {self.log_loss_skill:.6f}",
+                f"  Count ratio   : {self.count_ratio:.6f}",
+                f"  Calibration slope : {self.calibration_slope:.6f}",
+            ])
         return "\n".join(lines)
 
 
@@ -187,4 +204,33 @@ def calibration_report(
         reliability=reliability,
         n_samples=len(probabilities),
         n_bins=n_bins,
+    )
+
+
+def calibration_report_from_log_odds(
+    log_odds: np.ndarray,
+    labels: np.ndarray,
+    *,
+    context: CalibrationContext,
+    n_bins: int = 10,
+    sample_weight: np.ndarray | None = None,
+) -> CalibrationReport:
+    """Evaluate log-odds on an explicitly named relevance population.
+
+    Skill is relative to the constant predictor at this population's
+    observed prevalence. Count ratio and calibration slope address
+    properties that an imbalanced-population ECE alone cannot establish.
+    """
+    from bayesian_bm25.calibration_accumulator import CalibrationAccumulator
+
+    accumulator = CalibrationAccumulator(n_bins=n_bins, context=context)
+    accumulator.update(log_odds, labels, sample_weight=sample_weight)
+    result = accumulator.summary()
+    return CalibrationReport(
+        ece=result["ece"], brier=result["brier"], logloss=result["log_loss"],
+        reliability=accumulator.reliability(), n_samples=np.asarray(log_odds).size, n_bins=n_bins,
+        log_loss_skill=result["log_loss_skill"], count_ratio=result["count_ratio"],
+        calibration_slope=result["calibration_slope"],
+        calibration_intercept=result["calibration_intercept"], context=context,
+        population_weight=accumulator.count,
     )

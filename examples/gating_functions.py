@@ -110,7 +110,7 @@ doc_signals = np.array([
 print("  Signal columns: BM25, Vector, Metadata (noisy)")
 print(f"  {'Document':<45} {'BM25':>5} {'Vec':>5} {'Meta':>5}")
 print(f"  {'-'*45} {'-'*5} {'-'*5} {'-'*5}")
-for doc, sigs in zip(documents, doc_signals):
+for doc, sigs in zip(documents, doc_signals, strict=True):
     print(f"  {doc:<45} {sigs[0]:5.2f} {sigs[1]:5.2f} {sigs[2]:5.2f}")
 
 # Rank with different gating strategies
@@ -208,7 +208,7 @@ for mode in gating_modes:
     print(f"  {mode:<10}  {result:10.4f}")
 
 # Compensate with lower alpha
-print(f"\n  Softplus + lower alpha to compensate:")
+print("\n  Softplus + lower alpha to compensate:")
 print(f"  {'Alpha':>8}  {'Combined':>10}")
 print(f"  {'-'*8}  {'-'*10}")
 for alpha in [0.5, 0.3, 0.1, 0.0]:

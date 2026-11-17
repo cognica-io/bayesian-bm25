@@ -6,16 +6,19 @@
 
 """Multi-field BM25 scorer with Bayesian probability fusion.
 
-Manages per-field ``BayesianBM25Scorer`` instances and fuses field-level
-probabilities via ``log_odds_conjunction``.  This enables first-class
-multi-field search (e.g., title + body) with calibrated output.
+Manages per-field ``BayesianBM25Scorer`` instances. Query mode pools
+prior-free field evidence and solves one final corpus count and ceiling.
+Corpus mode retains the earlier posterior opinion pool for comparison.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from bayesian_bm25.fusion import _resolve_alpha, log_odds_conjunction
+from bayesian_bm25.calibration_context import CalibrationContext
+from bayesian_bm25.count_calibration import CountCalibration, calibrate_count
+from bayesian_bm25.fusion import _resolve_alpha, log_odds_fusion
+from bayesian_bm25.probability import _EPSILON, logit, sigmoid
 from bayesian_bm25.scorer import BayesianBM25Scorer
 
 _VALID_ALPHA_VALUES = (float, int, str, type(None))
@@ -53,18 +56,52 @@ class MultiFieldScorer:
         k1: float = 1.2,
         b: float = 0.75,
         method: str = "robertson",
+        calibration: str = "corpus",
+        expected_relevant: float | None = None,
+        kappa: float | None = None,
+        ceiling: float | None = None,
+        calibration_context: CalibrationContext | None = None,
     ) -> None:
         if not fields:
             raise ValueError("fields must be a non-empty list")
         if len(fields) != len(set(fields)):
             raise ValueError("fields must not contain duplicates")
 
+        self._calibration_context = (
+            CalibrationContext(
+                reference_population="corpus",
+                count_source="convention" if expected_relevant is None else "supplied",
+                slope_source="convention" if kappa is None else "supplied",
+                ceiling_source="convention" if ceiling is None else "supplied",
+            ) if calibration_context is None else calibration_context
+        )
+        if not isinstance(self._calibration_context, CalibrationContext):
+            raise ValueError("calibration_context must be a CalibrationContext")
+        if self._calibration_context.reference_population != "corpus":
+            raise ValueError("the scorer calibrates the corpus reference population")
+        expected_relevant = 1.0 if expected_relevant is None else float(expected_relevant)
+        kappa = 1.0 if kappa is None else float(kappa)
+        ceiling = 1.0 if ceiling is None else float(ceiling)
+        if not np.isfinite(expected_relevant) or expected_relevant <= 0.0:
+            raise ValueError("expected_relevant must be positive and finite")
+        if not np.isfinite(kappa) or kappa <= 0.0:
+            raise ValueError("kappa must be positive and finite")
+        if not np.isfinite(ceiling) or not 0.0 < ceiling <= 1.0:
+            raise ValueError("ceiling must be finite and in (0, 1]")
         self._fields = list(fields)
         self._alpha = alpha
         self._base_rate = base_rate
         self._k1 = k1
         self._b = b
         self._method = method
+        if calibration not in ("corpus", "query"):
+            raise ValueError("calibration must be 'corpus' or 'query'")
+        if calibration == "corpus" and ceiling != 1.0:
+            raise ValueError("ceiling requires calibration='query'")
+        self._calibration = calibration
+        self._expected_relevant = expected_relevant
+        self._kappa = kappa
+        self._ceiling = ceiling
 
         # Resolve field weights
         if field_weights is None:
@@ -82,6 +119,8 @@ class MultiFieldScorer:
                     f"field_weights must sum to 1, got {weight_sum}"
                 )
             self._field_weights = {f: field_weights[f] for f in fields}
+            if any(not np.isfinite(w) or w < 0.0 for w in self._field_weights.values()):
+                raise ValueError("field_weights must be finite and non-negative")
 
         # Per-field scorers (populated by index())
         self._scorers: dict[str, BayesianBM25Scorer] = {}
@@ -117,6 +156,11 @@ class MultiFieldScorer:
         show_progress : bool
             Whether to show progress bars during indexing.
         """
+        if (
+            self._calibration == "query"
+            and self._expected_relevant >= self._ceiling * len(documents)
+        ):
+            raise ValueError("expected_relevant must be less than ceiling * population size")
         for i, doc in enumerate(documents):
             for field in self._fields:
                 if field not in doc:
@@ -131,6 +175,10 @@ class MultiFieldScorer:
                 b=self._b,
                 method=self._method,
                 base_rate=self._base_rate,
+                calibration=self._calibration,
+                expected_relevant=self._expected_relevant,
+                kappa=self._kappa,
+                calibration_context=self._calibration_context,
             )
             field_corpus = [doc[field] for doc in documents]
             scorer.index(field_corpus, show_progress=show_progress)
@@ -154,31 +202,94 @@ class MultiFieldScorer:
         if not self._scorers:
             raise RuntimeError("Call index() before get_probabilities().")
 
-        # Collect per-field probabilities: shape (num_docs, num_fields)
-        field_probs = np.column_stack([
-            self._scorers[field].get_probabilities(query_tokens)
+        if self._calibration == "query":
+            evidence, model = self._query_count_model(query_tokens)
+            return np.asarray(model.probability(evidence))
+        return np.asarray(sigmoid(self.get_log_odds(query_tokens)))
+
+    def _query_count_model(self, query_tokens: list[str]) -> tuple[np.ndarray, CountCalibration]:
+        """Pool each field's evidence and constrain the fused corpus count."""
+        if not self._scorers:
+            raise RuntimeError("Call index() before scoring.")
+        columns = []
+        for field in self._fields:
+            scorer = self._scorers[field]
+            scores = scorer._raw_scores(query_tokens)
+            calibration = scorer._calibration_from_scores(scores)
+            columns.append(calibration.evidence(scores))
+        weights = np.array([self._field_weights[field] for field in self._fields])
+        pooled = np.asarray(log_odds_fusion(
+            np.column_stack(columns), alpha=_resolve_alpha(self._alpha, default=0.5),
+            weights=weights,
+        ))
+        model = calibrate_count(
+            pooled, self._expected_relevant, ceiling=self._ceiling,
+            context=self._calibration_context,
+        )
+        return pooled, model
+
+    def get_ranking_scores(self, query_tokens: list[str]) -> np.ndarray:
+        """Keep the latent fused ordering when a posterior ceiling saturates."""
+        if self._calibration == "query":
+            evidence, model = self._query_count_model(query_tokens)
+            return np.asarray(model.ranking_score(evidence))
+        return self.get_log_odds(query_tokens)
+
+    def get_log_odds(self, query_tokens: list[str]) -> np.ndarray:
+        """Get fused log-odds for all documents (dense array).
+
+        The per-field posteriors are pooled in log-odds space without
+        passing through a probability, so documents with strong evidence
+        keep their order where the fused probability would round to 1.
+        A field in which a document matches no query term has
+        probability 0; its log-odds are bounded below at the logit of
+        the probability clamp, which is the value
+        :meth:`get_probabilities` uses for it.
+
+        Parameters
+        ----------
+        query_tokens : list of str
+            Tokens for a single query.
+
+        Returns
+        -------
+        log_odds : ndarray of shape (num_docs,)
+            Fused log-odds of relevance for every document.
+        """
+        if not self._scorers:
+            raise RuntimeError("Call index() before get_log_odds().")
+        if self._calibration == "query":
+            evidence, model = self._query_count_model(query_tokens)
+            return np.asarray(model.log_odds(evidence))
+
+        field_log_odds = np.column_stack([
+            self._scorers[field].get_log_odds(query_tokens)
             for field in self._fields
         ])
+        field_log_odds = np.maximum(field_log_odds, float(logit(_EPSILON)))
 
-        # Build weights array in field order
         weights = np.array(
             [self._field_weights[f] for f in self._fields],
             dtype=np.float64,
         )
-
-        # Resolve alpha for the conjunction
         effective_alpha = _resolve_alpha(self._alpha, default=0.5)
 
-        return log_odds_conjunction(
-            field_probs, alpha=effective_alpha, weights=weights
+        return np.asarray(
+            log_odds_fusion(field_log_odds, alpha=effective_alpha, weights=weights),
+            dtype=np.float64,
         )
 
     def retrieve(
         self,
         query_tokens: list[str],
         k: int = 10,
+        return_log_odds: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Retrieve top-k documents by fused probability.
+        """Retrieve top-k documents by fused relevance.
+
+        Documents are ranked on the fused log-odds, which do not
+        saturate; the returned values are probabilities unless
+        ``return_log_odds`` is set.
 
         Parameters
         ----------
@@ -186,18 +297,29 @@ class MultiFieldScorer:
             Tokens for a single query.
         k : int
             Number of documents to retrieve.
+        return_log_odds : bool
+            Return fused log-odds instead of probabilities.
 
         Returns
         -------
         doc_ids : ndarray of shape (k,)
-            Document indices sorted by descending probability.
+            Document indices sorted by descending relevance.
         probabilities : ndarray of shape (k,)
-            Fused relevance probabilities for the top-k documents.
+            Fused relevance probabilities (or log-odds) for the top-k
+            documents.
         """
-        probs = self.get_probabilities(query_tokens)
-        k = min(k, len(probs))
-        top_k_ids = np.argsort(probs)[::-1][:k]
-        return top_k_ids, probs[top_k_ids]
+        if self._calibration == "query":
+            evidence, model = self._query_count_model(query_tokens)
+            ranking = np.asarray(model.ranking_score(evidence))
+            log_odds = np.asarray(model.log_odds(evidence))
+        else:
+            log_odds = self.get_log_odds(query_tokens)
+            ranking = log_odds
+        k = min(k, len(log_odds))
+        top_k_ids = np.argsort(-ranking, kind="stable")[:k]
+        if return_log_odds:
+            return top_k_ids, log_odds[top_k_ids]
+        return top_k_ids, np.asarray(sigmoid(log_odds[top_k_ids]), dtype=np.float64)
 
     def add_documents(
         self,

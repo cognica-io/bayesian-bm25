@@ -29,24 +29,35 @@ from datetime import datetime, timezone
 
 import bm25s
 import numpy as np
+import pytrec_eval
 
 from bayesian_bm25.probability import sigmoid
 from bayesian_bm25.scorer import BayesianBM25Scorer
 from benchmarks.calibration import minmax_normalize, platt_scaling_fit
 from benchmarks.metrics import (
-    average_precision,
+    best_f1_threshold,
     brier_score,
     expected_calibration_error,
-    ndcg_at_k,
-    precision_at_k,
     reliability_diagram,
+    threshold_f1,
 )
-from benchmarks.utils import (
-    IRDataset,
-    get_graded_relevance_vector,
-    get_relevance_vector,
-    load_beir_dataset,
-)
+from benchmarks.ranking_eval import ranked_run
+from benchmarks.utils import IRDataset, load_beir_dataset
+
+
+def _ranking_metrics(scores, dataset, qid, matched, k):
+    """Evaluate a top-1000 run against all of the query's judgments."""
+    positions = np.flatnonzero(matched)
+    run = ranked_run(
+        [dataset.doc_ids[i] for i in positions], np.asarray(scores)[positions], depth=1000,
+    )
+    if not run:
+        return 0.0, 0.0, 0.0
+    evaluator = pytrec_eval.RelevanceEvaluator(
+        {qid: dataset.qrels[qid]}, {f"ndcg_cut_{k}", "map", f"P_{k}"},
+    )
+    row = evaluator.evaluate({qid: run})[qid]
+    return row[f"ndcg_cut_{k}"], row["map"], row[f"P_{k}"]
 
 
 def evaluate_bm25_raw(
@@ -58,17 +69,11 @@ def evaluate_bm25_raw(
     ndcgs, aps, precisions = [], [], []
 
     for qid, qtokens in dataset.queries:
-        qrel = dataset.qrels[qid]
         scores = bm25_model.get_scores(qtokens)
-        top_k_idx = np.argsort(-scores)[:k]
-        ranked_dids = [dataset.doc_ids[i] for i in top_k_idx]
-
-        graded = get_graded_relevance_vector(ranked_dids, qrel)
-        binary = get_relevance_vector(ranked_dids, qrel)
-
-        ndcgs.append(ndcg_at_k(graded, k))
-        aps.append(average_precision(binary))
-        precisions.append(precision_at_k(binary, k))
+        ndcg, ap, precision = _ranking_metrics(scores, dataset, qid, scores > 0, k)
+        ndcgs.append(ndcg)
+        aps.append(ap)
+        precisions.append(precision)
 
     return {
         f"NDCG@{k}": float(np.mean(ndcgs)),
@@ -89,17 +94,13 @@ def evaluate_bayesian(
     for qid, qtokens in dataset.queries:
         qrel = dataset.qrels[qid]
         probs = scorer.get_probabilities(qtokens)
-        top_k_idx = np.argsort(-probs)[:k]
-        ranked_dids = [dataset.doc_ids[i] for i in top_k_idx]
-
-        graded = get_graded_relevance_vector(ranked_dids, qrel)
-        binary = get_relevance_vector(ranked_dids, qrel)
-
-        ndcgs.append(ndcg_at_k(graded, k))
-        aps.append(average_precision(binary))
-        precisions.append(precision_at_k(binary, k))
-
-        nonzero = probs > 0
+        nonzero = scorer._bm25.get_scores(qtokens) > 0
+        ndcg, ap, precision = _ranking_metrics(
+            scorer.get_log_odds(qtokens), dataset, qid, nonzero, k,
+        )
+        ndcgs.append(ndcg)
+        aps.append(ap)
+        precisions.append(precision)
         if np.any(nonzero):
             nonzero_dids = [dataset.doc_ids[i] for i, nz in enumerate(nonzero) if nz]
             nonzero_labels = [float(qrel.get(did, 0) >= 1) for did in nonzero_dids]
@@ -150,39 +151,6 @@ def collect_training_data(
 # Threshold transfer test
 # ---------------------------------------------------------------------------
 
-def threshold_f1(
-    values: np.ndarray,
-    labels: np.ndarray,
-    threshold: float,
-) -> tuple[float, float, float]:
-    predicted = values >= threshold
-    tp = np.sum(predicted & (labels == 1))
-    fp = np.sum(predicted & (labels == 0))
-    fn = np.sum(~predicted & (labels == 1))
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    return float(precision), float(recall), float(f1)
-
-
-def find_best_threshold(
-    values: np.ndarray,
-    labels: np.ndarray,
-    n_candidates: int = 200,
-) -> tuple[float, float]:
-    lo = float(np.min(values))
-    hi = float(np.max(values))
-    if lo == hi:
-        return lo, 0.0
-    candidates = np.linspace(lo, hi, n_candidates)
-    best_f1, best_t = 0.0, candidates[0]
-    for t in candidates:
-        _, _, f1 = threshold_f1(values, labels, t)
-        if f1 > best_f1:
-            best_f1, best_t = f1, t
-    return float(best_t), float(best_f1)
-
-
 def evaluate_threshold_transfer(
     scorer: BayesianBM25Scorer,
     dataset: IRDataset,
@@ -200,8 +168,8 @@ def evaluate_threshold_transfer(
         for qid in qids:
             qt = qid_to_tokens[qid]
             qrel = dataset.qrels[qid]
-            scores = scorer.get_probabilities(qt)
-            nz = scores > 0
+            scores = scorer.get_log_odds(qt)
+            nz = scorer._bm25.get_scores(qt) > 0
             if not np.any(nz):
                 continue
             nz_dids = [dataset.doc_ids[i] for i, n in enumerate(nz) if n]
@@ -212,7 +180,7 @@ def evaluate_threshold_transfer(
 
     train_v, train_l = collect(train_qids)
     test_v, test_l = collect(test_qids)
-    t, train_f1 = find_best_threshold(train_v, train_l)
+    t, train_f1 = best_f1_threshold(train_v, train_l)
     _, _, test_f1 = threshold_f1(test_v, test_l, t)
 
     return train_f1, test_f1, train_f1 - test_f1
@@ -367,25 +335,25 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
     platt_A, platt_B = platt_scaling_fit(train_scores, train_labels)
     print(f"   Platt A={platt_A:.4f}, B={platt_B:.4f}")
 
-    platt_all_probs, platt_all_labels = [], []
+    platt_all_probs, platt_all_labels, platt_all_logits = [], [], []
     platt_ndcgs, platt_aps, platt_precisions = [], [], []
     for qid, qtokens in eval_dataset.queries:
         qrel = dataset.qrels[qid]
         scores = bm25_model.get_scores(qtokens)
         platt_probs = np.array(sigmoid(platt_A * scores + platt_B))
-        top_k_idx = np.argsort(-platt_probs)[:k]
-        ranked_dids = [dataset.doc_ids[i] for i in top_k_idx]
-        graded = get_graded_relevance_vector(ranked_dids, qrel)
-        binary = get_relevance_vector(ranked_dids, qrel)
-        platt_ndcgs.append(ndcg_at_k(graded, k))
-        platt_aps.append(average_precision(binary))
-        platt_precisions.append(precision_at_k(binary, k))
+        ndcg, ap, precision = _ranking_metrics(
+            platt_A * scores + platt_B, dataset, qid, scores > 0, k,
+        )
+        platt_ndcgs.append(ndcg)
+        platt_aps.append(ap)
+        platt_precisions.append(precision)
         nonzero = scores > 0
         if np.any(nonzero):
             nz_dids = [dataset.doc_ids[i] for i, nz in enumerate(nonzero) if nz]
             nz_labels = [float(qrel.get(did, 0) >= 1) for did in nz_dids]
             platt_all_probs.extend(platt_probs[nonzero].tolist())
             platt_all_labels.extend(nz_labels)
+            platt_all_logits.extend((platt_A * scores[nonzero] + platt_B).tolist())
 
     platt_p_arr = np.array(platt_all_probs) if platt_all_probs else np.array([])
     platt_l_arr = np.array(platt_all_labels) if platt_all_labels else np.array([])
@@ -405,34 +373,32 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
     results.append(("Platt scaling", r_platt))
 
     # Platt threshold transfer
-    platt_train_probs = np.array(sigmoid(platt_A * train_scores + platt_B))
-    platt_t, platt_train_f1 = find_best_threshold(platt_train_probs, train_labels)
-    _, _, platt_test_f1 = threshold_f1(platt_p_arr, platt_l_arr, platt_t)
+    platt_train_logits = platt_A * train_scores + platt_B
+    platt_t, platt_train_f1 = best_f1_threshold(platt_train_logits, train_labels)
+    _, _, platt_test_f1 = threshold_f1(np.array(platt_all_logits), platt_l_arr, platt_t)
     threshold_results.append((
         "Platt scaling", platt_train_f1, platt_test_f1, platt_train_f1 - platt_test_f1
     ))
 
     # 9. Min-max normalization baseline
     print("9. Min-max normalization (baseline)")
-    minmax_all_probs, minmax_all_labels = [], []
+    minmax_all_probs, minmax_all_labels, minmax_all_scores = [], [], []
     minmax_ndcgs, minmax_aps, minmax_precisions = [], [], []
     for qid, qtokens in eval_dataset.queries:
         qrel = dataset.qrels[qid]
         scores = bm25_model.get_scores(qtokens)
         minmax_probs = minmax_normalize(scores, train_scores)
-        top_k_idx = np.argsort(-minmax_probs)[:k]
-        ranked_dids = [dataset.doc_ids[i] for i in top_k_idx]
-        graded = get_graded_relevance_vector(ranked_dids, qrel)
-        binary = get_relevance_vector(ranked_dids, qrel)
-        minmax_ndcgs.append(ndcg_at_k(graded, k))
-        minmax_aps.append(average_precision(binary))
-        minmax_precisions.append(precision_at_k(binary, k))
+        ndcg, ap, precision = _ranking_metrics(scores, dataset, qid, scores > 0, k)
+        minmax_ndcgs.append(ndcg)
+        minmax_aps.append(ap)
+        minmax_precisions.append(precision)
         nonzero = scores > 0
         if np.any(nonzero):
             nz_dids = [dataset.doc_ids[i] for i, nz in enumerate(nonzero) if nz]
             nz_labels = [float(qrel.get(did, 0) >= 1) for did in nz_dids]
             minmax_all_probs.extend(minmax_probs[nonzero].tolist())
             minmax_all_labels.extend(nz_labels)
+            minmax_all_scores.extend(scores[nonzero].tolist())
 
     minmax_p_arr = np.array(minmax_all_probs) if minmax_all_probs else np.array([])
     minmax_l_arr = np.array(minmax_all_labels) if minmax_all_labels else np.array([])
@@ -452,9 +418,8 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
     results.append(("Min-max normalization", r_minmax))
 
     # Min-max threshold transfer
-    minmax_train = minmax_normalize(train_scores, train_scores)
-    minmax_t, minmax_train_f1 = find_best_threshold(minmax_train, train_labels)
-    _, _, minmax_test_f1 = threshold_f1(minmax_p_arr, minmax_l_arr, minmax_t)
+    minmax_t, minmax_train_f1 = best_f1_threshold(train_scores, train_labels)
+    _, _, minmax_test_f1 = threshold_f1(np.array(minmax_all_scores), minmax_l_arr, minmax_t)
     threshold_results.append((
         "Min-max normalization",
         minmax_train_f1,
@@ -594,7 +559,7 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
         for qid, qtokens in eval_dataset.queries:
             qrel = dataset.qrels[qid]
             probs = scorer.get_probabilities(qtokens)
-            nonzero = probs > 0
+            nonzero = scorer._bm25.get_scores(qtokens) > 0
             if np.any(nonzero):
                 nonzero_dids = [dataset.doc_ids[i] for i, nz in enumerate(nonzero) if nz]
                 nonzero_labels = [float(qrel.get(did, 0) >= 1) for did in nonzero_dids]
@@ -614,9 +579,10 @@ def run_base_rate_comparison(dataset: IRDataset, k: int = 10) -> dict:
                 f"  {avg_actual:>10.4f}  {count:>8}  {err:>8.4f}"
             )
 
-    return {
-        name: r for name, r in results
-    }
+    recorded = {name: r for name, r in results}
+    for name, train_f1, test_f1, gap in threshold_results:
+        recorded[name].update({"Train F1": train_f1, "Test F1": test_f1, "F1 Gap": gap})
+    return recorded
 
 
 def main() -> None:
@@ -647,6 +613,13 @@ def main() -> None:
     if args.output:
         output = {
             "benchmark": "base_rate",
+            "protocol": {
+                "query_split": "50/50, seed 42",
+                "ranking_depth": 1000,
+                "map": "full-run AP with all judged relevant documents in the denominator",
+                "calibration_population": "matching documents, shared across methods",
+                "threshold_selection": "training queries only, unsaturated scores",
+            },
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "results": all_results,
         }

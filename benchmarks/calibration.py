@@ -23,12 +23,15 @@ from datetime import datetime, timezone
 import bm25s
 import numpy as np
 
+from bayesian_bm25.calibration import PlattCalibrator
 from bayesian_bm25.probability import sigmoid
 from bayesian_bm25.scorer import BayesianBM25Scorer
 from benchmarks.metrics import (
+    best_f1_threshold,
     brier_score,
     expected_calibration_error,
     reliability_diagram,
+    threshold_f1,
 )
 from benchmarks.utils import load_beir_dataset
 
@@ -108,71 +111,26 @@ def minmax_normalize(
 def platt_scaling_fit(
     scores: np.ndarray,
     labels: np.ndarray,
-    lr: float = 0.01,
-    max_iter: int = 5000,
-    tol: float = 1e-7,
 ) -> tuple[float, float]:
     """Fit Platt scaling parameters A, B: P = sigmoid(A*score + B).
 
     This is the standard method from Platt (1999) for converting
     SVM/classifier outputs into probabilities.
+
+    The fit uses Newton's method on standardized scores, which reaches
+    the maximum-likelihood parameters whatever the scale of the scores.
+    Fixed-step gradient descent on raw BM25 scores, at the relevance
+    rate of a retrieval pool, stops far from the optimum with a slope of
+    the wrong sign; a baseline fitted that way inverts the ranking.
     """
-    A = 0.0
-    B = 0.0
-    for _ in range(max_iter):
-        z = A * scores + B
-        p = sigmoid(z)
-        p = np.clip(p, 1e-10, 1.0 - 1e-10)
-        error = p - labels
-        grad_A = float(np.mean(error * scores))
-        grad_B = float(np.mean(error))
-        new_A = A - lr * grad_A
-        new_B = B - lr * grad_B
-        if abs(new_A - A) < tol and abs(new_B - B) < tol:
-            A, B = new_A, new_B
-            break
-        A, B = new_A, new_B
-    return A, B
+    calibrator = PlattCalibrator()
+    calibrator.fit(scores, labels)
+    return calibrator.a, calibrator.b
 
 
 # ---------------------------------------------------------------------------
 # Threshold transfer
 # ---------------------------------------------------------------------------
-
-
-def find_best_threshold(
-    values: np.ndarray,
-    labels: np.ndarray,
-    n_candidates: int = 200,
-) -> tuple[float, float]:
-    """Find threshold maximizing F1."""
-    lo, hi = float(np.min(values)), float(np.max(values))
-    if lo == hi:
-        return lo, 0.0
-    candidates = np.linspace(lo, hi, n_candidates)
-    best_f1, best_t = 0.0, candidates[0]
-    for t in candidates:
-        predicted = values >= t
-        tp = np.sum(predicted & (labels == 1))
-        fp = np.sum(predicted & (labels == 0))
-        fn = np.sum(~predicted & (labels == 1))
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-        if f1 > best_f1:
-            best_f1, best_t = f1, float(t)
-    return best_t, best_f1
-
-
-def threshold_f1(values, labels, t):
-    predicted = values >= t
-    tp = np.sum(predicted & (labels == 1))
-    fp = np.sum(predicted & (labels == 0))
-    fn = np.sum(~predicted & (labels == 1))
-    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-    return float(prec), float(rec), float(f1)
 
 
 # ---------------------------------------------------------------------------
@@ -337,19 +295,19 @@ def run_verification(dataset_name: str) -> dict:
     # Raw BM25
     bm25_train_scores, bm25_train_labels = train_scores, train_labels
     bm25_test_scores, bm25_test_labels = test_scores, test_labels
-    bm25_t, bm25_train_f1 = find_best_threshold(bm25_train_scores, bm25_train_labels)
+    bm25_t, bm25_train_f1 = best_f1_threshold(bm25_train_scores, bm25_train_labels)
     _, _, bm25_test_f1 = threshold_f1(bm25_test_scores, bm25_test_labels, bm25_t)
     methods.append(("Raw BM25", bm25_t, bm25_train_f1, bm25_test_f1))
 
     # Min-max
     minmax_train = minmax_normalize(train_scores, train_scores)
-    minmax_t, minmax_train_f1 = find_best_threshold(minmax_train, train_labels)
+    minmax_t, minmax_train_f1 = best_f1_threshold(minmax_train, train_labels)
     _, _, minmax_test_f1 = threshold_f1(minmax_probs, test_labels, minmax_t)
     methods.append(("Min-max norm", minmax_t, minmax_train_f1, minmax_test_f1))
 
     # Platt
     platt_train = sigmoid(A * train_scores + B)
-    platt_t, platt_train_f1 = find_best_threshold(platt_train, train_labels)
+    platt_t, platt_train_f1 = best_f1_threshold(platt_train, train_labels)
     _, _, platt_test_f1 = threshold_f1(platt_probs, test_labels, platt_t)
     methods.append(("Platt scaling", platt_t, platt_train_f1, platt_test_f1))
 
@@ -357,7 +315,7 @@ def run_verification(dataset_name: str) -> dict:
     bay_train_probs, bay_train_labels = collect_probabilities_and_labels(
         scorer, train_qids, qid_to_tokens, doc_ids, qrels
     )
-    bay_t, bay_train_f1 = find_best_threshold(bay_train_probs, bay_train_labels)
+    bay_t, bay_train_f1 = best_f1_threshold(bay_train_probs, bay_train_labels)
     _, _, bay_test_f1 = threshold_f1(test_probs, test_prob_labels, bay_t)
     methods.append(("Bayesian (auto)", bay_t, bay_train_f1, bay_test_f1))
 
@@ -365,7 +323,7 @@ def run_verification(dataset_name: str) -> dict:
     br_train_probs, br_train_labels = collect_probabilities_and_labels(
         scorer_br, train_qids, qid_to_tokens, doc_ids, qrels
     )
-    br_t, br_train_f1 = find_best_threshold(br_train_probs, br_train_labels)
+    br_t, br_train_f1 = best_f1_threshold(br_train_probs, br_train_labels)
     _, _, br_test_f1 = threshold_f1(br_probs, br_labels, br_t)
     methods.append(("Bayesian (auto+br)", br_t, br_train_f1, br_test_f1))
 
@@ -373,7 +331,7 @@ def run_verification(dataset_name: str) -> dict:
     fit_train_probs, fit_train_labels = collect_probabilities_and_labels(
         scorer_fit, train_qids, qid_to_tokens, doc_ids, qrels
     )
-    fit_t, fit_train_f1 = find_best_threshold(fit_train_probs, fit_train_labels)
+    fit_t, fit_train_f1 = best_f1_threshold(fit_train_probs, fit_train_labels)
     _, _, fit_test_f1_result = threshold_f1(fit_probs, fit_labels, fit_t)
     methods.append(("Bayesian (fit)", fit_t, fit_train_f1, fit_test_f1_result))
 

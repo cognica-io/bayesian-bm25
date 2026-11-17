@@ -37,7 +37,7 @@ probs = transform.score_to_probability(scores, tfs, ratios)
 
 print("\nBatch conversion:")
 print(f"  {'Score':>6}  {'TF':>3}  {'Ratio':>5}  {'Prob':>8}")
-for s, t, r, p in zip(scores, tfs, ratios, probs):
+for s, t, r, p in zip(scores, tfs, ratios, probs, strict=True):
     print(f"  {s:6.2f}  {t:3.0f}  {r:5.2f}  {p:8.4f}")
 
 # --- Example 3: Understanding the components ---

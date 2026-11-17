@@ -13,7 +13,9 @@ BM25 scores.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+import operator
+from dataclasses import replace
 
 import numpy as np
 
@@ -25,142 +27,18 @@ except ImportError as exc:
         "Install it with: pip install bayesian-bm25[scorer]"
     ) from exc
 
-from bayesian_bm25.probability import BayesianProbabilityTransform
+from bayesian_bm25.block_max_index import BlockMaxIndex as BlockMaxIndex
+from bayesian_bm25.calibration_context import CalibrationContext
+from bayesian_bm25.probability import BayesianProbabilityTransform, sigmoid
+from bayesian_bm25.query_calibration import (
+    QueryCalibration,
+    calibrate_query,
+    score_dispersion,
+)
+from bayesian_bm25.retrieval_result import RetrievalResult
 
 _VALID_BASE_RATE_METHODS = ("percentile", "mixture", "elbow")
-
-
-class BlockMaxIndex:
-    """Block-max index for BMW-style upper bounds (Paper 1, Section 6.2).
-
-    Partitions documents into fixed-size blocks and stores per-block
-    maximum BM25 contribution for each term.  Block-level upper bounds
-    are tighter than global WAND upper bounds because they exploit
-    locality in the posting list.
-
-    Parameters
-    ----------
-    block_size : int
-        Number of documents per block (default 128).
-    """
-
-    def __init__(self, block_size: int = 128) -> None:
-        if block_size < 1:
-            raise ValueError(f"block_size must be >= 1, got {block_size}")
-        self._block_size = block_size
-        self._block_maxes: np.ndarray | None = None  # (n_terms, n_blocks)
-        self._n_docs: int = 0
-        self._n_terms: int = 0
-
-    def build(self, score_matrix: np.ndarray) -> None:
-        """Build block-max index from a per-term score matrix.
-
-        Parameters
-        ----------
-        score_matrix : array of shape (n_terms, n_docs)
-            Per-term BM25 contributions for each document.
-        """
-        score_matrix = np.asarray(score_matrix, dtype=np.float64)
-        if score_matrix.ndim != 2:
-            raise ValueError(
-                f"score_matrix must be 2D (n_terms, n_docs), got {score_matrix.ndim}D"
-            )
-        n_terms, n_docs = score_matrix.shape
-        self._n_terms = n_terms
-        self._n_docs = n_docs
-
-        bs = self._block_size
-        n_blocks = (n_docs + bs - 1) // bs
-
-        block_maxes = np.empty((n_terms, n_blocks), dtype=np.float64)
-        for b in range(n_blocks):
-            start = b * bs
-            end = min(start + bs, n_docs)
-            block_maxes[:, b] = np.max(score_matrix[:, start:end], axis=1)
-
-        self._block_maxes = block_maxes
-
-    def block_upper_bound(self, term_idx: int, block_id: int) -> float:
-        """Return the per-term BM25 upper bound for a specific block.
-
-        Parameters
-        ----------
-        term_idx : int
-            Term index in the score matrix.
-        block_id : int
-            Block index.
-
-        Returns
-        -------
-        Maximum BM25 contribution of ``term_idx`` in ``block_id``.
-        """
-        if self._block_maxes is None:
-            raise RuntimeError("Call build() before block_upper_bound().")
-        return float(self._block_maxes[term_idx, block_id])
-
-    def bayesian_block_upper_bound(
-        self,
-        term_idx: int,
-        block_id: int,
-        transform: BayesianProbabilityTransform,
-        p_max: float = 0.9,
-    ) -> float:
-        """Bayesian probability upper bound for a block (Corollary 7.4.2).
-
-        Delegates to ``transform.wand_upper_bound()`` using the
-        block-level BM25 maximum, producing a tighter bound than the
-        global WAND upper bound.
-
-        Parameters
-        ----------
-        term_idx : int
-            Term index.
-        block_id : int
-            Block index.
-        transform : BayesianProbabilityTransform
-            Configured transform for score-to-probability conversion.
-        p_max : float
-            Maximum prior for the WAND upper bound formula.
-
-        Returns
-        -------
-        Bayesian probability upper bound for the block.
-        """
-        block_max = self.block_upper_bound(term_idx, block_id)
-        return float(transform.wand_upper_bound(block_max, p_max))
-
-    @property
-    def block_size(self) -> int:
-        """Number of documents per block."""
-        return self._block_size
-
-    @property
-    def n_blocks(self) -> int:
-        """Total number of blocks."""
-        if self._block_maxes is None:
-            raise RuntimeError("Call build() before accessing n_blocks.")
-        return self._block_maxes.shape[1]
-
-
-@dataclass
-class RetrievalResult:
-    """Result object returned by ``retrieve(explain=True)``.
-
-    Attributes
-    ----------
-    doc_ids : ndarray of shape (num_queries, k)
-        Document indices for each query.
-    probabilities : ndarray of shape (num_queries, k)
-        Calibrated relevance probabilities.
-    explanations : list of list of BM25SignalTrace, or None
-        Per-query, per-document trace through the probability pipeline.
-        ``explanations[q][r]`` is the trace for query *q*, rank *r*.
-        None when ``explain=False``.
-    """
-
-    doc_ids: np.ndarray
-    probabilities: np.ndarray
-    explanations: list | None
+_VALID_CALIBRATIONS = ("corpus", "query")
 
 
 class BayesianBM25Scorer:
@@ -193,6 +71,39 @@ class BayesianBM25Scorer:
         - ``"percentile"`` (default): 95th-percentile heuristic.
         - ``"mixture"``: 2-component Gaussian EM (numpy only, 20 iterations).
         - ``"elbow"``: knee point in sorted score curve.
+    calibration : str
+        How scores become probabilities.
+
+        - ``"corpus"`` (default): one slope and one midpoint for the
+          whole corpus, estimated from pseudo-queries at indexing time,
+          with the composite document prior and the optional base rate.
+          A corpus-level slope is the right order of magnitude only for
+          queries that resemble the pseudo-queries: applied to a query
+          twenty times as long it multiplies the evidence by roughly
+          twenty.
+        - ``"query"``: per-query calibration.  The slope is
+          ``kappa / sigma_q`` with ``sigma_q`` the dispersion of the
+          matching scores of each query, so it follows the scale of the
+          query's scores; the offset is fixed by the count constraint
+          ``sum_d P(R=1 | s_d) = expected_relevant`` over the whole
+          corpus.  The posterior is a monotone transform of the BM25
+          score for each query, so it preserves the BM25 ranking, and
+          at most ``expected_relevant / p`` documents can receive
+          probability ``p`` or more.  ``alpha``, ``beta`` and
+          ``base_rate`` do not enter this mode.
+    kappa : float
+        Dimensionless slope for ``calibration="query"``: the evidence
+        gained per standard deviation of a query's matching scores.
+    expected_relevant : float
+        Expected number of relevant documents per query for
+        ``calibration="query"``.  Must be smaller than the corpus size.
+        Neither ``kappa`` nor ``expected_relevant`` can be identified
+        from scores alone; they are conventions unless fitted to
+        relevance labels.
+    ceiling : float
+        Posterior ceiling in (0, 1] for query calibration. The expected
+        count must be less than ``ceiling * num_docs``. The ceiling is
+        supplied or learned from judgments; scores do not identify it.
     """
 
     def __init__(
@@ -204,17 +115,59 @@ class BayesianBM25Scorer:
         beta: float | None = None,
         base_rate: float | str | None = None,
         base_rate_method: str = "percentile",
+        calibration: str = "corpus",
+        kappa: float | None = None,
+        expected_relevant: float | None = None,
+        ceiling: float | None = None,
+        calibration_context: CalibrationContext | None = None,
     ) -> None:
+        supplied_count = expected_relevant is not None
+        supplied_slope = kappa is not None
+        supplied_ceiling = ceiling is not None
+        kappa = 1.0 if kappa is None else float(kappa)
+        expected_relevant = 1.0 if expected_relevant is None else float(expected_relevant)
+        ceiling = 1.0 if ceiling is None else float(ceiling)
         if base_rate_method not in _VALID_BASE_RATE_METHODS:
             raise ValueError(
                 f"base_rate_method must be one of {_VALID_BASE_RATE_METHODS}, "
                 f"got {base_rate_method!r}"
             )
+        if calibration not in _VALID_CALIBRATIONS:
+            raise ValueError(
+                f"calibration must be one of {_VALID_CALIBRATIONS}, "
+                f"got {calibration!r}"
+            )
+        if not math.isfinite(kappa) or not (kappa > 0.0):
+            raise ValueError(f"kappa must be positive and finite, got {kappa}")
+        if not math.isfinite(expected_relevant) or not (expected_relevant > 0.0):
+            raise ValueError(
+                f"expected_relevant must be positive and finite, got {expected_relevant}"
+            )
+        if not math.isfinite(ceiling) or not (0.0 < ceiling <= 1.0):
+            raise ValueError("ceiling must be finite and in (0, 1]")
+        if calibration != "query" and ceiling != 1.0:
+            raise ValueError("ceiling requires calibration='query'")
         self._bm25 = bm25s.BM25(k1=k1, b=b, method=method)
         self._user_alpha = alpha
         self._user_beta = beta
         self._user_base_rate = base_rate
         self._base_rate_method = base_rate_method
+        self._calibration = calibration
+        self._kappa = float(kappa)
+        self._expected_relevant = float(expected_relevant)
+        self._ceiling = float(ceiling)
+        self._calibration_context = (
+            CalibrationContext(
+                reference_population="corpus",
+                count_source="supplied" if supplied_count else "convention",
+                slope_source="supplied" if supplied_slope else "convention",
+                ceiling_source="supplied" if supplied_ceiling else "convention",
+            ) if calibration_context is None else calibration_context
+        )
+        if not isinstance(self._calibration_context, CalibrationContext):
+            raise ValueError("calibration_context must be a CalibrationContext")
+        if self._calibration_context.reference_population != "corpus":
+            raise ValueError("the scorer calibrates the corpus reference population")
         self._transform: BayesianProbabilityTransform | None = None
         self._doc_lengths: np.ndarray | None = None
         self._avgdl: float | None = None
@@ -247,6 +200,26 @@ class BayesianBM25Scorer:
             return None
         return self._transform.base_rate
 
+    @property
+    def calibration(self) -> str:
+        """Calibration mode: ``"corpus"`` or ``"query"``."""
+        return self._calibration
+
+    @property
+    def kappa(self) -> float:
+        """Dimensionless slope used by ``calibration="query"``."""
+        return self._kappa
+
+    @property
+    def expected_relevant(self) -> float:
+        """Expected relevant documents per query for ``calibration="query"``."""
+        return self._expected_relevant
+
+    @property
+    def ceiling(self) -> float:
+        """Default posterior ceiling for per-query calibration."""
+        return self._ceiling
+
     def index(self, corpus_tokens: list[list[str]], show_progress: bool = True) -> None:
         """Build the BM25 index and compute document statistics.
 
@@ -257,6 +230,14 @@ class BayesianBM25Scorer:
         show_progress : bool
             Whether to show progress bars during indexing.
         """
+        if (
+            self._calibration == "query"
+            and self._expected_relevant >= self._ceiling * len(corpus_tokens)
+        ):
+            raise ValueError(
+                f"expected_relevant ({self._expected_relevant}) must be smaller "
+                f"than the corpus size times ceiling ({self._ceiling * len(corpus_tokens):g})"
+            )
         self._corpus_tokens = corpus_tokens
         self._doc_token_sets = [set(tokens) for tokens in corpus_tokens]
         self._bm25.index(corpus_tokens, show_progress=show_progress)
@@ -329,7 +310,8 @@ class BayesianBM25Scorer:
 
         all_scores = np.concatenate(per_query_scores)
         estimated_beta = float(np.median(all_scores))
-        score_std = float(np.std(all_scores))
+        # Scores that are equal up to rounding have no scale to estimate.
+        score_std = score_dispersion(all_scores)
         estimated_alpha = 1.0 / score_std if score_std > 0 else 1.0
 
         alpha = self._user_alpha if self._user_alpha is not None else estimated_alpha
@@ -497,6 +479,11 @@ class BayesianBM25Scorer:
         k: int = 10,
         show_progress: bool = False,
         explain: bool = False,
+        return_log_odds: bool = False,
+        *,
+        expected_relevant: np.ndarray | float | None = None,
+        kappa: np.ndarray | float | None = None,
+        ceiling: np.ndarray | float | None = None,
     ) -> tuple[np.ndarray, np.ndarray] | RetrievalResult:
         """Retrieve top-k documents with Bayesian probabilities.
 
@@ -513,6 +500,18 @@ class BayesianBM25Scorer:
             ``BM25SignalTrace`` explanations.  When False (default),
             returns a backward-compatible ``(doc_ids, probabilities)``
             tuple.
+        return_log_odds : bool
+            Return posterior log-odds in place of probabilities.  A
+            probability rounds to 1 for log-odds above about 36.7 and is
+            clamped well before that, so documents with strong evidence
+            tie; log-odds keep their order.  Under
+            ``calibration="corpus"`` a retrieved document with a zero
+            score has probability 0 and log-odds ``-inf``.
+        expected_relevant, kappa, ceiling : float, array, or None
+            Query-calibration overrides, either one scalar or one value
+            per query. Counts refer to the whole indexed corpus. A result
+            limit is not a relevance count. None uses the scorer default.
+            These overrides require ``calibration="query"``.
 
         Returns
         -------
@@ -522,34 +521,94 @@ class BayesianBM25Scorer:
         if self._transform is None:
             raise RuntimeError("Call index() before retrieve().")
 
-        results = self._bm25.retrieve(
-            query_tokens, k=k, sorted=True, show_progress=show_progress
-        )
-        doc_ids = results.documents
-        bm25_scores = results.scores
+        try:
+            depth = operator.index(k)
+        except TypeError as exc:
+            raise ValueError("k must be a positive integer") from exc
+        if isinstance(k, bool) or depth < 1 or depth > self.num_docs:
+            raise ValueError("k must be a positive integer no larger than the corpus size")
+        if self._calibration != "query" and any(
+            value is not None for value in (expected_relevant, kappa, ceiling)
+        ):
+            raise ValueError("query parameter overrides require calibration='query'")
 
-        probabilities = self._scores_to_probabilities(
-            doc_ids, bm25_scores, query_tokens
-        )
+        n_queries = len(query_tokens)
+        counts = self._query_parameter(expected_relevant, self._expected_relevant, n_queries)
+        slopes = self._query_parameter(kappa, self._kappa, n_queries)
+        ceilings = self._query_parameter(ceiling, self._ceiling, n_queries)
+        doc_ids = np.empty((n_queries, depth), dtype=np.int64)
+        bm25_scores = np.empty((n_queries, depth), dtype=np.float64)
+        values = np.empty((n_queries, depth), dtype=np.float64)
+        ranking_scores = np.empty_like(values)
+        posterior_log_odds = np.empty_like(values)
+        calibrations: list[QueryCalibration] | None = [] if self._calibration == "query" else None
+        population_ids = np.arange(self.num_docs, dtype=np.int64)
+
+        for q_idx, query in bm25s.tqdm(
+            enumerate(query_tokens), total=n_queries, disable=not show_progress,
+            desc="Score and calibrate", leave=False,
+        ):
+            scores = self._raw_scores(query)
+            if calibrations is not None:
+                model = self._calibration_from_scores(
+                    scores,
+                    expected_relevant=None if expected_relevant is None else float(counts[q_idx]),
+                    kappa=None if kappa is None else float(slopes[q_idx]),
+                    ceiling=None if ceiling is None else float(ceilings[q_idx]),
+                )
+                calibrations.append(model)
+                ranking = np.asarray(model.ranking_score(scores))
+                log_odds = np.asarray(model.log_odds(scores))
+            else:
+                # A document prior can move a document outside raw BM25's
+                # top-k into the posterior top-k. Score the population
+                # before selecting rather than re-sorting a truncated list.
+                log_odds = self._scores_to_probabilities(
+                    population_ids[None, :], scores[None, :], [query], return_log_odds=True,
+                )[0]
+                ranking = log_odds
+
+            eligible = population_ids
+            if depth < self.num_docs:
+                threshold = np.partition(ranking, self.num_docs - depth)[self.num_docs - depth]
+                eligible = np.flatnonzero(ranking >= threshold)
+            selected = eligible[np.argsort(-ranking[eligible], kind="stable")[:depth]]
+            doc_ids[q_idx] = selected
+            bm25_scores[q_idx] = scores[selected]
+            ranking_scores[q_idx] = ranking[selected]
+            posterior_log_odds[q_idx] = log_odds[selected]
+            if return_log_odds:
+                values[q_idx] = log_odds[selected]
+            elif calibrations is not None:
+                values[q_idx] = model.probability(scores[selected])
+            else:
+                values[q_idx] = self._scores_to_probabilities(
+                    selected[None, :], scores[selected][None, :], [query],
+                )[0]
 
         if not explain:
-            return doc_ids, probabilities
+            return doc_ids, values
 
         from bayesian_bm25.debug import FusionDebugger
 
-        debugger = FusionDebugger(self._transform)
         explanations: list[list] = []
 
         for q_idx in range(doc_ids.shape[0]):
             query = query_tokens[q_idx]
+            debugger = FusionDebugger(self._transform)
             query_explanations = []
             for rank in range(doc_ids.shape[1]):
                 did = int(doc_ids[q_idx, rank])
                 score = float(bm25_scores[q_idx, rank])
-                if score > 0 and self._doc_lengths is not None:
+                if (score > 0 or calibrations is not None) and self._doc_lengths is not None:
                     dl_ratio = float(self._doc_lengths[did] / self._avgdl)
                     tf = float(len(set(query) & self._doc_token_sets[did]))
-                    trace = debugger.trace_bm25(score, tf, dl_ratio)
+                    if calibrations is None:
+                        trace = debugger.trace_bm25(score, tf, dl_ratio)
+                    else:
+                        trace = debugger.trace_query_calibration(
+                            calibrations[q_idx], score, tf, dl_ratio,
+                        )
                 else:
                     trace = None
                 query_explanations.append(trace)
@@ -557,13 +616,208 @@ class BayesianBM25Scorer:
 
         return RetrievalResult(
             doc_ids=doc_ids,
-            probabilities=probabilities,
+            probabilities=values,
             explanations=explanations,
+            calibrations=calibrations,
+            ranking_scores=ranking_scores,
+            posterior_log_odds=posterior_log_odds,
         )
+
+    @staticmethod
+    def _query_parameter(
+        value: np.ndarray | float | None, default: float, n_queries: int,
+    ) -> np.ndarray:
+        """Resolve scalar or per-query parameter overrides."""
+        array = np.asarray(default if value is None else value, dtype=np.float64)
+        if array.ndim == 0:
+            return np.full(n_queries, float(array))
+        if array.shape != (n_queries,):
+            raise ValueError("query parameter arrays must have one value per query")
+        return array
+
+    def _raw_scores(self, query_tokens: list[str]) -> np.ndarray:
+        """Score one query, including the empty query's known zero vector."""
+        if not isinstance(query_tokens, list):
+            raise ValueError("query_tokens must be a list of tokens")
+        if not query_tokens:
+            return np.zeros(self.num_docs, dtype=np.float64)
+        return np.asarray(self._bm25.get_scores(query_tokens), dtype=np.float64)
+
+    def calibrate_query(
+        self,
+        query_tokens: list[str],
+        *,
+        expected_relevant: float | None = None,
+        kappa: float | None = None,
+        ceiling: float | None = None,
+    ) -> QueryCalibration:
+        """Per-query calibration parameters for one query.
+
+        Scores every document, sets the slope to ``kappa / sigma_q``
+        from the dispersion of the matching scores, and solves the count
+        constraint over the whole corpus for the offset.  Documents that
+        match no query term enter the constraint in closed form at score
+        zero.
+
+        The result does not depend on the ``calibration`` mode of the
+        scorer, so the per-query parameters can be inspected even when
+        probabilities are produced with ``calibration="corpus"``.
+
+        Parameters
+        ----------
+        query_tokens : list of str
+            Tokens for a single query.
+
+        Returns
+        -------
+        QueryCalibration
+            Slope, offset and prevalence for this query.
+        """
+        if self._transform is None:
+            raise RuntimeError("Call index() before calibrate_query().")
+        scores = self._raw_scores(query_tokens)
+        return self._calibration_from_scores(
+            scores, expected_relevant=expected_relevant, kappa=kappa, ceiling=ceiling,
+        )
+
+    def _calibration_from_scores(
+        self,
+        scores: np.ndarray,
+        *,
+        expected_relevant: float | None = None,
+        kappa: float | None = None,
+        ceiling: float | None = None,
+    ) -> QueryCalibration:
+        """Calibrate one query from its full score vector."""
+        if self._transform is None:
+            raise RuntimeError("index() must be called before scoring")
+
+        n_docs = len(scores)
+        count = self._expected_relevant if expected_relevant is None else expected_relevant
+        slope = self._kappa if kappa is None else kappa
+        cap = self._ceiling if ceiling is None else ceiling
+        context = replace(
+            self._calibration_context,
+            count_source=(
+                self._calibration_context.count_source if expected_relevant is None else "supplied"
+            ),
+            slope_source=self._calibration_context.slope_source if kappa is None else "supplied",
+            ceiling_source=(
+                self._calibration_context.ceiling_source if ceiling is None else "supplied"
+            ),
+        )
+        if count >= cap * n_docs:
+            raise ValueError(
+                f"expected_relevant ({count}) must be smaller "
+                f"than the corpus size times ceiling ({cap * n_docs:g})"
+            )
+        # The corpus-level scale stands in when a query's matching scores
+        # have no dispersion (fewer than two matches, or all equal).
+        corpus_scale = 1.0 / self._transform.alpha
+        matched = scores[scores > 0]
+        if matched.size == 0:
+            # No document matches: every document carries score zero, so
+            # every posterior equals the prevalence.
+            return calibrate_query(
+                np.zeros(1, dtype=np.float64),
+                kappa=slope,
+                expected_relevant=count,
+                ceiling=cap,
+                population_size=n_docs,
+                scale=corpus_scale,
+                context=context,
+            )
+        return calibrate_query(
+            matched,
+            kappa=slope,
+            expected_relevant=count,
+            ceiling=cap,
+            population_size=n_docs,
+            fallback_scale=corpus_scale,
+            context=context,
+        )
+
+    def get_log_odds(
+        self,
+        query_tokens: list[str],
+        *,
+        expected_relevant: float | None = None,
+        kappa: float | None = None,
+        ceiling: float | None = None,
+    ) -> np.ndarray:
+        """Get posterior log-odds for ALL documents (dense array).
+
+        This is the quantity to rank, prune and fuse on.  Under
+        ``calibration="corpus"`` a document that matches no query term
+        has probability 0, hence log-odds ``-inf``; under
+        ``calibration="query"`` it carries the finite log-odds of a
+        score of zero.
+
+        Parameters
+        ----------
+        query_tokens : list of str
+            Tokens for a single query.
+
+        Returns
+        -------
+        log_odds : ndarray of shape (num_docs,)
+            Posterior log-odds of relevance for every document.
+        """
+        if self._transform is None:
+            raise RuntimeError("Call index() before get_log_odds().")
+
+        bm25_scores = self._raw_scores(query_tokens)
+        if self._calibration == "query":
+            return np.asarray(
+                self._calibration_from_scores(
+                    bm25_scores, expected_relevant=expected_relevant, kappa=kappa, ceiling=ceiling,
+                ).log_odds(bm25_scores),
+                dtype=np.float64,
+            )
+        if any(value is not None for value in (expected_relevant, kappa, ceiling)):
+            raise ValueError("query parameter overrides require calibration='query'")
+
+        doc_ids = np.arange(len(bm25_scores))
+        log_odds = self._scores_to_probabilities(
+            doc_ids.reshape(1, -1),
+            bm25_scores.reshape(1, -1),
+            [query_tokens],
+            return_log_odds=True,
+        )
+        return log_odds.squeeze(0)
+
+    def get_ranking_scores(
+        self,
+        query_tokens: list[str],
+        *,
+        expected_relevant: float | None = None,
+        kappa: float | None = None,
+        ceiling: float | None = None,
+    ) -> np.ndarray:
+        """Scores for exact ordering before a capped posterior can saturate.
+
+        Query calibration returns latent log-odds. Corpus calibration
+        returns the posterior log-odds, including its document prior.
+        """
+        if self._transform is None:
+            raise RuntimeError("Call index() before get_ranking_scores().")
+        if self._calibration != "query":
+            return self.get_log_odds(
+                query_tokens, expected_relevant=expected_relevant, kappa=kappa, ceiling=ceiling,
+            )
+        scores = self._raw_scores(query_tokens)
+        model = self._calibration_from_scores(
+            scores, expected_relevant=expected_relevant, kappa=kappa, ceiling=ceiling,
+        )
+        return np.asarray(model.ranking_score(scores), dtype=np.float64)
 
     def get_probabilities(
         self,
         query_tokens: list[str],
+        *,
+        expected_relevant: float | None = None,
+        kappa: float | None = None,
+        ceiling: float | None = None,
     ) -> np.ndarray:
         """Get probabilities for ALL documents (dense array).
 
@@ -580,7 +834,16 @@ class BayesianBM25Scorer:
         if self._transform is None:
             raise RuntimeError("Call index() before get_probabilities().")
 
-        bm25_scores = self._bm25.get_scores(query_tokens)
+        if self._calibration == "query":
+            return np.asarray(
+                sigmoid(self.get_log_odds(
+                    query_tokens, expected_relevant=expected_relevant, kappa=kappa, ceiling=ceiling,
+                )), dtype=np.float64,
+            )
+        if any(value is not None for value in (expected_relevant, kappa, ceiling)):
+            raise ValueError("query parameter overrides require calibration='query'")
+
+        bm25_scores = self._raw_scores(query_tokens)
         doc_ids = np.arange(len(bm25_scores))
         probabilities = self._scores_to_probabilities(
             doc_ids.reshape(1, -1),
@@ -605,8 +868,14 @@ class BayesianBM25Scorer:
         doc_ids: np.ndarray,
         bm25_scores: np.ndarray,
         query_tokens_batch: list[list[str]],
+        return_log_odds: bool = False,
     ) -> np.ndarray:
-        """Convert raw BM25 scores to probabilities for given doc IDs."""
+        """Convert raw BM25 scores to probabilities for given doc IDs.
+
+        Corpus-level calibration.  A document with a zero score keeps
+        probability 0, which is log-odds ``-inf`` when
+        ``return_log_odds`` is True.
+        """
         if (
             self._transform is None
             or self._doc_lengths is None
@@ -615,7 +884,15 @@ class BayesianBM25Scorer:
         ):
             raise RuntimeError("index() must be called before scoring")
 
-        probabilities = np.zeros_like(bm25_scores, dtype=np.float64)
+        if return_log_odds:
+            probabilities = np.full(bm25_scores.shape, -np.inf, dtype=np.float64)
+        else:
+            probabilities = np.zeros_like(bm25_scores, dtype=np.float64)
+        to_value = (
+            self._transform.score_to_log_odds
+            if return_log_odds
+            else self._transform.score_to_probability
+        )
 
         for q_idx in range(doc_ids.shape[0]):
             query = query_tokens_batch[q_idx]
@@ -631,10 +908,8 @@ class BayesianBM25Scorer:
             doc_len_ratios = self._doc_lengths[active_ids] / self._avgdl
             tfs = self._compute_tf_batch(active_ids, query)
 
-            probabilities[q_idx, active_mask] = (
-                self._transform.score_to_probability(
-                    active_scores, tfs, doc_len_ratios
-                )
+            probabilities[q_idx, active_mask] = to_value(
+                active_scores, tfs, doc_len_ratios
             )
 
         return probabilities

@@ -13,7 +13,7 @@ them into a single relevance probability.
 
 import numpy as np
 
-from bayesian_bm25 import prob_and, prob_or, log_odds_conjunction
+from bayesian_bm25 import log_odds_conjunction, prob_and, prob_or
 
 # --- Setup: probabilities from different retrieval signals ---
 # A document was scored by three different field matchers:
@@ -27,7 +27,10 @@ signals = np.array([p_title, p_body, p_metadata])
 # "Document must be relevant in ALL fields"
 # Problem: shrinks quickly with more signals
 and_result = prob_and(signals)
-print(f"Probabilistic AND:        {and_result:.4f}  (shrinkage: {signals.min():.2f} -> {and_result:.4f})")
+print(
+    f"Probabilistic AND:        {and_result:.4f}  "
+    f"(shrinkage: {signals.min():.2f} -> {and_result:.4f})"
+)
 
 # --- Probabilistic OR (complement rule) ---
 # "Document is relevant in ANY field"
@@ -77,5 +80,5 @@ doc_signals = np.array([
 ])
 
 results = log_odds_conjunction(doc_signals)
-for i, (sigs, r) in enumerate(zip(doc_signals, results)):
+for i, (sigs, r) in enumerate(zip(doc_signals, results, strict=True)):
     print(f"  Doc {i}: signals={sigs} -> combined={r:.4f}")

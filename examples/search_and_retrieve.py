@@ -49,7 +49,7 @@ print(f"{'Rank':>4}  {'Prob':>8}  Document")
 print("-" * 60)
 
 doc_ids, probs = scorer.retrieve([query_tokens], k=5)
-for rank, (did, p) in enumerate(zip(doc_ids[0], probs[0]), 1):
+for rank, (did, p) in enumerate(zip(doc_ids[0], probs[0], strict=True), 1):
     print(f"  {rank:>2}   {p:7.4f}   {corpus_texts[did][:50]}...")
 
 # --- Multiple queries at once ---
@@ -64,9 +64,9 @@ print("Batch retrieval:")
 query_tokens_batch = [q.lower().split() for q in queries]
 doc_ids, probs = scorer.retrieve(query_tokens_batch, k=3)
 
-for q, dids, ps in zip(queries, doc_ids, probs):
+for q, dids, ps in zip(queries, doc_ids, probs, strict=True):
     print(f"\n  Query: '{q}'")
-    for did, p in zip(dids, ps):
+    for did, p in zip(dids, ps, strict=True):
         if p > 0:
             print(f"    P={p:.4f}  {corpus_texts[did][:50]}...")
 

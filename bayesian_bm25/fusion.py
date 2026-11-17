@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from bayesian_bm25.evidence_fusion import posterior_to_evidence
 from bayesian_bm25.probability import _clamp_probability, logit, sigmoid
+from bayesian_bm25.query_calibration import score_dispersion
 
 
 def cosine_to_probability(
@@ -100,6 +102,261 @@ def prob_or(probs: np.ndarray) -> np.ndarray | float:
     return float(result) if np.ndim(result) == 0 else result
 
 
+def _log_sigmoid(x: np.ndarray) -> np.ndarray:
+    """log(sigmoid(x)) = -log(1 + exp(-x)), stable for large |x|."""
+    return -np.logaddexp(0.0, -x)
+
+
+def log_odds_not(logits: np.ndarray | float) -> np.ndarray | float:
+    """Probabilistic NOT in log-odds space: logit(1 - p) = -logit(p).
+
+    Exact for every finite input; no clamping is involved.
+    """
+    result = -np.asarray(logits, dtype=np.float64)
+    return float(result) if result.ndim == 0 else result
+
+
+def log_odds_and(logits: np.ndarray) -> np.ndarray | float:
+    """Probabilistic AND (product rule) evaluated in log-odds space.
+
+    Returns ``logit(prod_i p_i)`` for ``p_i = sigmoid(logit_i)`` along
+    the last axis.  Working with ``log p_i = log_sigmoid(logit_i)``
+    keeps the result strictly increasing in every input for arbitrarily
+    large magnitudes, where the probability-valued :func:`prob_and`
+    rounds to 0 or 1 and documents tie.
+
+    Parameters
+    ----------
+    logits : array of shape (..., n)
+        Log-odds of the events to combine.  The last axis is reduced.
+
+    Returns
+    -------
+    Log-odds of the conjunction.
+    """
+    x = np.asarray(logits, dtype=np.float64)
+    log_p = np.sum(_log_sigmoid(x), axis=-1)
+    # logit(P) = log P - log(1 - P) with P = exp(log_p) <= 1.
+    result = log_p - np.log(-np.expm1(np.minimum(log_p, -np.finfo(np.float64).tiny)))
+    return float(result) if np.ndim(result) == 0 else result
+
+
+def log_odds_or(logits: np.ndarray) -> np.ndarray | float:
+    """Probabilistic OR (complement rule) evaluated in log-odds space.
+
+    Returns ``logit(1 - prod_i (1 - p_i))`` for ``p_i = sigmoid(logit_i)``
+    along the last axis.  With ``log(1 - p_i) = log_sigmoid(-logit_i)``
+    the result stays strictly increasing in every input: the
+    probability-valued :func:`prob_or` rounds to exactly 1 once any
+    input passes about 36.7, after which the ranking is decided by
+    tie-breaking.
+
+    Parameters
+    ----------
+    logits : array of shape (..., n)
+        Log-odds of the events to combine.  The last axis is reduced.
+
+    Returns
+    -------
+    Log-odds of the disjunction.
+    """
+    x = np.asarray(logits, dtype=np.float64)
+    log_q = np.sum(_log_sigmoid(-x), axis=-1)
+    # logit(P) = log(1 - Q) - log Q with Q = exp(log_q) <= 1.
+    result = np.log(-np.expm1(np.minimum(log_q, -np.finfo(np.float64).tiny))) - log_q
+    return float(result) if np.ndim(result) == 0 else result
+
+
+def effective_signal_count(
+    n_signals: int,
+    correlation: float | np.ndarray,
+) -> float:
+    """Effective number of signals under correlated evidence (Theorem 5.8).
+
+    For ``n`` equally strong signals whose evidence logits are jointly
+    Gaussian given relevance, exact fusion multiplies the mean evidence
+    by
+
+        n_eff = n / (1 + (n - 1) * r)
+
+    when every pair has correlation ``r``.  Independent signals
+    (``r = 0``) give ``n_eff = n``; fully redundant signals (``r = 1``)
+    give ``n_eff = 1``.  For a general correlation matrix ``Omega`` the
+    multiplier is ``1' Omega^-1 1``, which reduces to the formula above
+    under equicorrelation.
+
+    Parameters
+    ----------
+    n_signals : int
+        Number of signals ``n`` (>= 1).
+    correlation : float or array of shape (n, n)
+        Pairwise correlation ``r`` of the evidence among non-relevant
+        documents, or the full correlation matrix.  Estimate it on a
+        uniform sample of the corpus, not on the candidate pool: a pool
+        formed as the union of each signal's top results induces a
+        spurious negative correlation.
+
+    Returns
+    -------
+    float
+        The effective number of signals.
+    """
+    n = int(n_signals)
+    if n < 1:
+        raise ValueError(f"n_signals must be >= 1, got {n_signals}")
+
+    if np.ndim(correlation) == 2:
+        omega = _validated_correlation_matrix(correlation, n)
+        ones = np.ones(n, dtype=np.float64)
+        return float(ones @ np.linalg.solve(omega, ones))
+
+    if n == 1:
+        return 1.0
+    r = float(correlation)
+    if not (-1.0 / (n - 1) < r <= 1.0):
+        raise ValueError(
+            f"correlation must be in (-1/(n-1), 1] = ({-1.0 / (n - 1):g}, 1], got {r}"
+        )
+    return n / (1.0 + (n - 1) * r)
+
+
+def confidence_exponent(
+    n_signals: int,
+    correlation: float | np.ndarray,
+) -> float:
+    """Confidence exponent ``rho`` implied by a correlation (Theorem 5.8).
+
+    The log-odds conjunction scales the mean evidence by ``n ** rho``.
+    That is exact when ``n ** rho`` equals the effective number of
+    signals, i.e.
+
+        rho = 1 - log(1 + (n - 1) * r) / log(n).
+
+    ``r = 0`` gives ``rho = 1`` (evidence sums), ``r = 1`` gives
+    ``rho = 0`` (the log-odds mean), and the square-root law
+    ``rho = 1/2`` corresponds to ``r = 1 / (1 + sqrt(n))``.
+
+    Parameters
+    ----------
+    n_signals : int
+        Number of signals ``n`` (>= 2; the exponent is undefined for a
+        single signal, which passes through unchanged for every ``rho``).
+    correlation : float or array of shape (n, n)
+        Pairwise correlation of the evidence, or the correlation matrix.
+
+    Returns
+    -------
+    float
+        The exponent ``rho``.  It exceeds 1 for negatively correlated
+        signals.
+    """
+    n = int(n_signals)
+    if n < 2:
+        raise ValueError(
+            f"confidence_exponent needs at least two signals, got {n_signals}"
+        )
+    return float(np.log(effective_signal_count(n, correlation)) / np.log(n))
+
+
+def _validated_correlation_matrix(correlation: np.ndarray, n: int) -> np.ndarray:
+    """Check that ``correlation`` is an n x n positive definite correlation matrix."""
+    omega = np.asarray(correlation, dtype=np.float64)
+    if omega.shape != (n, n):
+        raise ValueError(
+            f"correlation matrix must have shape ({n}, {n}), got {omega.shape}"
+        )
+    if not np.allclose(omega, omega.T, atol=1e-10):
+        raise ValueError("correlation matrix must be symmetric")
+    if not np.allclose(np.diag(omega), 1.0, atol=1e-10):
+        raise ValueError("correlation matrix must have a unit diagonal")
+    try:
+        np.linalg.cholesky(omega)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("correlation matrix must be positive definite") from exc
+    return omega
+
+
+def gaussian_evidence_weights(
+    strengths: np.ndarray,
+    correlation: float | np.ndarray,
+) -> np.ndarray:
+    """Exact fusion weights for correlated Gaussian evidence (Theorem 5.8).
+
+    If the evidence logits ``e_i`` are each a valid log-likelihood ratio
+    and are jointly Gaussian given relevance with standard deviations
+    ``tau_i`` and correlation matrix ``Omega``, the joint log-likelihood
+    ratio is ``sum_i v_i * e_i`` with
+
+        v = T^-1 Omega^-1 tau,    T = diag(tau).
+
+    The weights multiply the evidences directly; they are not
+    normalized to sum to one.  They need not be positive: for two
+    signals ``v_2 < 0`` whenever ``r > tau_2 / tau_1``, because a weak
+    signal that is highly correlated with a strong one is best used to
+    cancel the strong signal's noise.
+
+    Parameters
+    ----------
+    strengths : array of shape (n,)
+        Standard deviations ``tau_i`` of the evidence logits given
+        relevance.  For a log-linear calibration with dimensionless
+        slope ``kappa_i`` (Definition 3.12), ``tau_i = kappa_i``.
+    correlation : float or array of shape (n, n)
+        Pairwise correlation shared by all pairs, or the full
+        correlation matrix ``Omega``.
+
+    Returns
+    -------
+    array of shape (n,)
+        The weights ``v``.
+    """
+    tau = np.asarray(strengths, dtype=np.float64).ravel()
+    n = tau.size
+    if n < 1:
+        raise ValueError("strengths must not be empty")
+    if not np.all(np.isfinite(tau)) or np.any(tau <= 0.0):
+        raise ValueError("strengths must be positive and finite")
+
+    if np.ndim(correlation) == 0:
+        r = float(correlation)
+        omega = np.full((n, n), r, dtype=np.float64)
+        np.fill_diagonal(omega, 1.0)
+    else:
+        omega = np.asarray(correlation, dtype=np.float64)
+    omega = _validated_correlation_matrix(omega, n)
+
+    return np.linalg.solve(omega, tau) / tau
+
+
+def evidence_correlation(evidence: np.ndarray) -> np.ndarray:
+    """Correlation matrix of the columns of an evidence matrix.
+
+    Parameters
+    ----------
+    evidence : array of shape (m, n)
+        Evidence logits of ``m`` documents under ``n`` signals.  The
+        correlation that enters Theorem 5.8 is the one among
+        non-relevant documents, so a uniform sample of the corpus is the
+        right input; no relevance labels are needed.
+
+    Returns
+    -------
+    array of shape (n, n)
+        Pearson correlation matrix.
+    """
+    x = np.asarray(evidence, dtype=np.float64)
+    if x.ndim != 2 or x.shape[0] < 2:
+        raise ValueError(
+            "evidence must be a 2D array with at least two rows, "
+            f"got shape {x.shape}"
+        )
+    # A column that is constant up to rounding has no correlation with
+    # anything; np.corrcoef would return noise for it.
+    if any(score_dispersion(column) <= 0.0 for column in x.T):
+        raise ValueError("every evidence column must have positive variance")
+    return np.atleast_2d(np.corrcoef(x, rowvar=False))
+
+
 _SQRT_N_ALPHA = 0.5  # alpha=0.5 implements the sqrt(n) scaling law (Theorem 4.2.1)
 
 
@@ -113,7 +370,10 @@ def _resolve_alpha(alpha: float | str | None, default: float) -> float:
                 f"alpha must be a float, None, or 'auto', got {alpha!r}"
             )
         return _SQRT_N_ALPHA
-    return float(alpha)
+    value = float(alpha)
+    if not np.isfinite(value):
+        raise ValueError("alpha must be finite")
+    return value
 
 
 def _apply_gating(
@@ -169,6 +429,116 @@ def _apply_gating(
     )
 
 
+def log_odds_fusion(
+    logits: np.ndarray,
+    alpha: float | str | None = None,
+    weights: np.ndarray | None = None,
+    gating: str = "none",
+    gating_beta: float = 1.0,
+    max_logit: float | None = None,
+    prior_logit: np.ndarray | float | None = None,
+    input_prior_log_odds: np.ndarray | float | None = None,
+) -> np.ndarray | float:
+    """Pool evidence logits and return the fused log-odds.
+
+    This is the log-odds conjunction (Definition 5.7) evaluated without
+    ever leaving log-odds space:
+
+        fused = prior_logit + n^alpha * sum_i w_i * gate(logit_i),
+
+    with ``w_i = 1/n`` when no weights are given.  ``alpha = 1`` with
+    uniform weights is the plain sum of evidence, the Bayes rule for
+    conditionally independent signals (Theorem 5.13); ``alpha = 0`` is
+    the log-odds mean, a normalized Logarithmic Opinion Pool
+    (Theorem 5.6).  :func:`confidence_exponent` gives the exponent
+    implied by a measured correlation between signals (Theorem 5.8).
+
+    Unlike :func:`log_odds_conjunction`, neither the inputs nor the
+    output pass through a probability, so nothing is clamped or rounded
+    and the result stays strictly increasing in every input.  Rank and
+    prune on the returned value; apply ``sigmoid`` only to report or
+    threshold a probability.
+
+    Parameters
+    ----------
+    logits : array of shape (..., n)
+        Evidence logits to combine.  The last axis is reduced.  Pass
+        prior-free evidence (a posterior logit minus its own prior
+        logit) together with ``prior_logit`` so that the prior is
+        counted once.
+    alpha : float, str, or None
+        Confidence scaling exponent.  ``"auto"`` resolves to 0.5.  When
+        None, uses 0.5 in unweighted mode and 0.0 in weighted mode, as
+        :func:`log_odds_conjunction` does.
+    weights : array of shape (n,) or None
+        Per-signal reliability weights; non-negative, summing to 1.
+    gating : str
+        Gating applied to each logit before pooling: ``"none"``,
+        ``"relu"``, ``"swish"``, ``"gelu"`` or ``"softplus"``.
+    gating_beta : float
+        Sharpness parameter for swish and softplus gating.
+    max_logit : float or None
+        Clip each gated logit to ``[-max_logit, +max_logit]`` before
+        pooling.  None (default) disables clipping.
+    prior_logit : float, array, or None
+        Prior log-odds added once after pooling.
+    input_prior_log_odds : float, array, or None
+        When the inputs are posterior logits, remove each source prior
+        before gating and pooling. This requires an explicit target
+        ``prior_logit``. None pools the supplied logits as given.
+
+    Returns
+    -------
+    Fused log-odds.
+    """
+    x = np.asarray(logits, dtype=np.float64)
+    if x.ndim == 0 or x.shape[-1] == 0:
+        raise ValueError("logits must have a non-empty signal axis")
+    if np.any(np.isnan(x)):
+        raise ValueError("logits must not contain NaN")
+    if input_prior_log_odds is not None:
+        if prior_logit is None:
+            raise ValueError("removing source priors requires an explicit target prior_logit")
+        x = np.asarray(posterior_to_evidence(x, input_prior_log_odds))
+    n = x.shape[-1]
+    gated = _apply_gating(x, gating, beta=gating_beta)
+
+    if max_logit is not None:
+        gated = np.clip(gated, -max_logit, max_logit)
+
+    if weights is not None:
+        weights = np.asarray(weights, dtype=np.float64)
+        if np.any(weights < 0):
+            raise ValueError("weights must be non-negative")
+        if weights.shape != (n,) or not np.all(np.isfinite(weights)):
+            raise ValueError(
+                "weights must be a finite non-negative vector with one value per signal"
+            )
+        if abs(float(np.sum(weights)) - 1.0) > 1e-6:
+            raise ValueError(
+                f"weights must sum to 1, got {float(np.sum(weights))}"
+            )
+
+        effective_alpha = _resolve_alpha(alpha, default=0.0)
+
+        # Log-OP with confidence scaling:
+        # n^alpha * sum(w_i * logit_i)  (Theorem 8.3 + Section 4.2)
+        contributions = np.zeros_like(gated)
+        np.multiply(gated, weights, out=contributions, where=weights != 0.0)
+        fused = (n ** effective_alpha) * np.sum(contributions, axis=-1)
+    else:
+        effective_alpha = _resolve_alpha(alpha, default=0.5)
+
+        # Mean log-odds (Eq. 20) with multiplicative confidence
+        # scaling (Eq. 23).
+        fused = np.mean(gated, axis=-1) * (n ** effective_alpha)
+
+    if prior_logit is not None:
+        fused = fused + np.asarray(prior_logit, dtype=np.float64)
+
+    return float(fused) if np.ndim(fused) == 0 else fused
+
+
 def log_odds_conjunction(
     probs: np.ndarray,
     alpha: float | str | None = None,
@@ -176,6 +546,8 @@ def log_odds_conjunction(
     gating: str = "none",
     gating_beta: float = 1.0,
     max_logit: float | None = None,
+    prior_logit: np.ndarray | float | None = None,
+    input_prior_log_odds: np.ndarray | float | None = None,
 ) -> np.ndarray | float:
     """Log-odds conjunction with multiplicative confidence scaling (Paper 2, Section 4).
 
@@ -239,44 +611,30 @@ def log_odds_conjunction(
     Returns
     -------
     Combined probability after log-odds conjunction.
+
+    Notes
+    -----
+    The inputs are clamped to [epsilon, 1 - epsilon] and the output is a
+    probability, so candidates whose evidence exceeds the clamp tie.
+    Use :func:`log_odds_fusion` to rank, prune or fuse on log-odds
+    directly.
     """
     probs = _clamp_probability(np.asarray(probs, dtype=np.float64))
-    n = probs.shape[-1]
-    raw_logits = logit(probs)
-    gated_logits = _apply_gating(raw_logits, gating, beta=gating_beta)
 
-    if max_logit is not None:
-        gated_logits = np.clip(gated_logits, -max_logit, max_logit)
-
-    if weights is not None:
-        weights = np.asarray(weights, dtype=np.float64)
-        if np.any(weights < 0):
-            raise ValueError("weights must be non-negative")
-        if abs(float(np.sum(weights)) - 1.0) > 1e-6:
-            raise ValueError(
-                f"weights must sum to 1, got {float(np.sum(weights))}"
-            )
-
-        effective_alpha = _resolve_alpha(alpha, default=0.0)
-
-        # Log-OP with confidence scaling:
-        # sigma(n^alpha * sum(w_i * logit(P_i)))  (Theorem 8.3 + Section 4.2)
-        l_weighted = (n ** effective_alpha) * np.sum(
-            weights * gated_logits, axis=-1
-        )
-        result = sigmoid(l_weighted)
-        return float(result) if np.ndim(result) == 0 else result
-
-    effective_alpha = _resolve_alpha(alpha, default=0.5)
-
-    # Step 1: mean log-odds (Eq. 20)
-    l_bar = np.mean(gated_logits, axis=-1)
-
-    # Step 2: multiplicative confidence scaling (Eq. 23)
-    l_adjusted = l_bar * (n ** effective_alpha)
+    # Steps 1-2: pooled log-odds with confidence scaling (Eq. 20, 23).
+    fused = log_odds_fusion(
+        logit(probs),
+        alpha=alpha,
+        weights=weights,
+        gating=gating,
+        gating_beta=gating_beta,
+        max_logit=max_logit,
+        prior_logit=prior_logit,
+        input_prior_log_odds=input_prior_log_odds,
+    )
 
     # Step 3: back to probability (Eq. 26)
-    result = sigmoid(l_adjusted)
+    result = sigmoid(fused)
     return float(result) if np.ndim(result) == 0 else result
 
 
@@ -284,6 +642,8 @@ def balanced_log_odds_fusion(
     sparse_probs: np.ndarray,
     dense_similarities: np.ndarray,
     weight: float = 0.5,
+    *,
+    from_log_odds: bool = False,
 ) -> np.ndarray | float:
     """Balanced log-odds fusion for hybrid sparse-dense retrieval.
 
@@ -308,6 +668,13 @@ def balanced_log_odds_fusion(
     weight : float
         Weight for the dense signal (default 0.5 for equal weighting).
         The sparse weight is ``1 - weight``.
+    from_log_odds : bool
+        When True, ``sparse_probs`` holds posterior log-odds instead of
+        probabilities (for example from
+        ``BayesianProbabilityTransform.score_to_log_odds()``), and no
+        clamping is applied to it.  A probability input saturates at
+        the clamp, about 23.0 in log-odds; candidates beyond it tie and
+        the lexical signal stops discriminating among them.
 
     Returns
     -------
@@ -323,7 +690,7 @@ def balanced_log_odds_fusion(
     sparse_probs = np.asarray(sparse_probs, dtype=np.float64)
     dense_similarities = np.asarray(dense_similarities, dtype=np.float64)
 
-    logit_sparse = logit(_clamp_probability(sparse_probs))
+    logit_sparse = _to_log_odds(sparse_probs, from_log_odds)
     logit_dense = logit(cosine_to_probability(dense_similarities))
 
     logit_sparse_norm = _min_max_normalize(logit_sparse)
@@ -331,6 +698,40 @@ def balanced_log_odds_fusion(
 
     result = weight * logit_dense_norm + (1.0 - weight) * logit_sparse_norm
     return float(result) if np.ndim(result) == 0 else result
+
+
+def _to_log_odds(
+    values: np.ndarray | float,
+    from_log_odds: bool,
+    input_prior_log_odds: np.ndarray | float | None = None,
+) -> np.ndarray:
+    """Return the input as log-odds.
+
+    When ``from_log_odds`` is True the values are already log-odds and
+    are passed through untouched.  Otherwise they are probabilities,
+    which are clamped to [epsilon, 1 - epsilon] before the logit.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    result = values if from_log_odds else np.asarray(logit(_clamp_probability(values)))
+    if input_prior_log_odds is not None:
+        result = np.asarray(posterior_to_evidence(result, input_prior_log_odds))
+    return result
+
+
+def _validated_input_priors(
+    input_prior_log_odds: np.ndarray | float | None,
+    n_signals: int,
+    base_rate: float | None,
+) -> np.ndarray | None:
+    """Validate source priors and require the target prior for evidence fusion."""
+    if input_prior_log_odds is None:
+        return None
+    if base_rate is None:
+        raise ValueError("input_prior_log_odds requires an explicit target base_rate")
+    priors = np.asarray(input_prior_log_odds, dtype=np.float64)
+    if priors.shape not in ((), (n_signals,)) or not np.all(np.isfinite(priors)):
+        raise ValueError("input_prior_log_odds must be finite with one value per signal")
+    return priors.copy()
 
 
 def _min_max_normalize(arr: np.ndarray) -> np.ndarray:
@@ -343,1030 +744,17 @@ def _min_max_normalize(arr: np.ndarray) -> np.ndarray:
     return (arr - lo) / (hi - lo)
 
 
-class LearnableLogOddsWeights:
-    """Learnable per-signal reliability weights for log-odds conjunction (Remark 5.3.2).
-
-    Learns weights that map from the Naive Bayes uniform initialization
-    (w_i = 1/n) to per-signal reliability weights, completing the
-    correspondence to a fully parameterized single-layer network in
-    log-odds space: logit -> weighted sum -> sigmoid.
-
-    The gradient dL/dz_j = n^alpha * (p - y) * w_j * (x_j - x_bar_w)
-    is Hebbian: the product of pre-synaptic activity (signal deviation
-    from weighted mean) and post-synaptic error (prediction minus label).
-
-    Parameters
-    ----------
-    n_signals : int
-        Number of probability signals to combine (>= 1).
-    alpha : float or str
-        Confidence scaling exponent (fixed, not learned).  Default 0.0
-        means no count-based scaling.  ``"auto"`` resolves to 0.5
-        (sqrt(n) scaling law, Theorem 4.2.1).  Weights (per-signal
-        reliability) and alpha (confidence scaling) are orthogonal
-        (Paper 2, Section 4.2).
-    """
-
-    def __init__(
-        self,
-        n_signals: int,
-        alpha: float | str = 0.0,
-        base_rate: float | None = None,
-    ) -> None:
-        if n_signals < 1:
-            raise ValueError(
-                f"n_signals must be >= 1, got {n_signals}"
-            )
-        if base_rate is not None and not (0.0 < base_rate < 1.0):
-            raise ValueError(
-                f"base_rate must be in (0, 1), got {base_rate}"
-            )
-        self._n_signals = n_signals
-        self._alpha = _resolve_alpha(alpha, default=0.0)
-        self._base_rate = base_rate
-        self._logit_base_rate: float | None = (
-            float(logit(base_rate)) if base_rate is not None else None
+def __getattr__(name: str):
+    """Preserve class imports while keeping one main class per module."""
+    if name == "LearnableLogOddsWeights":
+        from bayesian_bm25.learnable_log_odds_weights import LearnableLogOddsWeights
+        return LearnableLogOddsWeights
+    if name == "AttentionLogOddsWeights":
+        from bayesian_bm25.attention_log_odds_weights import AttentionLogOddsWeights
+        return AttentionLogOddsWeights
+    if name == "MultiHeadAttentionLogOddsWeights":
+        from bayesian_bm25.multi_head_attention_log_odds_weights import (
+            MultiHeadAttentionLogOddsWeights,
         )
-
-        # Softmax parameterization: zeros -> uniform 1/n (Naive Bayes init)
-        self._logits = np.zeros(n_signals, dtype=np.float64)
-
-        # Online learning state
-        self._n_updates: int = 0
-        self._grad_logits_ema = np.zeros(n_signals, dtype=np.float64)
-
-        # Polyak averaging in the simplex
-        self._weights_avg = np.full(n_signals, 1.0 / n_signals, dtype=np.float64)
-
-    @property
-    def n_signals(self) -> int:
-        """Number of probability signals."""
-        return self._n_signals
-
-    @property
-    def alpha(self) -> float:
-        """Confidence scaling exponent (fixed)."""
-        return self._alpha
-
-    @property
-    def base_rate(self) -> float | None:
-        """Corpus-level base rate of relevance, or None if not set."""
-        return self._base_rate
-
-    @property
-    def weights(self) -> np.ndarray:
-        """Current weights: softmax of internal logits."""
-        return self._softmax(self._logits)
-
-    @property
-    def averaged_weights(self) -> np.ndarray:
-        """Polyak-averaged weights for stable inference."""
-        return self._weights_avg.copy()
-
-    def __call__(
-        self,
-        probs: np.ndarray,
-        use_averaged: bool = False,
-    ) -> np.ndarray | float:
-        """Combine probability signals via weighted log-odds conjunction.
-
-        Parameters
-        ----------
-        probs : array of shape (..., n_signals)
-            Probability values to combine.
-        use_averaged : bool
-            If True, use Polyak-averaged weights instead of raw weights.
-
-        Returns
-        -------
-        Combined probability after weighted log-odds conjunction.
-        """
-        probs = _clamp_probability(np.asarray(probs, dtype=np.float64))
-        w = self._weights_avg if use_averaged else self.weights
-
-        n = self._n_signals
-        scale = n ** self._alpha
-        x = logit(probs)
-
-        l_weighted = scale * np.sum(w * x, axis=-1)
-        if self._logit_base_rate is not None:
-            l_weighted = l_weighted + self._logit_base_rate
-        result = sigmoid(l_weighted)
-        return float(result) if np.ndim(result) == 0 else result
-
-    def fit(
-        self,
-        probs: np.ndarray,
-        labels: np.ndarray,
-        *,
-        learning_rate: float = 0.01,
-        max_iterations: int = 1000,
-        tolerance: float = 1e-6,
-    ) -> None:
-        """Batch gradient descent on BCE loss to learn weights.
-
-        The gradient for logit z_j is (averaged over samples):
-          dL/dz_j = n^alpha * (p - y) * w_j * (x_j - x_bar_w)
-
-        where x_i = logit(P_i), x_bar_w = sum(w_i * x_i), and
-        p = sigmoid(n^alpha * x_bar_w).
-
-        Parameters
-        ----------
-        probs : array of shape (m, n_signals)
-            Training probability signals.
-        labels : array of shape (m,)
-            Binary relevance labels (0 or 1).
-        learning_rate : float
-            Step size for gradient descent.
-        max_iterations : int
-            Maximum number of gradient descent iterations.
-        tolerance : float
-            Convergence threshold on maximum absolute logit change.
-        """
-        probs = np.asarray(probs, dtype=np.float64)
-        labels = np.asarray(labels, dtype=np.float64)
-
-        if probs.ndim == 1:
-            probs = probs.reshape(1, -1)
-        if probs.shape[-1] != self._n_signals:
-            raise ValueError(
-                f"probs last dimension {probs.shape[-1]} != n_signals {self._n_signals}"
-            )
-
-        n = self._n_signals
-        scale = n ** self._alpha
-
-        # Log-odds of input signals: shape (m, n)
-        x = logit(_clamp_probability(probs))
-
-        for _ in range(max_iterations):
-            w = self._softmax(self._logits)
-
-            # Weighted mean log-odds per sample: shape (m,)
-            x_bar_w = np.sum(w * x, axis=-1)
-
-            # Predicted probability: shape (m,)
-            l_weighted = scale * x_bar_w
-            if self._logit_base_rate is not None:
-                l_weighted = l_weighted + self._logit_base_rate
-            p = sigmoid(l_weighted)
-            p = np.atleast_1d(np.asarray(p, dtype=np.float64))
-
-            # Error: shape (m,)
-            error = p - labels
-
-            # Gradient for each logit z_j, averaged over samples:
-            # dL/dz_j = scale * (p - y) * w_j * (x_j - x_bar_w)
-            # Shape: (m, n) -> mean over m -> (n,)
-            grad_logits = np.mean(
-                scale * error[:, np.newaxis] * w[np.newaxis, :] * (x - x_bar_w[:, np.newaxis]),
-                axis=0,
-            )
-
-            self._logits -= learning_rate * grad_logits
-
-            if np.max(np.abs(learning_rate * grad_logits)) < tolerance:
-                break
-
-        # Reset online state after batch fit (consistent with BayesianProbabilityTransform.fit())
-        self._n_updates = 0
-        self._grad_logits_ema = np.zeros(n, dtype=np.float64)
-        self._weights_avg = self._softmax(self._logits).copy()
-
-    def update(
-        self,
-        probs: np.ndarray | float,
-        label: np.ndarray | float,
-        *,
-        learning_rate: float = 0.01,
-        momentum: float = 0.9,
-        decay_tau: float = 1000.0,
-        max_grad_norm: float = 1.0,
-        avg_decay: float = 0.995,
-    ) -> None:
-        """Online SGD update from a single observation or mini-batch.
-
-        Follows the same patterns as ``BayesianProbabilityTransform.update()``:
-        EMA gradient smoothing with bias correction, L2 gradient clipping,
-        learning rate decay, and Polyak averaging of weights in the simplex.
-
-        Parameters
-        ----------
-        probs : array of shape (n_signals,) or (m, n_signals)
-            Probability signal(s) for the observed document(s).
-        label : float or array of shape (m,)
-            Binary relevance label(s).
-        learning_rate : float
-            Base step size, decayed as lr / (1 + t / tau).
-        momentum : float
-            EMA decay factor for gradient smoothing.
-        decay_tau : float
-            Time constant for learning rate decay.
-        max_grad_norm : float
-            Maximum L2 norm for gradient clipping.
-        avg_decay : float
-            Decay factor for Polyak weight averaging.
-        """
-        probs = np.atleast_1d(np.asarray(probs, dtype=np.float64))
-        label = np.atleast_1d(np.asarray(label, dtype=np.float64))
-
-        if probs.ndim == 1:
-            probs = probs.reshape(1, -1)
-        if probs.shape[-1] != self._n_signals:
-            raise ValueError(
-                f"probs last dimension {probs.shape[-1]} != n_signals {self._n_signals}"
-            )
-
-        n = self._n_signals
-        scale = n ** self._alpha
-        w = self._softmax(self._logits)
-
-        # Log-odds of input signals: shape (m, n)
-        x = logit(_clamp_probability(probs))
-
-        # Weighted mean log-odds per sample: shape (m,)
-        x_bar_w = np.sum(w * x, axis=-1)
-
-        # Predicted probability: shape (m,)
-        l_weighted = scale * x_bar_w
-        if self._logit_base_rate is not None:
-            l_weighted = l_weighted + self._logit_base_rate
-        p = sigmoid(l_weighted)
-        p = np.atleast_1d(np.asarray(p, dtype=np.float64))
-
-        # Error: shape (m,)
-        error = p - label
-
-        # Gradient for each logit, averaged over mini-batch
-        grad_logits = np.mean(
-            scale * error[:, np.newaxis] * w[np.newaxis, :] * (x - x_bar_w[:, np.newaxis]),
-            axis=0,
-        )
-
-        # EMA smoothing of gradients
-        self._grad_logits_ema = (
-            momentum * self._grad_logits_ema + (1.0 - momentum) * grad_logits
-        )
-
-        # Bias correction for early updates
-        self._n_updates += 1
-        correction = 1.0 - momentum ** self._n_updates
-        corrected_grad = self._grad_logits_ema / correction
-
-        # L2 gradient clipping
-        grad_norm = float(np.sqrt(np.sum(corrected_grad ** 2)))
-        if grad_norm > max_grad_norm:
-            corrected_grad = corrected_grad * (max_grad_norm / grad_norm)
-
-        # Learning rate decay: lr / (1 + t / tau)
-        effective_lr = learning_rate / (1.0 + self._n_updates / decay_tau)
-
-        self._logits -= effective_lr * corrected_grad
-
-        # Polyak averaging of weights in the simplex
-        raw_weights = self._softmax(self._logits)
-        self._weights_avg = avg_decay * self._weights_avg + (1.0 - avg_decay) * raw_weights
-
-    @staticmethod
-    def _softmax(z: np.ndarray) -> np.ndarray:
-        """Numerically stable softmax: shift by max to prevent overflow."""
-        z_shifted = z - np.max(z)
-        exp_z = np.exp(z_shifted)
-        return exp_z / np.sum(exp_z)
-
-
-class AttentionLogOddsWeights:
-    """Query-dependent signal weighting via attention (Paper 2, Section 8).
-
-    Computes per-signal softmax attention weights from query features:
-    ``w_i(q) = softmax(W @ features + b)[i]``, then combines probability
-    signals via weighted log-odds conjunction.  This enables the fusion
-    weights to adapt per-query rather than being fixed across all queries.
-
-    The class is feature-agnostic -- it learns a linear projection from
-    arbitrary user-provided query features to softmax attention weights.
-
-    Parameters
-    ----------
-    n_signals : int
-        Number of probability signals to combine (>= 1).
-    n_query_features : int
-        Dimensionality of the query feature vector (>= 1).
-    alpha : float or str
-        Confidence scaling exponent (fixed, not learned).  ``"auto"``
-        resolves to 0.5 (sqrt(n) scaling law, Theorem 4.2.1).
-    """
-
-    def __init__(
-        self,
-        n_signals: int,
-        n_query_features: int,
-        alpha: float | str = 0.5,
-        normalize: bool = False,
-        seed: int = 0,
-        base_rate: float | None = None,
-    ) -> None:
-        if n_signals < 1:
-            raise ValueError(f"n_signals must be >= 1, got {n_signals}")
-        if n_query_features < 1:
-            raise ValueError(
-                f"n_query_features must be >= 1, got {n_query_features}"
-            )
-        if base_rate is not None and not (0.0 < base_rate < 1.0):
-            raise ValueError(
-                f"base_rate must be in (0, 1), got {base_rate}"
-            )
-        self._n_signals = n_signals
-        self._n_query_features = n_query_features
-        self._alpha = _resolve_alpha(alpha, default=0.5)
-        self._normalize = normalize
-        self._base_rate = base_rate
-        self._logit_base_rate: float | None = (
-            float(logit(base_rate)) if base_rate is not None else None
-        )
-
-        # W: (n_signals, n_query_features), b: (n_signals,)
-        # Xavier-style initialization scaled for softmax input
-        init_scale = 1.0 / np.sqrt(n_query_features)
-        rng = np.random.default_rng(seed)
-        self._W = rng.normal(0, init_scale, size=(n_signals, n_query_features))
-        self._b = np.zeros(n_signals, dtype=np.float64)
-
-        # Online learning state
-        self._n_updates: int = 0
-        self._grad_W_ema = np.zeros_like(self._W)
-        self._grad_b_ema = np.zeros_like(self._b)
-
-        # Polyak averaging
-        self._W_avg = self._W.copy()
-        self._b_avg = self._b.copy()
-
-    @property
-    def n_signals(self) -> int:
-        """Number of probability signals."""
-        return self._n_signals
-
-    @property
-    def n_query_features(self) -> int:
-        """Dimensionality of query feature vector."""
-        return self._n_query_features
-
-    @property
-    def alpha(self) -> float:
-        """Confidence scaling exponent (fixed)."""
-        return self._alpha
-
-    @property
-    def base_rate(self) -> float | None:
-        """Corpus-level base rate of relevance, or None if not set."""
-        return self._base_rate
-
-    @property
-    def normalize(self) -> bool:
-        """Whether per-signal logit normalization is enabled."""
-        return self._normalize
-
-    @staticmethod
-    def _normalize_logits(x: np.ndarray) -> np.ndarray:
-        """Per-column min-max normalization on logit array.
-
-        Parameters
-        ----------
-        x : array of shape (m, n)
-            Logit values where each column is a signal.
-
-        Returns
-        -------
-        Array of same shape with each column independently normalized to [0, 1].
-        """
-        result = x.copy()
-        for col in range(x.shape[-1]):
-            result[..., col] = _min_max_normalize(x[..., col])
-        return result
-
-    @property
-    def weights_matrix(self) -> np.ndarray:
-        """Weight matrix W of shape (n_signals, n_query_features)."""
-        return self._W.copy()
-
-    def _compute_weights(
-        self, query_features: np.ndarray, use_averaged: bool = False
-    ) -> np.ndarray:
-        """Compute softmax attention weights from query features.
-
-        Parameters
-        ----------
-        query_features : array of shape (n_query_features,) or (m, n_query_features)
-        use_averaged : bool
-            Use Polyak-averaged parameters.
-
-        Returns
-        -------
-        weights : array of shape (n_signals,) or (m, n_signals)
-        """
-        W = self._W_avg if use_averaged else self._W
-        b = self._b_avg if use_averaged else self._b
-        # logits: (m, n_signals) = (m, n_qf) @ (n_qf, n_signals) + (n_signals,)
-        z = query_features @ W.T + b
-        return self._softmax(z)
-
-    def __call__(
-        self,
-        probs: np.ndarray,
-        query_features: np.ndarray,
-        use_averaged: bool = False,
-    ) -> np.ndarray | float:
-        """Combine probability signals via query-dependent weighted log-odds.
-
-        Parameters
-        ----------
-        probs : array of shape (..., n_signals)
-            Probability values to combine.
-        query_features : array of shape (n_query_features,) or (m, n_query_features)
-            Query feature vector(s) for computing attention weights.
-        use_averaged : bool
-            If True, use Polyak-averaged parameters.
-
-        Returns
-        -------
-        Combined probability after attention-weighted log-odds conjunction.
-        """
-        probs = np.asarray(probs, dtype=np.float64)
-        query_features = np.atleast_2d(
-            np.asarray(query_features, dtype=np.float64)
-        )
-
-        # Per-query attention weights: (m, n_signals)
-        w = self._compute_weights(query_features, use_averaged)
-
-        if probs.ndim == 1:
-            # Single sample: normalization cannot apply (no candidates to
-            # normalize across), fall through to direct computation.
-            w_flat = w.squeeze(0)
-            x = logit(_clamp_probability(probs))
-            n = self._n_signals
-            scale = n ** self._alpha
-            l_weighted = scale * np.sum(w_flat * x)
-            if self._logit_base_rate is not None:
-                l_weighted = l_weighted + self._logit_base_rate
-            result = sigmoid(l_weighted)
-            return float(result)
-
-        # Vectorized batched path (replaces per-row loop)
-        x = logit(_clamp_probability(probs))
-        if self._normalize:
-            x = self._normalize_logits(x)
-        n = self._n_signals
-        scale = n ** self._alpha
-        # w may be (1, n_signals) for single query or (m, n_signals)
-        # for per-row queries; broadcast via numpy
-        l_weighted = scale * np.sum(w * x, axis=-1)
-        if self._logit_base_rate is not None:
-            l_weighted = l_weighted + self._logit_base_rate
-        result = sigmoid(l_weighted)
-        return np.atleast_1d(np.asarray(result, dtype=np.float64))
-
-    def fit(
-        self,
-        probs: np.ndarray,
-        labels: np.ndarray,
-        query_features: np.ndarray,
-        *,
-        query_ids: np.ndarray | None = None,
-        learning_rate: float = 0.01,
-        max_iterations: int = 1000,
-        tolerance: float = 1e-6,
-    ) -> None:
-        """Batch gradient descent on BCE loss to learn W and b.
-
-        Parameters
-        ----------
-        probs : array of shape (m, n_signals)
-            Training probability signals.
-        labels : array of shape (m,)
-            Binary relevance labels (0 or 1).
-        query_features : array of shape (m, n_query_features)
-            Query features for each training sample.
-        query_ids : array of shape (m,) or None
-            Query group identifiers for per-query normalization.  When
-            ``normalize=True`` and ``query_ids`` is provided, logit
-            normalization is applied within each query group.  When
-            ``normalize=True`` and ``query_ids`` is None, the whole batch
-            is normalized as a single group.
-        learning_rate : float
-            Step size for gradient descent.
-        max_iterations : int
-            Maximum number of gradient descent iterations.
-        tolerance : float
-            Convergence threshold on maximum absolute parameter change.
-        """
-        probs = _clamp_probability(np.asarray(probs, dtype=np.float64))
-        labels = np.asarray(labels, dtype=np.float64)
-        query_features = np.asarray(query_features, dtype=np.float64)
-
-        if probs.ndim == 1:
-            probs = probs.reshape(1, -1)
-        if query_features.ndim == 1:
-            query_features = query_features.reshape(1, -1)
-
-        m = probs.shape[0]
-        n = self._n_signals
-        scale = n ** self._alpha
-        x = logit(probs)  # (m, n)
-
-        if self._normalize:
-            if query_ids is not None:
-                query_ids = np.asarray(query_ids)
-                # Boolean indexing copies, so x[mask] = ... writes back safely
-                # without cross-group contamination.
-                for qid in np.unique(query_ids):
-                    mask = query_ids == qid
-                    x[mask] = self._normalize_logits(x[mask])
-            else:
-                x = self._normalize_logits(x)
-
-        for _ in range(max_iterations):
-            # Compute per-sample attention weights
-            z = query_features @ self._W.T + self._b  # (m, n)
-            w = self._softmax(z)  # (m, n)
-
-            # Weighted log-odds per sample
-            x_bar_w = np.sum(w * x, axis=-1)  # (m,)
-            l_weighted = scale * x_bar_w
-            if self._logit_base_rate is not None:
-                l_weighted = l_weighted + self._logit_base_rate
-            p = sigmoid(l_weighted)  # (m,)
-            p = np.atleast_1d(np.asarray(p, dtype=np.float64))
-            error = p - labels  # (m,)
-
-            # Gradient: dL/dz_j = scale * (p - y) * w_j * (x_j - x_bar_w)
-            # Then chain through softmax: dz_j/dW_jk = q_k (query feature)
-            # and softmax Jacobian: dw_i/dz_j = w_i*(delta_ij - w_j)
-            grad_z = (
-                scale
-                * error[:, np.newaxis]
-                * w
-                * (x - x_bar_w[:, np.newaxis])
-            )  # (m, n)
-
-            # dL/dW = (1/m) * grad_z.T @ query_features  -> (n, n_qf)
-            grad_W = grad_z.T @ query_features / m
-            grad_b = np.mean(grad_z, axis=0)
-
-            old_W = self._W.copy()
-            old_b = self._b.copy()
-
-            self._W -= learning_rate * grad_W
-            self._b -= learning_rate * grad_b
-
-            max_change = max(
-                float(np.max(np.abs(self._W - old_W))),
-                float(np.max(np.abs(self._b - old_b))),
-            )
-            if max_change < tolerance:
-                break
-
-        # Reset online state after batch fit
-        self._n_updates = 0
-        self._grad_W_ema = np.zeros_like(self._W)
-        self._grad_b_ema = np.zeros_like(self._b)
-        self._W_avg = self._W.copy()
-        self._b_avg = self._b.copy()
-
-    def update(
-        self,
-        probs: np.ndarray | float,
-        label: np.ndarray | float,
-        query_features: np.ndarray,
-        *,
-        learning_rate: float = 0.01,
-        momentum: float = 0.9,
-        decay_tau: float = 1000.0,
-        max_grad_norm: float = 1.0,
-        avg_decay: float = 0.995,
-    ) -> None:
-        """Online SGD update from a single observation or mini-batch.
-
-        Parameters
-        ----------
-        probs : array of shape (n_signals,) or (m, n_signals)
-            Probability signal(s).
-        label : float or array of shape (m,)
-            Binary relevance label(s).
-        query_features : array of shape (n_query_features,) or (m, n_query_features)
-            Query feature(s).
-        learning_rate : float
-            Base step size, decayed as lr / (1 + t / tau).
-        momentum : float
-            EMA decay factor for gradient smoothing.
-        decay_tau : float
-            Time constant for learning rate decay.
-        max_grad_norm : float
-            Maximum L2 norm for gradient clipping.
-        avg_decay : float
-            Decay factor for Polyak parameter averaging.
-        """
-        probs = _clamp_probability(
-            np.atleast_1d(np.asarray(probs, dtype=np.float64))
-        )
-        label = np.atleast_1d(np.asarray(label, dtype=np.float64))
-        query_features = np.atleast_2d(
-            np.asarray(query_features, dtype=np.float64)
-        )
-
-        if probs.ndim == 1:
-            probs = probs.reshape(1, -1)
-
-        n = self._n_signals
-        scale = n ** self._alpha
-        x = logit(probs)  # (m, n)
-
-        if self._normalize and x.ndim == 2:
-            x = self._normalize_logits(x)
-
-        z = query_features @ self._W.T + self._b  # (m, n)
-        w = self._softmax(z)  # (m, n)
-
-        x_bar_w = np.sum(w * x, axis=-1)  # (m,)
-        l_weighted = scale * x_bar_w
-        if self._logit_base_rate is not None:
-            l_weighted = l_weighted + self._logit_base_rate
-        p = sigmoid(l_weighted)
-        p = np.atleast_1d(np.asarray(p, dtype=np.float64))
-        error = p - label
-
-        grad_z = (
-            scale
-            * error[:, np.newaxis]
-            * w
-            * (x - x_bar_w[:, np.newaxis])
-        )  # (m, n)
-
-        m = probs.shape[0]
-        grad_W = grad_z.T @ query_features / m  # (n, n_qf)
-        grad_b = np.mean(grad_z, axis=0)  # (n,)
-
-        # EMA smoothing
-        self._grad_W_ema = momentum * self._grad_W_ema + (1.0 - momentum) * grad_W
-        self._grad_b_ema = momentum * self._grad_b_ema + (1.0 - momentum) * grad_b
-
-        # Bias correction
-        self._n_updates += 1
-        correction = 1.0 - momentum ** self._n_updates
-        corrected_W = self._grad_W_ema / correction
-        corrected_b = self._grad_b_ema / correction
-
-        # L2 gradient clipping (joint norm over W and b)
-        grad_norm = float(np.sqrt(
-            np.sum(corrected_W ** 2) + np.sum(corrected_b ** 2)
-        ))
-        if grad_norm > max_grad_norm:
-            scale_clip = max_grad_norm / grad_norm
-            corrected_W = corrected_W * scale_clip
-            corrected_b = corrected_b * scale_clip
-
-        # Learning rate decay
-        effective_lr = learning_rate / (1.0 + self._n_updates / decay_tau)
-
-        self._W -= effective_lr * corrected_W
-        self._b -= effective_lr * corrected_b
-
-        # Polyak averaging
-        self._W_avg = avg_decay * self._W_avg + (1.0 - avg_decay) * self._W
-        self._b_avg = avg_decay * self._b_avg + (1.0 - avg_decay) * self._b
-
-    def compute_upper_bounds(
-        self,
-        upper_bound_probs: np.ndarray,
-        query_features: np.ndarray,
-        use_averaged: bool = False,
-    ) -> np.ndarray:
-        """Compute fused probability upper bounds (Theorem 8.7.1).
-
-        Given per-signal probability upper bounds, compute the maximum
-        possible fused probability for each candidate.
-
-        Parameters
-        ----------
-        upper_bound_probs : array of shape (m, n_signals)
-            Maximum possible probability per signal per candidate.
-        query_features : array of shape (n_query_features,) or (m, n_query_features)
-            Query feature vector(s) for computing attention weights.
-        use_averaged : bool
-            If True, use Polyak-averaged parameters.
-
-        Returns
-        -------
-        Array of shape (m,) -- upper bound on fused probability per candidate.
-        """
-        upper_bound_probs = _clamp_probability(
-            np.asarray(upper_bound_probs, dtype=np.float64)
-        )
-        query_features = np.atleast_2d(
-            np.asarray(query_features, dtype=np.float64)
-        )
-        if upper_bound_probs.ndim == 1:
-            upper_bound_probs = upper_bound_probs.reshape(1, -1)
-
-        w = self._compute_weights(query_features, use_averaged)
-        x = logit(upper_bound_probs)
-        if self._normalize:
-            x = self._normalize_logits(x)
-        n = self._n_signals
-        scale = n ** self._alpha
-        l_weighted = scale * np.sum(w * x, axis=-1)
-        if self._logit_base_rate is not None:
-            l_weighted = l_weighted + self._logit_base_rate
-        result = sigmoid(l_weighted)
-        return np.atleast_1d(np.asarray(result, dtype=np.float64))
-
-    def prune(
-        self,
-        probs: np.ndarray,
-        query_features: np.ndarray,
-        threshold: float,
-        upper_bound_probs: np.ndarray | None = None,
-        use_averaged: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Prune candidates whose upper bound is below threshold (Theorem 8.7.1).
-
-        Parameters
-        ----------
-        probs : array of shape (m, n_signals)
-            Actual probability signals per candidate.
-        query_features : array of shape (n_query_features,) or (m, n_query_features)
-            Query feature vector(s).
-        threshold : float
-            Minimum fused probability to survive pruning.
-        upper_bound_probs : array of shape (m, n_signals) or None
-            Per-signal upper bounds.  If None, uses ``probs`` as its
-            own upper bound (no pruning benefit, but safe).
-        use_averaged : bool
-            If True, use Polyak-averaged parameters.
-
-        Returns
-        -------
-        (surviving_indices, fused_probabilities) : tuple of arrays
-            Indices of candidates that survived pruning and their
-            fused probabilities.
-        """
-        probs = np.asarray(probs, dtype=np.float64)
-        query_features = np.atleast_2d(
-            np.asarray(query_features, dtype=np.float64)
-        )
-        if probs.ndim == 1:
-            probs = probs.reshape(1, -1)
-        if upper_bound_probs is None:
-            upper_bound_probs = probs
-        upper_bounds = self.compute_upper_bounds(
-            upper_bound_probs, query_features, use_averaged
-        )
-        surviving_mask = upper_bounds >= threshold
-        surviving_indices = np.where(surviving_mask)[0]
-        if len(surviving_indices) == 0:
-            return surviving_indices, np.array([], dtype=np.float64)
-        surv_qf = (
-            query_features[surviving_indices]
-            if query_features.shape[0] > 1
-            else query_features
-        )
-        fused = self(probs[surviving_indices], surv_qf, use_averaged)
-        return surviving_indices, np.atleast_1d(fused)
-
-    @staticmethod
-    def _softmax(z: np.ndarray) -> np.ndarray:
-        """Numerically stable softmax along last axis."""
-        z = np.asarray(z, dtype=np.float64)
-        z_shifted = z - np.max(z, axis=-1, keepdims=True)
-        exp_z = np.exp(z_shifted)
-        return exp_z / np.sum(exp_z, axis=-1, keepdims=True)
-
-
-class MultiHeadAttentionLogOddsWeights:
-    """Multi-head attention fusion (Paper 2, Remark 8.6, Corollary 8.7.2).
-
-    Creates multiple independent ``AttentionLogOddsWeights`` heads, each
-    initialized with a different random seed.  At inference time, each
-    head produces fused log-odds independently, and the results are
-    combined by averaging log-odds across heads before converting back
-    to probability via sigmoid.
-
-    Parameters
-    ----------
-    n_heads : int
-        Number of attention heads (>= 1).
-    n_signals : int
-        Number of probability signals to combine (>= 1).
-    n_query_features : int
-        Dimensionality of the query feature vector (>= 1).
-    alpha : float or str
-        Confidence scaling exponent (fixed, not learned).
-    normalize : bool
-        Whether to apply per-signal logit normalization.
-    """
-
-    def __init__(
-        self,
-        n_heads: int,
-        n_signals: int,
-        n_query_features: int,
-        alpha: float | str = 0.5,
-        normalize: bool = False,
-    ) -> None:
-        if n_heads < 1:
-            raise ValueError(f"n_heads must be >= 1, got {n_heads}")
-        self._n_heads = n_heads
-        self._heads = [
-            AttentionLogOddsWeights(
-                n_signals=n_signals,
-                n_query_features=n_query_features,
-                alpha=alpha,
-                normalize=normalize,
-                seed=h,
-            )
-            for h in range(n_heads)
-        ]
-
-    @property
-    def n_heads(self) -> int:
-        """Number of attention heads."""
-        return self._n_heads
-
-    @property
-    def heads(self) -> list[AttentionLogOddsWeights]:
-        """List of attention head instances."""
-        return list(self._heads)
-
-    def __call__(
-        self,
-        probs: np.ndarray,
-        query_features: np.ndarray,
-        use_averaged: bool = False,
-    ) -> np.ndarray | float:
-        """Combine probability signals via multi-head attention fusion.
-
-        Each head produces fused log-odds independently.  The final
-        result averages the log-odds across heads and applies sigmoid.
-
-        Parameters
-        ----------
-        probs : array of shape (..., n_signals)
-            Probability values to combine.
-        query_features : array of shape (n_query_features,) or (m, n_query_features)
-            Query feature vector(s).
-        use_averaged : bool
-            If True, use Polyak-averaged parameters.
-
-        Returns
-        -------
-        Combined probability after multi-head log-odds averaging.
-        """
-        probs = np.asarray(probs, dtype=np.float64)
-        head_results = []
-        for head in self._heads:
-            r = head(probs, query_features, use_averaged)
-            head_results.append(np.atleast_1d(np.asarray(r, dtype=np.float64)))
-
-        # Average in log-odds space, then sigmoid
-        head_logits = [logit(_clamp_probability(r)) for r in head_results]
-        avg_logit = np.mean(head_logits, axis=0)
-        result = sigmoid(avg_logit)
-        if probs.ndim == 1:
-            return float(result) if np.ndim(result) == 0 else float(result[0])
-        return np.atleast_1d(np.asarray(result, dtype=np.float64))
-
-    def fit(
-        self,
-        probs: np.ndarray,
-        labels: np.ndarray,
-        query_features: np.ndarray,
-        **kwargs,
-    ) -> None:
-        """Train all heads on the same data.
-
-        Different random initializations lead to different learned
-        solutions, providing diversity across heads.
-
-        Parameters
-        ----------
-        probs : array of shape (m, n_signals)
-            Training probability signals.
-        labels : array of shape (m,)
-            Binary relevance labels.
-        query_features : array of shape (m, n_query_features)
-            Query features for each training sample.
-        **kwargs
-            Additional keyword arguments passed to each head's ``fit()``.
-        """
-        for head in self._heads:
-            head.fit(probs, labels, query_features, **kwargs)
-
-    def update(
-        self,
-        probs: np.ndarray | float,
-        label: np.ndarray | float,
-        query_features: np.ndarray,
-        **kwargs,
-    ) -> None:
-        """Online update for all heads.
-
-        Parameters
-        ----------
-        probs : array of shape (n_signals,) or (m, n_signals)
-            Probability signal(s).
-        label : float or array of shape (m,)
-            Binary relevance label(s).
-        query_features : array of shape (n_query_features,) or (m, n_query_features)
-            Query feature(s).
-        **kwargs
-            Additional keyword arguments passed to each head's ``update()``.
-        """
-        for head in self._heads:
-            head.update(probs, label, query_features, **kwargs)
-
-    def compute_upper_bounds(
-        self,
-        upper_bound_probs: np.ndarray,
-        query_features: np.ndarray,
-        use_averaged: bool = False,
-    ) -> np.ndarray:
-        """Compute fused upper bounds across heads (Corollary 8.7.2).
-
-        Each head computes its upper bound independently.  The final
-        upper bound averages the per-head upper bound log-odds and
-        applies sigmoid.
-
-        Parameters
-        ----------
-        upper_bound_probs : array of shape (m, n_signals)
-            Per-signal probability upper bounds.
-        query_features : array of shape (n_query_features,) or (m, n_query_features)
-            Query feature vector(s).
-        use_averaged : bool
-            If True, use Polyak-averaged parameters.
-
-        Returns
-        -------
-        Array of shape (m,) -- upper bound on fused probability per candidate.
-        """
-        head_bounds = []
-        for head in self._heads:
-            ub = head.compute_upper_bounds(
-                upper_bound_probs, query_features, use_averaged
-            )
-            head_bounds.append(ub)
-        head_logits = [logit(_clamp_probability(b)) for b in head_bounds]
-        avg_logit = np.mean(head_logits, axis=0)
-        result = sigmoid(avg_logit)
-        return np.atleast_1d(np.asarray(result, dtype=np.float64))
-
-    def prune(
-        self,
-        probs: np.ndarray,
-        query_features: np.ndarray,
-        threshold: float,
-        upper_bound_probs: np.ndarray | None = None,
-        use_averaged: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Prune candidates using multi-head upper bounds (Corollary 8.7.2).
-
-        Parameters
-        ----------
-        probs : array of shape (m, n_signals)
-            Actual probability signals per candidate.
-        query_features : array of shape (n_query_features,) or (m, n_query_features)
-            Query feature vector(s).
-        threshold : float
-            Minimum fused probability to survive pruning.
-        upper_bound_probs : array of shape (m, n_signals) or None
-            Per-signal upper bounds.  If None, uses ``probs``.
-        use_averaged : bool
-            If True, use Polyak-averaged parameters.
-
-        Returns
-        -------
-        (surviving_indices, fused_probabilities) : tuple of arrays
-        """
-        probs = np.asarray(probs, dtype=np.float64)
-        query_features = np.atleast_2d(
-            np.asarray(query_features, dtype=np.float64)
-        )
-        if probs.ndim == 1:
-            probs = probs.reshape(1, -1)
-        if upper_bound_probs is None:
-            upper_bound_probs = probs
-        upper_bounds = self.compute_upper_bounds(
-            upper_bound_probs, query_features, use_averaged
-        )
-        surviving_mask = upper_bounds >= threshold
-        surviving_indices = np.where(surviving_mask)[0]
-        if len(surviving_indices) == 0:
-            return surviving_indices, np.array([], dtype=np.float64)
-        surv_qf = (
-            query_features[surviving_indices]
-            if query_features.shape[0] > 1
-            else query_features
-        )
-        fused = self(probs[surviving_indices], surv_qf, use_averaged)
-        return surviving_indices, np.atleast_1d(np.asarray(fused, dtype=np.float64))
+        return MultiHeadAttentionLogOddsWeights
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

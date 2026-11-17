@@ -29,9 +29,11 @@ import numpy as np
 from bayesian_bm25.scorer import BayesianBM25Scorer
 from benchmarks.metrics import (
     average_precision,
+    best_f1_threshold,
     expected_calibration_error,
     ndcg_at_k,
     precision_at_k,
+    threshold_f1,
 )
 from benchmarks.utils import (
     IRDataset,
@@ -81,7 +83,8 @@ def evaluate_bayesian(
     for qid, qtokens in dataset.queries:
         qrel = dataset.qrels[qid]
         probs = scorer.get_probabilities(qtokens)
-        top_k_idx = np.argsort(-probs)[:k]
+        # Rank on log-odds: probabilities tie once the evidence saturates.
+        top_k_idx = np.argsort(-scorer.get_log_odds(qtokens))[:k]
         ranked_dids = [dataset.doc_ids[i] for i in top_k_idx]
 
         graded = get_graded_relevance_vector(ranked_dids, qrel)
@@ -140,41 +143,6 @@ def collect_training_data(
 # Threshold-based evaluation
 # ---------------------------------------------------------------------------
 
-def threshold_f1(
-    values: np.ndarray,
-    labels: np.ndarray,
-    threshold: float,
-) -> tuple[float, float, float]:
-    """Compute precision, recall, F1 at a given threshold."""
-    predicted = values >= threshold
-    tp = np.sum(predicted & (labels == 1))
-    fp = np.sum(predicted & (labels == 0))
-    fn = np.sum(~predicted & (labels == 1))
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    return float(precision), float(recall), float(f1)
-
-
-def find_best_threshold(
-    values: np.ndarray,
-    labels: np.ndarray,
-    n_candidates: int = 200,
-) -> tuple[float, float]:
-    """Find the threshold that maximises F1."""
-    lo = float(np.min(values))
-    hi = float(np.max(values))
-    if lo == hi:
-        return lo, 0.0
-    candidates = np.linspace(lo, hi, n_candidates)
-    best_f1, best_t = 0.0, candidates[0]
-    for t in candidates:
-        _, _, f1 = threshold_f1(values, labels, t)
-        if f1 > best_f1:
-            best_f1, best_t = f1, t
-    return float(best_t), float(best_f1)
-
-
 def evaluate_threshold_transfer(
     bm25_model: bm25s.BM25,
     scorer: BayesianBM25Scorer,
@@ -209,13 +177,13 @@ def evaluate_threshold_transfer(
     # BM25
     bm25_train_v, bm25_train_l = collect(train_qids, False)
     bm25_test_v, bm25_test_l = collect(test_qids, False)
-    bm25_t, bm25_train_f1 = find_best_threshold(bm25_train_v, bm25_train_l)
+    bm25_t, bm25_train_f1 = best_f1_threshold(bm25_train_v, bm25_train_l)
     _, _, bm25_test_f1 = threshold_f1(bm25_test_v, bm25_test_l, bm25_t)
 
     # Bayesian
     bay_train_v, bay_train_l = collect(train_qids, True)
     bay_test_v, bay_test_l = collect(test_qids, True)
-    bay_t, bay_train_f1 = find_best_threshold(bay_train_v, bay_train_l)
+    bay_t, bay_train_f1 = best_f1_threshold(bay_train_v, bay_train_l)
     _, _, bay_test_f1 = threshold_f1(bay_test_v, bay_test_l, bay_t)
 
     return bm25_train_f1, bm25_test_f1, bay_train_f1, bay_test_f1
@@ -341,7 +309,7 @@ def run_single_dataset(dataset: IRDataset, k: int = 10) -> dict:
     print(f"\n{'--' * 36}")
     print("Summary")
     print(f"  {'Method':<35}  {'NDCG@10':>8}  {'MAP':>8}  {'ECE':>8}")
-    print(f"  {'─' * 35}  {'─' * 8}  {'─' * 8}  {'─' * 8}")
+    print(f"  {'-' * 35}  {'-' * 8}  {'-' * 8}  {'-' * 8}")
 
     rows = [
         ("Raw BM25", raw_results),
@@ -368,7 +336,7 @@ def run_single_dataset(dataset: IRDataset, k: int = 10) -> dict:
         bm25_model, scorer_online, dataset, train_qids, eval_qids, "online",
     )
     print(f"  {'Method':<20}  {'Train F1':>8}  {'Test F1':>8}  {'Gap':>8}")
-    print(f"  {'─' * 20}  {'─' * 8}  {'─' * 8}  {'─' * 8}")
+    print(f"  {'-' * 20}  {'-' * 8}  {'-' * 8}  {'-' * 8}")
     print(f"  {'Raw BM25':<20}  {bm25_tr_f1:>8.4f}  {bm25_te_f1:>8.4f}  "
           f"{bm25_tr_f1 - bm25_te_f1:>+8.4f}")
     print(f"  {'Bayesian (online)':<20}  {bay_tr_f1:>8.4f}  {bay_te_f1:>8.4f}  "

@@ -18,7 +18,7 @@ and log-odds conjunction.
 
 import numpy as np
 
-from bayesian_bm25 import prob_and, prob_not, prob_or, log_odds_conjunction
+from bayesian_bm25 import log_odds_conjunction, prob_and, prob_not, prob_or
 
 # ---------------------------------------------------------------
 # 1. Basic NOT operation
@@ -51,16 +51,16 @@ p_java   = np.array([0.05, 0.92, 0.75, 0.03, 0.08])
 # "python AND NOT java" = prob_and([p_python, prob_not(p_java)])
 p_exclude = np.array([
     prob_and(np.array([pp, prob_not(pj)]))
-    for pp, pj in zip(p_python, p_java)
+    for pp, pj in zip(p_python, p_java, strict=True)
 ])
 
 print(f"  {'Document':<45} {'P(py)':>6} {'P(java)':>8} {'P(py AND NOT java)':>19}")
 print(f"  {'-'*45} {'-'*6} {'-'*8} {'-'*19}")
-for doc, pp, pj, pe in zip(documents, p_python, p_java, p_exclude):
+for doc, pp, pj, pe in zip(documents, p_python, p_java, p_exclude, strict=True):
     print(f"  {doc:<45} {pp:6.4f} {pj:8.4f} {pe:19.4f}")
 
 ranked = np.argsort(-p_exclude)
-print(f"\n  Ranked by 'python AND NOT java':")
+print("\n  Ranked by 'python AND NOT java':")
 for rank, i in enumerate(ranked, 1):
     print(f"    {rank}. [{p_exclude[i]:.4f}] {documents[i]}")
 
@@ -125,5 +125,5 @@ exclude_results = log_odds_conjunction(exclude_signals)
 
 print(f"\n  {'Document':<45} {'Include java':>13} {'Exclude java':>13}")
 print(f"  {'-'*45} {'-'*13} {'-'*13}")
-for doc, inc, exc in zip(documents, include_results, exclude_results):
+for doc, inc, exc in zip(documents, include_results, exclude_results, strict=True):
     print(f"  {doc:<45} {inc:13.4f} {exc:13.4f}")

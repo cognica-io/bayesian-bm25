@@ -9,9 +9,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 import numpy as np
+
+from benchmarks.ivf_search_result import IVFSearchResult
 
 _EPSILON = 1e-12
 
@@ -20,23 +21,6 @@ def _l2_normalize_rows(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr, dtype=np.float32)
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
     return arr / np.maximum(norms, _EPSILON)
-
-
-@dataclass
-class IVFSearchResult:
-    """Result bundle for one IVF query."""
-
-    indices: np.ndarray
-    scores: np.ndarray
-    cell_ids: np.ndarray
-    cell_populations: np.ndarray
-    candidate_indices: np.ndarray
-    candidate_scores: np.ndarray
-    candidate_cell_ids: np.ndarray
-    candidate_cell_populations: np.ndarray
-    probed_cell_ids: np.ndarray
-    probed_cell_scores: np.ndarray
-    centroid_scores: np.ndarray
 
 
 class SimpleIVF:
@@ -74,6 +58,19 @@ class SimpleIVF:
         self.n_cells = int(self.centroids.shape[0])
         self.cell_populations = np.diff(self.cell_offsets).astype(np.int32)
         self.avg_population = float(np.mean(self.cell_populations))
+
+        # Per-cell sums of the cosine between each member and its
+        # centroid, and of its square.  Two numbers per cell are all the
+        # index needs to hold to estimate the background of any query
+        # (see query_background).
+        member_cosine = 1.0 - self.background_distances
+        self.cell_cosine_sums = np.bincount(
+            self.assignments, weights=member_cosine, minlength=self.n_cells,
+        )
+        self.cell_cosine_square_sums = np.bincount(
+            self.assignments, weights=member_cosine * member_cosine,
+            minlength=self.n_cells,
+        )
 
     @classmethod
     def build(
@@ -162,6 +159,116 @@ class SimpleIVF:
             cell_residual_means=cell_residual_means,
             cell_residual_q90=cell_residual_q90,
         )
+
+    def query_background(
+        self,
+        result: IVFSearchResult,
+        *,
+        query_vector: np.ndarray | None = None,
+        excluded_indices: np.ndarray | None = None,
+    ) -> tuple[float, float]:
+        """Mean and standard deviation of a query's cosine distance over the corpus.
+
+        The residuals stored at build time (``background_distances``) are
+        distances between a document and the centroid of its own cell.
+        They are not distances between a query and a document, and their
+        distribution is not the background a calibration of query
+        distances needs.  This method estimates that background from what
+        the index holds and what a search computes anyway, in time
+        proportional to the number of cells.
+
+        Write a member ``x`` of a cell with unit centroid ``c`` as
+        ``x = a c + sqrt(1 - a^2) u`` with ``a = <x, c>`` and ``u``
+        orthogonal to ``c``.  For a query ``q`` with ``s = <q, c>``,
+
+            <q, x> = a s + sqrt(1 - a^2) <q, u>.
+
+        * First moment.  The centroid is the normalized mean of its
+          members, so the members sum to ``(sum of a) * c`` and the
+          similarities of a cell sum to ``s * (sum of a)`` exactly.
+        * Second moment.  The squared similarities of a cell sum to
+          ``s^2 * (sum of a^2)`` plus the orthogonal part, modelled as
+          ``k * (1 - s^2) * (N_c - sum of a^2)``.  The constant ``k``
+          (the reciprocal of an effective dimension) is estimated on the
+          probed cells, where the true similarities are known.
+
+        Probed cells enter with their true similarities.
+
+        Parameters
+        ----------
+        result : IVFSearchResult
+            Result of ``search`` for the query.
+
+        Returns
+        -------
+        (mean, std)
+            Estimated mean and standard deviation of the cosine distance
+            ``1 - <q, x>`` over all documents.
+        """
+        centroid_scores = np.asarray(result.centroid_scores, dtype=np.float64)
+        scores = np.asarray(result.candidate_scores, dtype=np.float64)
+        cells = np.asarray(result.candidate_cell_ids, dtype=np.int64)
+        candidate_indices = np.asarray(result.candidate_indices, dtype=np.int64)
+        excluded = np.array([], dtype=np.int64)
+        if excluded_indices is not None:
+            excluded = np.unique(np.asarray(excluded_indices, dtype=np.int64))
+            if np.any(excluded < 0) or np.any(excluded >= self.n_docs):
+                raise ValueError("excluded_indices must be valid document positions")
+            keep = ~np.isin(candidate_indices, excluded)
+            scores, cells, candidate_indices = scores[keep], cells[keep], candidate_indices[keep]
+
+        probed = np.zeros(self.n_cells, dtype=bool)
+        probed[np.asarray(result.probed_cell_ids, dtype=np.int64)] = True
+        unprobed = ~probed
+
+        # Orthogonal variance per unit of (1 - a^2)(1 - s^2), from the
+        # probed candidates.
+        orthogonal_scale = 0.0
+        if len(scores) > 0:
+            member_cosine = 1.0 - self.background_distances[candidate_indices]
+            predicted = centroid_scores[cells] * member_cosine
+            orthogonal = (1.0 - member_cosine**2) * (1.0 - centroid_scores[cells] ** 2)
+            denominator = float(np.sum(orthogonal))
+            if denominator > _EPSILON:
+                orthogonal_scale = float(np.sum((scores - predicted) ** 2)) / denominator
+
+        s = centroid_scores[unprobed]
+        first = float(np.sum(scores)) + float(np.sum(s * self.cell_cosine_sums[unprobed]))
+        second = float(np.sum(scores * scores)) + float(
+            np.sum(
+                s * s * self.cell_cosine_square_sums[unprobed]
+                + orthogonal_scale
+                * (1.0 - s * s)
+                * (self.cell_populations[unprobed] - self.cell_cosine_square_sums[unprobed])
+            )
+        )
+        n_total = len(scores) + int(np.sum(self.cell_populations[unprobed]))
+        if excluded_indices is not None:
+            # Probed exclusions are already absent from result candidates.
+            # For unprobed cells remove the actual held-out contribution
+            # from the moment model of the full indexed population.
+            unscored = excluded[unprobed[self.assignments[excluded]]]
+            if unscored.size:
+                if query_vector is None:
+                    raise ValueError("query_vector is required to exclude unprobed documents")
+                vector = np.asarray(query_vector, dtype=np.float64)
+                norm = float(np.linalg.norm(vector))
+                if vector.shape != (self.dim,) or not np.all(np.isfinite(vector)) or norm <= 0.0:
+                    raise ValueError(
+                        "query_vector must be a finite nonzero vector of index dimension"
+                    )
+                excluded_scores = np.asarray(
+                    self.embeddings[unscored] @ (vector / norm), dtype=np.float64,
+                )
+                first -= float(np.sum(excluded_scores))
+                second -= float(np.sum(excluded_scores**2))
+                n_total -= unscored.size
+        if n_total == 0:
+            return 1.0, _EPSILON
+
+        mean_similarity = first / n_total
+        variance = max(second / n_total - mean_similarity * mean_similarity, 0.0)
+        return 1.0 - mean_similarity, max(math.sqrt(variance), _EPSILON)
 
     def _docs_for_cells(self, cell_ids: np.ndarray) -> np.ndarray:
         doc_groups: list[np.ndarray] = []

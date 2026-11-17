@@ -62,7 +62,10 @@ all_timestamps = np.concatenate([timestamps_p1, timestamps_p2])
 
 print("=== Data Summary ===")
 print(f"Phase 1 (t=0..{N_PHASE1 - 1}):   alpha={PHASE1_ALPHA}, beta={PHASE1_BETA}")
-print(f"Phase 2 (t={N_PHASE1}..{N_PHASE1 + N_PHASE2 - 1}): alpha={PHASE2_ALPHA}, beta={PHASE2_BETA}")
+print(
+    f"Phase 2 (t={N_PHASE1}..{N_PHASE1 + N_PHASE2 - 1}): "
+    f"alpha={PHASE2_ALPHA}, beta={PHASE2_BETA}"
+)
 print(f"Total observations: {len(all_scores)}")
 
 # --- Concept drift detection: temporal vs uniform ---
@@ -91,7 +94,7 @@ print(f"Uniform:          alpha={uniform.alpha:.3f}, beta={uniform.beta:.3f}")
 
 temporal_err = abs(temporal.alpha - PHASE2_ALPHA) + abs(temporal.beta - PHASE2_BETA)
 uniform_err = abs(uniform.alpha - PHASE2_ALPHA) + abs(uniform.beta - PHASE2_BETA)
-print(f"\nError vs Phase 2 truth:")
+print("\nError vs Phase 2 truth:")
 print(f"  Temporal: {temporal_err:.3f}")
 print(f"  Uniform:  {uniform_err:.3f}")
 if temporal_err < uniform_err:
@@ -100,7 +103,10 @@ if temporal_err < uniform_err:
 # --- Half-life tuning ---
 print("\n=== Half-Life Tuning ===")
 print(f"Phase 2 truth: alpha={PHASE2_ALPHA:.3f}, beta={PHASE2_BETA:.3f}\n")
-print(f"{'Half-life':>10}  {'Alpha':>7}  {'Beta':>7}  {'Alpha err':>10}  {'Beta err':>10}  {'Total err':>10}")
+print(
+    f"{'Half-life':>10}  {'Alpha':>7}  {'Beta':>7}  "
+    f"{'Alpha err':>10}  {'Beta err':>10}  {'Total err':>10}"
+)
 print("-" * 65)
 
 half_lives = [20, 50, 100, 500, 10000]
@@ -115,7 +121,10 @@ for hl in half_lives:
     )
     a_err = abs(t.alpha - PHASE2_ALPHA)
     b_err = abs(t.beta - PHASE2_BETA)
-    print(f"{hl:>10}  {t.alpha:>7.3f}  {t.beta:>7.3f}  {a_err:>10.3f}  {b_err:>10.3f}  {a_err + b_err:>10.3f}")
+    print(
+        f"{hl:>10}  {t.alpha:>7.3f}  {t.beta:>7.3f}  "
+        f"{a_err:>10.3f}  {b_err:>10.3f}  {a_err + b_err:>10.3f}"
+    )
 
 print("\nShorter half-life = faster adaptation to recent data.")
 print("Very short half-life may overfit to noise in the latest observations.")
@@ -147,7 +156,10 @@ for i in range(len(all_scores)):
 
     # Print selected steps to show the trajectory
     if i < 5 or i in (N_PHASE1 - 1, N_PHASE1, N_PHASE1 + 1) or (i + 1) % 100 == 0:
-        print(f"  {i:>3}  {phase:>5}   {score:5.2f}   {label:4.0f}   {online.alpha:7.3f}  {online.beta:7.3f}")
+        print(
+            f"  {i:>3}  {phase:>5}   {score:5.2f}   {label:4.0f}   "
+            f"{online.alpha:7.3f}  {online.beta:7.3f}"
+        )
 
 print(f"\nParameters at drift point (t={N_PHASE1 - 1}):")
 print(f"  alpha={alpha_at_drift:.3f}, beta={beta_at_drift:.3f}")

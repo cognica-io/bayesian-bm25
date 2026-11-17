@@ -11,7 +11,6 @@ meaning across queries.  This enables threshold-based filtering
 and confidence bucketing without per-query tuning.
 """
 
-import numpy as np
 
 from bayesian_bm25.scorer import BayesianBM25Scorer
 
@@ -58,17 +57,17 @@ for i, p in enumerate(probs):
 print(f"Query: '{query}'\n")
 
 if high_confidence:
-    print("High confidence (P >= {:.2f}):".format(HIGH_THRESHOLD))
+    print(f"High confidence (P >= {HIGH_THRESHOLD:.2f}):")
     for did, p in sorted(high_confidence, key=lambda x: -x[1]):
         print(f"  P={p:.4f}  {corpus_texts[did]}")
 
 if medium_confidence:
-    print("\nMedium confidence ({:.2f} <= P < {:.2f}):".format(LOW_THRESHOLD, HIGH_THRESHOLD))
+    print(f"\nMedium confidence ({LOW_THRESHOLD:.2f} <= P < {HIGH_THRESHOLD:.2f}):")
     for did, p in sorted(medium_confidence, key=lambda x: -x[1]):
         print(f"  P={p:.4f}  {corpus_texts[did]}")
 
 if low_confidence:
-    print("\nLow confidence (P < {:.2f}):".format(LOW_THRESHOLD))
+    print(f"\nLow confidence (P < {LOW_THRESHOLD:.2f}):")
     for did, p in sorted(low_confidence, key=lambda x: -x[1]):
         print(f"  P={p:.4f}  {corpus_texts[did]}")
 

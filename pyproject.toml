@@ -21,6 +21,7 @@ scorer = ["bm25s>=0.2.0"]
 bench = [
     "bm25s>=0.2.0",
     "ir_datasets",
+    "pytrec-eval-terrier",
 ]
 dev = [
     "pytest>=7.0",

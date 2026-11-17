@@ -62,6 +62,9 @@ class BM25SignalTrace:
     alpha: float
     beta: float
     base_rate: float | None
+    ceiling: float = 1.0
+    ranking_score: float | None = None
+    posterior_log_odds: float | None = None
 
 
 @dataclass
@@ -135,6 +138,9 @@ class FusionTrace:
     complements: list[float] | None = None
     log_complements: list[float] | None = None
     log_complement_sum: float | None = None
+    input_prior_log_odds: list[float] | None = None
+    prior_logit: float | None = None
+    posterior_log_odds: float | None = None
 
 
 @dataclass
@@ -180,14 +186,36 @@ class FusionDebugger:
         score: float,
         tf: float,
         doc_len_ratio: float,
+        *,
+        neutral_prior: bool = False,
     ) -> BM25SignalTrace:
-        """Trace a single BM25 score through the full probability pipeline."""
+        """Trace a single BM25 score through the full probability pipeline.
+
+        Parameters
+        ----------
+        score : float
+            Raw BM25 score.
+        tf : float
+            Term frequency feature of the document prior.
+        doc_len_ratio : float
+            Document length divided by the average document length.
+        neutral_prior : bool
+            When True, the document prior is neutral (0.5, log-odds 0)
+            and the posterior is the likelihood shifted by the base rate
+            alone.  This is the two-term posterior of per-query
+            calibration, which carries no document-quality prior.
+        """
         t = self._transform
 
         likelihood_val = float(t.likelihood(score))
-        tf_prior_val = float(t.tf_prior(tf))
-        norm_prior_val = float(t.norm_prior(doc_len_ratio))
-        composite_prior_val = float(t.composite_prior(tf, doc_len_ratio))
+        if neutral_prior:
+            tf_prior_val = 0.5
+            norm_prior_val = 0.5
+            composite_prior_val = 0.5
+        else:
+            tf_prior_val = float(t.tf_prior(tf))
+            norm_prior_val = float(t.norm_prior(doc_len_ratio))
+            composite_prior_val = float(t.composite_prior(tf, doc_len_ratio))
         posterior_val = float(
             t.posterior(likelihood_val, composite_prior_val, base_rate=t.base_rate)
         )
@@ -213,6 +241,26 @@ class FusionDebugger:
             alpha=t.alpha,
             beta=t.beta,
             base_rate=t.base_rate,
+        )
+
+    def trace_query_calibration(
+        self,
+        calibration,
+        score: float,
+        tf: float,
+        doc_len_ratio: float,
+    ) -> BM25SignalTrace:
+        """Trace the actual query model, including its count and ceiling."""
+        evidence = float(calibration.evidence(score))
+        return BM25SignalTrace(
+            raw_score=score, tf=tf, doc_len_ratio=doc_len_ratio,
+            likelihood=float(sigmoid(evidence)), tf_prior=0.5, norm_prior=0.5,
+            composite_prior=0.5, logit_likelihood=evidence, logit_prior=0.0,
+            logit_base_rate=calibration.prior_log_odds,
+            posterior=float(calibration.probability(score)), alpha=calibration.slope,
+            beta=calibration.midpoint, base_rate=calibration.prevalence,
+            ceiling=calibration.ceiling, ranking_score=float(calibration.ranking_score(score)),
+            posterior_log_odds=float(calibration.log_odds(score)),
         )
 
     def trace_vector(
@@ -329,6 +377,9 @@ class FusionDebugger:
         weights: list[float] | np.ndarray | None = None,
         gating: str | None = None,
         gating_beta: float | None = None,
+        from_log_odds: bool = False,
+        input_prior_log_odds: np.ndarray | float | None = None,
+        prior_logit: float | None = None,
     ) -> FusionTrace:
         """Trace the fusion of multiple probability signals.
 
@@ -358,9 +409,13 @@ class FusionDebugger:
 
         if method == "log_odds":
             return self._trace_log_odds(
-                probs, names, alpha, weights, gating, gating_beta
+                probs, names, alpha, weights, gating, gating_beta,
+                from_log_odds=from_log_odds,
+                input_prior_log_odds=input_prior_log_odds, prior_logit=prior_logit,
             )
-        elif method == "prob_and":
+        if from_log_odds or input_prior_log_odds is not None or prior_logit is not None:
+            raise ValueError("evidence options require method='log_odds'")
+        if method == "prob_and":
             return self._trace_prob_and(probs, names)
         elif method == "prob_or":
             return self._trace_prob_or(probs, names)
@@ -380,13 +435,29 @@ class FusionDebugger:
         weights: list[float] | np.ndarray | None,
         gating: str | None = None,
         gating_beta: float | None = None,
+        *,
+        from_log_odds: bool = False,
+        input_prior_log_odds: np.ndarray | float | None = None,
+        prior_logit: float | None = None,
     ) -> FusionTrace:
         """Unroll log_odds_conjunction to capture all intermediates."""
-        from bayesian_bm25.fusion import _apply_gating
+        from bayesian_bm25.fusion import _apply_gating, _to_log_odds, log_odds_fusion
 
         n = len(probs)
-        probs_arr = _clamp_probability(np.array(probs, dtype=np.float64))
-        raw_logits = np.array([float(logit(p)) for p in probs_arr])
+        values = np.asarray(probs, dtype=np.float64)
+        probs_arr = sigmoid(values) if from_log_odds else _clamp_probability(values)
+        raw_logits = _to_log_odds(values, from_log_odds, input_prior_log_odds)
+        posterior = float(log_odds_fusion(
+            _to_log_odds(values, from_log_odds), alpha=alpha,
+            weights=None if weights is None else np.asarray(weights),
+            gating=gating or "none",
+            gating_beta=gating_beta if gating_beta is not None else 1.0,
+            input_prior_log_odds=input_prior_log_odds, prior_logit=prior_logit,
+        ))
+        source_priors = (
+            None if input_prior_log_odds is None
+            else np.broadcast_to(input_prior_log_odds, values.shape).tolist()
+        )
 
         # Apply gating if specified
         if gating is not None and gating != "none":
@@ -406,7 +477,7 @@ class FusionDebugger:
             # Weighted sum of logits
             weighted_logit = float(np.sum(weights_arr * np.array(logits_arr)))
             scaled = n_alpha_scale * weighted_logit
-            fused = float(sigmoid(scaled))
+            fused = float(sigmoid(posterior))
             return FusionTrace(
                 signal_probabilities=list(probs_arr),
                 signal_names=names,
@@ -420,13 +491,15 @@ class FusionDebugger:
                 fused_probability=fused,
                 gating=gating,
                 gating_beta=gating_beta,
+                input_prior_log_odds=source_priors, prior_logit=prior_logit,
+                posterior_log_odds=posterior,
             )
 
         effective_alpha = 0.5 if alpha is None else alpha
         mean_logit_val = float(np.mean(logits_arr))
         n_alpha_scale = float(n ** effective_alpha)
         scaled = mean_logit_val * n_alpha_scale
-        fused = float(sigmoid(scaled))
+        fused = float(sigmoid(posterior))
 
         return FusionTrace(
             signal_probabilities=list(probs_arr),
@@ -441,6 +514,8 @@ class FusionDebugger:
             fused_probability=fused,
             gating=gating,
             gating_beta=gating_beta,
+            input_prior_log_odds=source_priors, prior_logit=prior_logit,
+            posterior_log_odds=posterior,
         )
 
     def _trace_prob_and(

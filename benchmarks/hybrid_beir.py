@@ -13,6 +13,26 @@ Tokenization uses bm25s.tokenize with Snowball English stemmer and stop
 word removal, matching the BEIR official BM25 baseline (Lucene
 EnglishAnalyzer with Porter stemmer).
 
+Evaluation protocol:
+
+  * The document whose id equals the query's id is excluded before
+    retrieval, before calibration and before scoring (the default of the
+    BEIR evaluator, and what MTEB applies to ArguAna, whose queries are
+    arguments drawn from the corpus).  Pass --keep-identical-ids to
+    disable.
+  * The lexical result list holds only documents with a non-zero BM25
+    score.
+  * Every Bayesian method is ranked on log-odds, never on a probability:
+    a probability rounds to 1 above about 36.7 in log-odds and is
+    clamped at about 23.0, after which documents tie and the order is
+    decided by tie-breaking.
+  * Rankings are computed in double precision and passed to pytrec_eval
+    as rank-encoded scores, because the evaluator compares scores in
+    single precision.
+  * Every method with weights learned from relevance labels is
+    cross-validated over queries: the weights applied to a query were
+    fitted on queries of the other folds.
+
 Methods compared:
 
   1. BM25                       -- sparse retrieval via bm25s
@@ -31,31 +51,31 @@ Methods compared:
  14. Bayesian-Gated-GELU        -- gated log-odds, GELU
  15. Bayesian-Gated-Swish-B2    -- gated log-odds, Swish beta=2.0
  16. Bayesian-Gated-Softplus    -- gated log-odds, softplus
- 17. Bayesian-Attention         -- query-dependent attention weights
- 18. Bayesian-Attn-Norm         -- attention + logit normalization + 7 features
- 19. Bayesian-Attn-Norm-CV      -- 5-fold cross-validated Attn-Norm
- 20. Bayesian-MultiHead         -- 4-head attention fusion
- 21. Bayesian-MultiHead-Norm    -- MultiHead + normalize + rich features
- 22. Bayesian-MultiField        -- MultiFieldScorer (title + body), sparse-only
- 23. Bayesian-MultiField-Bal    -- MultiField + dense via balanced fusion
- 24. Bayesian-Vector-Balanced   -- VPT-calibrated dense + balanced fusion
- 25. Bayesian-Vector-Softplus   -- VPT-calibrated dense + softplus gating
- 26. Bayesian-Vector-Attn       -- VPT-calibrated dense + attention fusion
- 27. Dense-Kappa                -- global sigmoid calibration (Paper 3, Stage 1)
- 28. Dense-Arctan               -- arctangent normalization baseline
- 29. Dense-Platt                -- supervised Platt scaling baseline
- 30. VPT-DensityPrior           -- VPT with IVF density prior only (Stage 6a)
- 31. VPT-BM25Weights            -- VPT with BM25 weights only (Stage 6b)
- 32. VPT-BW-0.2                 -- VPT bandwidth ablation c=0.2 (Stage 7)
- 33. VPT-BW-0.5                 -- VPT bandwidth ablation c=0.5
- 34. VPT-BW-1.0                 -- VPT bandwidth ablation c=1.0
- 35. VPT-BW-2.0                 -- VPT bandwidth ablation c=2.0
+ 17. Bayesian-Attention         -- query-dependent attention weights (5-fold CV)
+ 18. Bayesian-Attn-Norm         -- attention + logit normalization + 7 features (5-fold CV)
+ 19. Bayesian-MultiHead         -- 4-head attention fusion (5-fold CV)
+ 20. Bayesian-MultiHead-Norm    -- MultiHead + normalize + rich features (5-fold CV)
+ 21. Bayesian-MultiField        -- MultiFieldScorer (title + body), sparse-only
+ 22. Bayesian-MultiField-Bal    -- MultiField + dense via balanced fusion
+ 23. Bayesian-Vector-Balanced   -- VPT-calibrated dense + balanced fusion
+ 24. Bayesian-Vector-Softplus   -- VPT-calibrated dense + softplus gating
+ 25. Bayesian-Vector-Attn       -- VPT-calibrated dense + attention fusion (5-fold CV)
+ 26. Dense-Kappa                -- global sigmoid calibration (Paper 3, Stage 1)
+ 27. Dense-Arctan               -- arctangent normalization baseline
+ 28. Dense-Platt                -- supervised Platt scaling baseline (5-fold CV)
+ 29. VPT-DensityPrior           -- VPT with IVF density prior only (Stage 6a)
+ 30. VPT-BM25Weights            -- VPT with BM25 weights only (Stage 6b)
+ 31. VPT-BW-0.2                 -- VPT bandwidth ablation c=0.2 (Stage 7)
+ 32. VPT-BW-0.5                 -- VPT bandwidth ablation c=0.5
+ 33. VPT-BW-1.0                 -- VPT bandwidth ablation c=1.0
+ 34. VPT-BW-2.0                 -- VPT bandwidth ablation c=2.0
 
-With --tune, additional tuned methods are evaluated:
+With --tune, additional tuned methods are evaluated on datasets that
+ship training qrels (parameters are tuned on the training queries only):
 
- 36. Bayesian-Tuned             -- tuned alpha, beta, base_rate
- 37. Bayesian-Balanced-Tuned    -- balanced fusion with tuned weight
- 38. Bayesian-Hybrid-AND-Tuned  -- log-odds conjunction with tuned alpha
+ 35. Bayesian-Tuned             -- tuned alpha, beta, base_rate
+ 36. Bayesian-Balanced-Tuned    -- balanced fusion with tuned weight
+ 37. Bayesian-Hybrid-AND-Tuned  -- log-odds conjunction with tuned alpha
 
 Dependencies:
     pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-0.5
@@ -69,29 +89,34 @@ Usage:
     python hybrid_beir.py -d ../../beir --download --datasets scifact
     python hybrid_beir.py -d ../../beir --cache-dir /tmp/emb_cache
     python hybrid_beir.py -d ../../beir --no-cache
+    python hybrid_beir.py -d ../../beir --keep-identical-ids
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import time
 import urllib.request
 import zipfile
+from functools import lru_cache
 
 import bm25s
 import numpy as np
 import Stemmer
 
+from bayesian_bm25.calibration import PlattCalibrator
+from bayesian_bm25.calibration_context import CalibrationContext
 from bayesian_bm25.fusion import (
     AttentionLogOddsWeights,
     MultiHeadAttentionLogOddsWeights,
     balanced_log_odds_fusion,
     cosine_to_probability,
-    log_odds_conjunction,
+    log_odds_fusion,
+    log_odds_or,
 )
-from bayesian_bm25.metrics import calibration_report
 from bayesian_bm25.multi_field import MultiFieldScorer
 from bayesian_bm25.probability import (
     BayesianProbabilityTransform,
@@ -104,6 +129,10 @@ from bayesian_bm25.vector_probability import (
     VectorProbabilityTransform,
     ivf_density_prior,
 )
+from benchmarks.calibration_accumulator import CalibrationAccumulator
+from benchmarks.dataset_identity import canonicalize_qrels
+from benchmarks.ranking_eval import evaluate_run, mean_metrics, ranked_run
+from benchmarks.reference_vector import reference_vector_log_odds
 from benchmarks.search_diagnostics import (
     build_exact_search_diagnostics,
     build_ivf_search_diagnostics,
@@ -112,6 +141,33 @@ from benchmarks.search_diagnostics import (
 from benchmarks.simple_ivf import IVFSearchResult, SimpleIVF
 
 STEMMER = Stemmer.Stemmer("english")
+DEFAULT_DATASETS = ("arguana", "fiqa", "nfcorpus", "scidocs", "scifact")
+DEFAULT_DENSE_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_BEIR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "beir")
+REQUIRED_DATASET_FILES = ("corpus.jsonl", "queries.jsonl", "qrels/test.tsv")
+
+
+def validate_dataset_inputs(beir_dir: str | os.PathLike[str], datasets: list[str]) -> None:
+    """Require every requested collection before running any of them."""
+    if not datasets:
+        raise ValueError("at least one dataset is required")
+    if len(set(datasets)) != len(datasets):
+        raise ValueError("dataset names must be unique")
+    missing = [
+        os.path.join(beir_dir, name, relative)
+        for name in datasets
+        for relative in REQUIRED_DATASET_FILES
+        if not os.path.isfile(os.path.join(beir_dir, name, relative))
+    ]
+    if missing:
+        paths = "\n".join(missing)
+        raise FileNotFoundError(f"Required BEIR inputs are missing:\n{paths}")
+
+# Log-odds given to a candidate that matches no query term wherever a
+# fusion needs a finite lexical value: the logit of the probability
+# clamp, 1e-10.  The first version reached the same value by clamping a
+# probability of 0.
+UNMATCHED_LOG_ODDS = float(logit(1e-10))
 
 BEIR_BASE_URL = (
     "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets"
@@ -191,7 +247,7 @@ def download_beir_dataset(dataset_name: str, beir_dir: str) -> str:
 # BEIR data loading
 # ---------------------------------------------------------------------------
 
-def load_beir_dataset(dataset_dir: str) -> dict:
+def load_beir_dataset(dataset_dir: str, *, identity: str = "text") -> dict:
     """Load a BEIR dataset from local jsonl/tsv files.
 
     Expected layout:
@@ -251,7 +307,9 @@ def load_beir_dataset(dataset_dir: str) -> dict:
             filtered_qids.append(qid)
             filtered_qtexts.append(qtext)
 
-    return {
+    from benchmarks.dataset_identity import canonicalize_dataset
+
+    return canonicalize_dataset({
         "corpus_ids": corpus_ids,
         "corpus_texts": corpus_texts,
         "corpus_titles": corpus_titles,
@@ -261,7 +319,7 @@ def load_beir_dataset(dataset_dir: str) -> dict:
         "qrels": qrels,
         "all_query_ids": query_ids,
         "all_query_texts": query_texts,
-    }
+    }, identity=identity)
 
 
 def load_qrels_from_tsv(path: str) -> dict[str, dict[str, int]]:
@@ -279,6 +337,29 @@ def load_qrels_from_tsv(path: str) -> dict[str, dict[str, int]]:
             qid, did, score = parts[0], parts[1], int(parts[2])
             qrels.setdefault(qid, {})[did] = score
     return qrels
+
+
+def training_qrels_for_dataset(data: dict, qrels: dict) -> dict:
+    """Canonicalize train judgments and exclude every evaluated query alias."""
+    merged = canonicalize_qrels(qrels, data["query_alias_to_id"], data["corpus_alias_to_id"])
+    evaluated = set(data["query_ids"])
+    available = set(data["all_query_ids"])
+    return {qid: judgments for qid, judgments in merged.items()
+            if qid in available and qid not in evaluated}
+
+
+def posterior_context(method: str) -> CalibrationContext:
+    """The actual evaluation population of each historical posterior variant."""
+    return CalibrationContext(
+        reference_population=(
+            "query_excluded_multifield_list" if method == "Bayesian-MultiField"
+            else "query_excluded_lexical_dense_union"
+        ),
+        count_source="not_count_constrained",
+        slope_source=("training_folds" if method == "Dense-Platt" or "Att" in method
+                      or "Head" in method else "score_shape_assumption"),
+        ceiling_source="not_applicable", relevance_target="judged_relevance",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -300,20 +381,29 @@ def tokenize_texts(texts: list[str]) -> list[list[str]]:
 # Dense encoding with embedding cache
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=1)
+def _dense_encoder(model_name: str):
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(model_name)
+
+
 def encode_dense(
     texts: list[str],
     model_name: str,
     cache_path: str | None = None,
     cache_key: str = "embeddings",
     batch_size: int = 128,
+    cache_context: dict | None = None,
 ) -> np.ndarray:
     """Encode texts with sentence-transformers, with .npz caching.
 
     Returns L2-normalized embeddings of shape (len(texts), dim).
 
     When *cache_path* is given, the function first checks for a cached
-    array under *cache_key*.  A cache hit requires both the key to exist
-    and the row count to match ``len(texts)``.
+    array under *cache_key*. A hit requires the exact text order, model
+    name, and cache context to match a recorded fingerprint. An archive
+    without fingerprints is re-encoded rather than trusted by row count.
 
     Parameters
     ----------
@@ -335,21 +425,27 @@ def encode_dense(
     np.ndarray
         L2-normalized embeddings of shape ``(len(texts), dim)``.
     """
+    digest = hashlib.sha256(json.dumps(
+        {"model": model_name, "context": cache_context}, sort_keys=True,
+    ).encode("utf-8"))
+    for text in texts:
+        encoded = text.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    fingerprint = digest.hexdigest()
+    fingerprint_key = f"{cache_key}_fingerprint"
     if cache_path and os.path.exists(cache_path):
-        data = np.load(cache_path)
-        if cache_key in data:
-            emb = data[cache_key]
-            if emb.shape[0] == len(texts):
-                print(f"    {cache_key}: cache hit "
-                      f"({emb.shape[0]} x {emb.shape[1]}, {cache_path})")
-                return emb
-            print(f"    {cache_key}: cache stale "
-                  f"(cached {emb.shape[0]} != current {len(texts)}), re-encoding")
-
-    from sentence_transformers import SentenceTransformer
+        with np.load(cache_path) as data:
+            if cache_key in data and fingerprint_key in data:
+                emb = data[cache_key]
+                if str(data[fingerprint_key]) == fingerprint and emb.shape[0] == len(texts):
+                    print(f"    {cache_key}: cache hit "
+                          f"({emb.shape[0]} x {emb.shape[1]}, {cache_path})")
+                    return emb
+            print(f"    {cache_key}: cache fingerprint mismatch, re-encoding")
 
     print(f"    {cache_key}: encoding {len(texts)} texts with {model_name} ...")
-    model = SentenceTransformer(model_name)
+    model = _dense_encoder(model_name)
     emb = model.encode(
         texts,
         batch_size=batch_size,
@@ -361,11 +457,14 @@ def encode_dense(
     if cache_path:
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
         if os.path.exists(cache_path):
-            existing = dict(np.load(cache_path))
-            existing[cache_key] = emb
-            np.savez(cache_path, **existing)
+            with np.load(cache_path) as data:
+                existing = dict(data)
         else:
-            np.savez(cache_path, **{cache_key: emb})
+            existing = {}
+        existing[cache_key] = emb
+        existing[fingerprint_key] = np.asarray(fingerprint)
+        existing[f"{cache_key}_context"] = np.asarray(json.dumps(cache_context, sort_keys=True))
+        np.savez(cache_path, **existing)
         print(f"    {cache_key}: saved to cache ({cache_path})")
 
     return emb
@@ -411,6 +510,37 @@ def _apply_bm25_transform(
     return probs
 
 
+def _apply_bm25_log_odds(
+    transform: BayesianProbabilityTransform,
+    scores: np.ndarray,
+    active: np.ndarray,
+    tfs: np.ndarray,
+    doc_len_ratios: np.ndarray,
+) -> np.ndarray:
+    """Posterior log-odds of a Bayesian BM25 transform on a precomputed subset.
+
+    The log-odds are assembled directly, without passing through a
+    probability, so they are neither rounded nor clamped.  A candidate
+    that matches no query term has probability 0, hence log-odds -inf.
+    """
+    log_odds = np.full(len(scores), -np.inf, dtype=np.float64)
+    if np.any(active):
+        log_odds[active] = transform.score_to_log_odds(
+            scores[active], tfs[active], doc_len_ratios[active],
+        )
+    return log_odds
+
+
+def _with_unmatched_floor(log_odds: np.ndarray) -> np.ndarray:
+    """Replace the -inf of lexical non-matches by a finite floor."""
+    return np.where(np.isfinite(log_odds), log_odds, UNMATCHED_LOG_ODDS)
+
+
+def _dense_log_odds(dense_sim: np.ndarray) -> np.ndarray:
+    """Log-odds of the linear cosine-to-probability map, logit((1 + cos) / 2)."""
+    return np.asarray(logit(cosine_to_probability(dense_sim)), dtype=np.float64)
+
+
 def _retrieve_dense_candidates(
     query_vec: np.ndarray,
     corpus_emb: np.ndarray,
@@ -419,13 +549,30 @@ def _retrieve_dense_candidates(
     dense_backend: str,
     dense_index: SimpleIVF | None = None,
     ivf_nprobe: int | None = None,
+    exclude_idx: int | np.ndarray | None = None,
 ) -> dict[str, np.ndarray | IVFSearchResult | None]:
-    """Retrieve dense candidates using either exact scan or SimpleIVF."""
+    """Retrieve dense candidates using either exact scan or SimpleIVF.
+
+    When ``exclude_idx`` is given, that document is removed from the
+    result list and from the scores returned for background estimation,
+    so it can enter neither the candidates nor any calibration
+    statistic.
+    """
     if dense_backend == "exact":
         dense_scores_full = np.asarray(
             query_vec @ corpus_emb.T, dtype=np.float64,
         )
-        top_idx = np.argsort(-dense_scores_full)[:retrieve_k]
+        ranking_scores = dense_scores_full
+        background_scores = dense_scores_full
+        if exclude_idx is not None:
+            ranking_scores = dense_scores_full.copy()
+            ranking_scores[exclude_idx] = -np.inf
+            background_scores = np.delete(dense_scores_full, exclude_idx)
+        # Stable sort: documents with equal scores keep corpus order, so
+        # the ranks that reciprocal rank fusion consumes are deterministic.
+        top_idx = np.argsort(-ranking_scores, kind="stable")[:retrieve_k]
+        if exclude_idx is not None:
+            top_idx = top_idx[~np.isin(top_idx, exclude_idx)]
         top_scores = dense_scores_full[top_idx]
         return {
             "top_idx": np.asarray(top_idx, dtype=np.int32),
@@ -433,7 +580,8 @@ def _retrieve_dense_candidates(
             "sample_idx": np.asarray(top_idx, dtype=np.int32),
             "sample_scores": np.asarray(top_scores, dtype=np.float64),
             "sample_cell_populations": None,
-            "full_scores": dense_scores_full,
+            "full_scores": background_scores,
+            "all_scores": dense_scores_full,
             "search_result": None,
         }
 
@@ -442,7 +590,24 @@ def _retrieve_dense_candidates(
             f"dense_backend must be 'exact' or 'ivf', got {dense_backend!r}",
         )
 
-    search = dense_index.search(query_vec, retrieve_k, nprobe=ivf_nprobe)
+    extra = 0 if exclude_idx is None else np.atleast_1d(exclude_idx).size
+    search = dense_index.search(query_vec, retrieve_k + extra, nprobe=ivf_nprobe)
+    if exclude_idx is not None:
+        keep = ~np.isin(search.indices, exclude_idx)
+        candidate_keep = ~np.isin(search.candidate_indices, exclude_idx)
+        search = IVFSearchResult(
+            indices=search.indices[keep][:retrieve_k],
+            scores=search.scores[keep][:retrieve_k],
+            cell_ids=search.cell_ids[keep][:retrieve_k],
+            cell_populations=search.cell_populations[keep][:retrieve_k],
+            candidate_indices=search.candidate_indices[candidate_keep],
+            candidate_scores=search.candidate_scores[candidate_keep],
+            candidate_cell_ids=search.candidate_cell_ids[candidate_keep],
+            candidate_cell_populations=search.candidate_cell_populations[candidate_keep],
+            probed_cell_ids=search.probed_cell_ids,
+            probed_cell_scores=search.probed_cell_scores,
+            centroid_scores=search.centroid_scores,
+        )
     return {
         "top_idx": search.indices,
         "top_scores": search.scores,
@@ -450,6 +615,7 @@ def _retrieve_dense_candidates(
         "sample_scores": search.scores,
         "sample_cell_populations": search.cell_populations,
         "full_scores": None,
+        "all_scores": None,
         "search_result": search,
     }
 
@@ -530,30 +696,24 @@ def _combine_vpt_sample_guidance(
     )
 
 
-def _blend_probability_signal(
-    base_probs: np.ndarray,
-    refined_probs: np.ndarray,
+def _blend_log_odds_signal(
+    base_log_odds: np.ndarray,
+    refined_log_odds: np.ndarray,
     gate: float,
-    *,
-    max_logit: float = 10.0,
 ) -> np.ndarray:
-    """Blend refined probabilities back toward a safer base signal."""
-    base_probs = np.asarray(base_probs, dtype=np.float64)
-    refined_probs = np.asarray(refined_probs, dtype=np.float64)
+    """Blend refined log-odds back toward a safer base signal."""
     gate = float(np.clip(gate, 0.0, 1.0))
-    base_logits = np.asarray(logit(_clamp_probability(base_probs)), dtype=np.float64)
-    refined_logits = np.asarray(
-        logit(_clamp_probability(refined_probs)), dtype=np.float64,
-    )
-    logits = (1.0 - gate) * base_logits + gate * refined_logits
-    return np.asarray(
-        sigmoid(np.clip(logits, -max_logit, max_logit)),
-        dtype=np.float64,
+    return (1.0 - gate) * np.asarray(base_log_odds, dtype=np.float64) + gate * np.asarray(
+        refined_log_odds, dtype=np.float64,
     )
 
 
 # ---------------------------------------------------------------------------
 # Fusion methods (operate on candidate-level arrays)
+#
+# Every Bayesian fusion returns log-odds (or a fusion score), never a
+# probability: the final sigmoid of the first version rounded every
+# strong candidate to exactly 1 and left their order to tie-breaking.
 # ---------------------------------------------------------------------------
 
 def fusion_convex(
@@ -582,13 +742,36 @@ def fusion_rrf(
 
 
 def fusion_bayesian_bm25_or(
-    bayesian_probs: np.ndarray,
+    bayesian_log_odds: np.ndarray,
     dense_sim: np.ndarray,
 ) -> np.ndarray:
-    """Probabilistic OR: 1 - (1-p_sparse)*(1-p_dense)."""
-    dense_probs = np.asarray(cosine_to_probability(dense_sim), dtype=np.float64)
-    sparse = np.asarray(bayesian_probs, dtype=np.float64)
-    return 1.0 - (1.0 - sparse) * (1.0 - dense_probs)
+    """Probabilistic OR, 1 - (1-p_sparse)*(1-p_dense), as log-odds.
+
+    A candidate with no lexical match has sparse log-odds -inf
+    (probability 0), for which the disjunction reduces to the dense
+    term.
+    """
+    return np.asarray(
+        log_odds_or(np.column_stack([bayesian_log_odds, _dense_log_odds(dense_sim)])),
+        dtype=np.float64,
+    )
+
+
+def _two_signal_conjunction(
+    logit_dense: np.ndarray,
+    logit_sparse: np.ndarray,
+    has_sparse: np.ndarray,
+) -> np.ndarray:
+    """Log-odds conjunction of two signals with square-root-of-n scaling.
+
+    Candidates with a lexical match get the conjunction of both signals,
+    n^0.5 times the mean log-odds.  Candidates without one are scored by
+    the dense term alone at half weight, as in the first version.
+    """
+    scale = 2.0 ** 0.5
+    both = (0.5 * logit_dense + 0.5 * logit_sparse) * scale
+    dense_only = 0.5 * logit_dense
+    return np.where(has_sparse, both, dense_only)
 
 
 def fusion_bayesian_bm25_logodds(
@@ -600,46 +783,26 @@ def fusion_bayesian_bm25_logodds(
     dense_sim: np.ndarray,
     dense_median: float,
     dense_alpha: float,
+    base_rate: float | None = None,
 ) -> np.ndarray:
     """Per-query calibrated log-odds fusion (Theorem 7.1.1).
 
     Full BM25 posterior is assembled directly in logit space:
-        logit(L) + logit(prior)
-    avoiding the prob->logit round-trip.  Sigmoid once at the end.
+        logit(L) + logit(prior) [+ logit(base_rate)]
+    and the fused log-odds are returned as they are.
     """
-    from bayesian_bm25.probability import (
-        BayesianProbabilityTransform,
-    )
-    from bayesian_bm25.probability import (
-        sigmoid as _sigmoid,
-    )
-
-    n_signals = 2
-    alpha = 0.5
-    scale = n_signals ** alpha
-    w_dense = 0.5
-    w_sparse = 0.5
-
-    logit_d = np.clip(
-        dense_alpha * (dense_sim - dense_median), -500.0, 500.0,
-    )
+    logit_d = dense_alpha * (dense_sim - dense_median)
 
     # BM25 evidence: logit(L) + logit(prior) in logit space directly
     logit_likelihood = bm25_alpha * (bm25_scores - bm25_beta)
     prior = BayesianProbabilityTransform.composite_prior(
         tfs, doc_len_ratios,
     )
-    logit_prior = np.asarray(logit(prior), dtype=np.float64)
-    logit_s = np.clip(logit_likelihood + logit_prior, -500.0, 500.0)
+    logit_s = logit_likelihood + np.asarray(logit(prior), dtype=np.float64)
+    if base_rate is not None:
+        logit_s = logit_s + float(logit(base_rate))
 
-    has_sparse = bm25_scores > 0
-
-    l_bar = w_dense * logit_d + w_sparse * logit_s
-    scores_both = l_bar * scale
-    scores_dense_only = logit_d * w_dense
-
-    raw = np.where(has_sparse, scores_both, scores_dense_only)
-    return np.asarray(_sigmoid(raw), dtype=np.float64)
+    return _two_signal_conjunction(logit_d, logit_s, bm25_scores > 0)
 
 
 def fusion_logodds_local(
@@ -652,84 +815,13 @@ def fusion_logodds_local(
 ) -> np.ndarray:
     """Symmetric log-odds fusion: both signals calibrated at candidate level.
 
-    Instead of converting BM25 -> Bayesian BM25 probability -> logit (which
-    saturates), calibrate raw BM25 scores the same way as dense:
-    logit = alpha*(s - median).  Returns probabilities via sigmoid.
+    Raw BM25 scores are calibrated the same way as dense similarities,
+    logit = alpha*(s - median) with the statistics of the candidate
+    pool.  Returns fused log-odds.
     """
-    from bayesian_bm25.probability import sigmoid as _sigmoid
-
-    n_signals = 2
-    alpha = 0.5
-    scale = n_signals ** alpha
-    w_dense = 0.5
-    w_sparse = 0.5
-
-    logit_d = np.clip(dense_alpha * (dense_sim - dense_median), -500.0, 500.0)
-    logit_s = np.clip(bm25_alpha * (bm25_scores - bm25_median), -500.0, 500.0)
-
-    has_sparse = bm25_scores > 0
-
-    l_bar = w_dense * logit_d + w_sparse * logit_s
-    scores_both = l_bar * scale
-    scores_dense_only = logit_d * w_dense
-
-    raw = np.where(has_sparse, scores_both, scores_dense_only)
-    return np.asarray(_sigmoid(raw), dtype=np.float64)
-
-
-def fusion_bayesian_bm25_logodds_br(
-    bm25_scores: np.ndarray,
-    bm25_alpha: float,
-    bm25_beta: float,
-    base_rate: float,
-    tfs: np.ndarray,
-    doc_len_ratios: np.ndarray,
-    dense_sim: np.ndarray,
-    dense_median: float,
-    dense_alpha: float,
-) -> np.ndarray:
-    """Log-odds fusion with base rate prior (Theorem 7.1.1).
-
-    Full BM25 posterior assembled directly in logit space:
-        logit(L) + logit(prior) + logit(base_rate)
-    Sigmoid applied once at the end.
-    """
-    from bayesian_bm25.probability import (
-        BayesianProbabilityTransform,
-    )
-    from bayesian_bm25.probability import (
-        sigmoid as _sigmoid,
-    )
-
-    n_signals = 2
-    alpha = 0.5
-    scale = n_signals ** alpha
-    w_dense = 0.5
-    w_sparse = 0.5
-
-    logit_base = float(logit(base_rate))
-
-    logit_d = np.clip(
-        dense_alpha * (dense_sim - dense_median), -500.0, 500.0,
-    )
-
-    logit_likelihood = bm25_alpha * (bm25_scores - bm25_beta)
-    prior = BayesianProbabilityTransform.composite_prior(
-        tfs, doc_len_ratios,
-    )
-    logit_prior = np.asarray(logit(prior), dtype=np.float64)
-    logit_s = np.clip(
-        logit_likelihood + logit_prior + logit_base, -500.0, 500.0,
-    )
-
-    has_sparse = bm25_scores > 0
-
-    l_bar = w_dense * logit_d + w_sparse * logit_s
-    scores_both = l_bar * scale
-    scores_dense_only = logit_d * w_dense
-
-    raw = np.where(has_sparse, scores_both, scores_dense_only)
-    return np.asarray(_sigmoid(raw), dtype=np.float64)
+    logit_d = dense_alpha * (dense_sim - dense_median)
+    logit_s = bm25_alpha * (bm25_scores - bm25_median)
+    return _two_signal_conjunction(logit_d, logit_s, bm25_scores > 0)
 
 
 def _min_max_normalize(arr: np.ndarray) -> np.ndarray:
@@ -741,61 +833,41 @@ def _min_max_normalize(arr: np.ndarray) -> np.ndarray:
     return (arr - lo) / (hi - lo)
 
 
-def _arctan_normalize(scores: np.ndarray, alpha: float = 5.0) -> np.ndarray:
-    """Arctangent normalization: p = (2/pi) * arctan(alpha * s).
+def _arctan_log_odds(scores: np.ndarray, alpha: float = 5.0) -> np.ndarray:
+    """Arctangent normalization, p = (2/pi) * arctan(alpha * s), as log-odds.
 
     Paper 3, Section 8.2 baseline.  Maps similarity scores to [0, 1]
     via the arctan function.  The scaling parameter alpha controls the
-    steepness of the transition.
+    steepness of the transition.  A non-positive similarity maps to a
+    non-positive value, which is clamped to the smallest probability.
     """
-    return (2.0 / np.pi) * np.arctan(alpha * np.asarray(scores, dtype=np.float64))
+    probabilities = (2.0 / np.pi) * np.arctan(alpha * np.asarray(scores, dtype=np.float64))
+    return np.asarray(logit(_clamp_probability(probabilities)), dtype=np.float64)
 
 
-def _global_kappa_calibrate(
+def _global_kappa_log_odds(
     distances: np.ndarray,
     *,
-    kappa: float | None = None,
-    beta: float | None = None,
+    kappa: float,
+    beta: float,
 ) -> np.ndarray:
-    """Global sigmoid calibration: P = sigmoid(kappa * (s - beta)).
+    """Global sigmoid calibration, P = sigmoid(kappa * (beta - d)), as log-odds.
 
     Paper 3, Section 8.4 Stage 1 baseline.  Applies a corpus-level
-    sigmoid to cosine distances (converted to similarities).
+    location and scale to cosine distances.
 
     Parameters
     ----------
     distances : array
         Cosine distances d = 1 - s.
-    kappa : float or None
-        Sigmoid steepness.  If None, estimated as 1 / std(d).
-    beta : float or None
-        Sigmoid midpoint.  If None, estimated as median(d).
+    kappa : float
+        Sigmoid steepness, 1 / std of the background distances.
+    beta : float
+        Sigmoid midpoint, the median background distance.
     """
     d = np.asarray(distances, dtype=np.float64)
-    if beta is None:
-        beta = float(np.median(d))
-    if kappa is None:
-        std = float(np.std(d))
-        kappa = 1.0 / std if std > 1e-12 else 1.0
-    # Negative sign: smaller distance = higher probability
-    return np.asarray(sigmoid(kappa * (beta - d)), dtype=np.float64)
-
-
-def _platt_calibrate_dense(
-    train_scores: np.ndarray,
-    train_labels: np.ndarray,
-    eval_scores: np.ndarray,
-) -> np.ndarray:
-    """Platt scaling for dense similarity scores.
-
-    Paper 3, Section 8.2 baseline.  Supervised sigmoid calibration
-    using (a, b) fitted on training data.
-    """
-    from bayesian_bm25.calibration import PlattCalibrator
-
-    calibrator = PlattCalibrator()
-    calibrator.fit(train_scores, train_labels)
-    return np.asarray(calibrator.calibrate(eval_scores), dtype=np.float64)
+    # Negative sign: smaller distance = higher log-odds
+    return kappa * (beta - d)
 
 
 def _compute_dense_calibration(dense_sim: np.ndarray) -> tuple[float, float]:
@@ -810,41 +882,46 @@ def _compute_dense_calibration(dense_sim: np.ndarray) -> tuple[float, float]:
 
 
 def fusion_vpt_balanced(
-    sparse_probs: np.ndarray,
-    vpt_dense_probs: np.ndarray,
+    sparse_log_odds: np.ndarray,
+    vpt_dense_log_odds: np.ndarray,
     *,
     sparse_weight: float = 1.0,
     dense_weight: float = 1.0,
-    max_logit: float = 12.0,
 ) -> np.ndarray:
-    """Additive log-odds fusion with VPT-calibrated dense probabilities.
+    """Additive log-odds fusion with VPT-calibrated dense log-odds.
 
     This keeps the benchmark closer to the paper's posterior view:
     lexical log-odds evidence plus vector log-density-ratio evidence.
+    The dense term is scaled down when it is more dispersed than the
+    lexical one.  Returns fused log-odds; nothing is clipped.
     """
-    logit_sparse = np.asarray(
-        logit(_clamp_probability(sparse_probs)), dtype=np.float64,
-    )
-    logit_dense = np.asarray(
-        logit(_clamp_probability(vpt_dense_probs)), dtype=np.float64,
-    )
-    logit_sparse = np.clip(logit_sparse, -max_logit, max_logit)
-    logit_dense = np.clip(logit_dense, -max_logit, max_logit)
+    logit_sparse = np.asarray(sparse_log_odds, dtype=np.float64)
+    logit_dense = np.asarray(vpt_dense_log_odds, dtype=np.float64)
 
     sparse_std = max(float(np.std(logit_sparse)), 1e-6)
     dense_std = max(float(np.std(logit_dense)), 1e-6)
     dense_scale = dense_weight * min(1.0, sparse_std / dense_std)
 
-    fused_logit = sparse_weight * logit_sparse + dense_scale * logit_dense
-    return np.asarray(
-        sigmoid(np.clip(fused_logit, -max_logit, max_logit)),
-        dtype=np.float64,
-    )
+    return sparse_weight * logit_sparse + dense_scale * logit_dense
 
 
 # ---------------------------------------------------------------------------
 # Auto-tuning functions
 # ---------------------------------------------------------------------------
+
+def _cached_log_odds(
+    cache: dict,
+    transform: BayesianProbabilityTransform,
+) -> np.ndarray:
+    """Lexical posterior log-odds of a cached candidate set (-inf if unmatched)."""
+    active = cache["active"]
+    log_odds = np.full(len(cache["union_idx"]), -np.inf, dtype=np.float64)
+    if np.any(active):
+        log_odds[active] = transform.score_to_log_odds(
+            cache["active_scores"], cache["tfs"], cache["doc_len_ratios"],
+        )
+    return log_odds
+
 
 def _compute_bayesian_run_from_cache(
     tune_cache: dict[str, dict],
@@ -854,17 +931,10 @@ def _compute_bayesian_run_from_cache(
     """Build a pytrec_eval run dict from cached per-query data."""
     run: dict[str, dict[str, float]] = {}
     for qid, cache in tune_cache.items():
-        union_idx = cache["union_idx"]
-        active = cache["active"]
-        probs = np.zeros(len(union_idx), dtype=np.float64)
-        if np.any(active):
-            probs[active] = transform.score_to_probability(
-                cache["active_scores"], cache["tfs"], cache["doc_len_ratios"],
-            )
-        run[qid] = {
-            corpus_ids[union_idx[j]]: float(probs[j])
-            for j in range(len(union_idx))
-        }
+        run[qid] = ranked_run(
+            [corpus_ids[i] for i in cache["union_idx"]],
+            _cached_log_odds(cache, transform),
+        )
     return run
 
 
@@ -877,22 +947,16 @@ def _compute_balanced_run_from_cache(
     """Build a balanced fusion run dict from cached per-query data."""
     run: dict[str, dict[str, float]] = {}
     for qid, cache in tune_cache.items():
-        union_idx = cache["union_idx"]
-        active = cache["active"]
-        cand_dense = cache["cand_dense"]
-        probs = np.zeros(len(union_idx), dtype=np.float64)
-        if np.any(active):
-            probs[active] = transform.score_to_probability(
-                cache["active_scores"], cache["tfs"], cache["doc_len_ratios"],
-            )
         fused = np.asarray(
-            balanced_log_odds_fusion(probs, cand_dense, weight),
+            balanced_log_odds_fusion(
+                _with_unmatched_floor(_cached_log_odds(cache, transform)),
+                cache["cand_dense"],
+                weight,
+                from_log_odds=True,
+            ),
             dtype=np.float64,
         )
-        run[qid] = {
-            corpus_ids[union_idx[j]]: float(fused[j])
-            for j in range(len(union_idx))
-        }
+        run[qid] = ranked_run([corpus_ids[i] for i in cache["union_idx"]], fused)
     return run
 
 
@@ -905,26 +969,14 @@ def _compute_hybrid_and_run_from_cache(
     """Build a log-odds conjunction run dict from cached per-query data."""
     run: dict[str, dict[str, float]] = {}
     for qid, cache in tune_cache.items():
-        union_idx = cache["union_idx"]
-        active = cache["active"]
-        cand_dense = cache["cand_dense"]
-        probs = np.zeros(len(union_idx), dtype=np.float64)
-        if np.any(active):
-            probs[active] = transform.score_to_probability(
-                cache["active_scores"], cache["tfs"], cache["doc_len_ratios"],
-            )
-        dense_probs = np.asarray(
-            cosine_to_probability(cand_dense), dtype=np.float64,
+        signals = np.column_stack([
+            _with_unmatched_floor(_cached_log_odds(cache, transform)),
+            _dense_log_odds(cache["cand_dense"]),
+        ])
+        fused = np.asarray(
+            log_odds_fusion(signals, alpha=hybrid_alpha), dtype=np.float64,
         )
-        n_cand = len(union_idx)
-        combined = np.zeros(n_cand, dtype=np.float64)
-        for d in range(n_cand):
-            pair = np.array([probs[d], dense_probs[d]])
-            combined[d] = float(log_odds_conjunction(pair, alpha=hybrid_alpha))
-        run[qid] = {
-            corpus_ids[union_idx[j]]: float(combined[j])
-            for j in range(len(union_idx))
-        }
+        run[qid] = ranked_run([corpus_ids[i] for i in cache["union_idx"]], fused)
     return run
 
 
@@ -1144,303 +1196,255 @@ def evaluate_pytrec(
     run: dict[str, dict[str, float]],
     k: int = 10,
 ) -> dict[str, float]:
-    import pytrec_eval
-
-    measures = {f"ndcg_cut_{k}", f"map_cut_{k}", f"recall_{k}"}
-    evaluator = pytrec_eval.RelevanceEvaluator(qrels, measures)
-    results = evaluator.evaluate(run)
-
-    ndcg_scores = []
-    map_scores = []
-    recall_scores = []
-    for qid in results:
-        ndcg_scores.append(results[qid][f"ndcg_cut_{k}"])
-        map_scores.append(results[qid][f"map_cut_{k}"])
-        recall_scores.append(results[qid][f"recall_{k}"])
-
-    return {
-        f"NDCG@{k}": float(np.mean(ndcg_scores)),
-        f"MAP@{k}": float(np.mean(map_scores)),
-        f"Recall@{k}": float(np.mean(recall_scores)),
-    }
+    """Mean NDCG@k, MAP@k and Recall@k of a run over the queries of ``qrels``."""
+    return mean_metrics(evaluate_run(qrels, run, k=k))
 
 
 # ---------------------------------------------------------------------------
-# Attention variant helpers
+# Learned fusion weights (cross-validated over queries)
 # ---------------------------------------------------------------------------
 
 
-def _prepare_attn_probs(
-    probs_br: np.ndarray,
-    cand_dense: np.ndarray,
-    probs_no_br: np.ndarray | None = None,
-    dense_probs_override: np.ndarray | None = None,
-) -> tuple[np.ndarray, ...]:
-    """Prepare raw probability signals for attention.
+def _normalize_columns(x: np.ndarray) -> np.ndarray:
+    """Min-max normalize each column over the rows (one query's candidates)."""
+    result = np.empty_like(x)
+    for col in range(x.shape[1]):
+        result[:, col] = _min_max_normalize(x[:, col])
+    return result
 
-    Normalization is handled by the model when ``normalize=True`` is set
-    on the ``AttentionLogOddsWeights`` constructor.
 
-    When probs_no_br is provided, returns 3 signals (BM25-BR, dense,
-    BM25-no-BR).  Otherwise returns 2 signals.
+def _attention_signals(
+    cache: dict,
+    dense_key: str,
+    normalize: bool,
+) -> np.ndarray:
+    """Signal matrix of one query's candidates for the attention models.
 
-    When dense_probs_override is provided, it is used directly instead
-    of converting cand_dense via cosine_to_probability (for VPT).
+    Columns are the lexical posterior log-odds (with base rate) and the
+    dense log-odds stored under ``dense_key``.  With ``normalize`` each
+    column is min-max normalized over the query's full candidate set.
+    Normalizing here, before any rows are selected for training, makes
+    the training rows see exactly the values the model is later scored
+    on; normalizing the handful of sampled training rows among
+    themselves would not.
     """
-    if dense_probs_override is not None:
-        dense_probs = np.asarray(dense_probs_override, dtype=np.float64)
-    else:
-        dense_probs = np.asarray(
-            cosine_to_probability(cand_dense), dtype=np.float64,
-        )
-    if probs_no_br is not None:
-        return probs_br, dense_probs, probs_no_br
-    return probs_br, dense_probs
+    signals = np.column_stack([cache["cand_log_odds_br"], cache[dense_key]])
+    return _normalize_columns(signals) if normalize else signals
 
 
-def _collect_attn_training_data(
+def _collect_attention_training_data(
     attn_cache: dict,
-    corpus_ids: list,
-    qrels: dict,
+    train_qids: list[str],
     feature_key: str,
+    dense_key: str,
+    normalize: bool,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Collect (signals, labels, query features) from the training queries.
+
+    Positives are the judged candidates of each query.  BEIR qrels list
+    almost only relevant documents, so an equal number of unjudged
+    candidates is sampled per query as negatives.
+    """
+    rows: list[np.ndarray] = []
+    labels: list[float] = []
+    features: list[np.ndarray] = []
+
+    for qid in train_qids:
+        cache = attn_cache[qid]
+        signals = _attention_signals(cache, dense_key, normalize)
+        judged = np.flatnonzero(cache["cand_judged"])
+        unjudged = np.flatnonzero(~cache["cand_judged"])
+        relevant = cache["cand_labels"]
+
+        n_neg = min(int(np.sum(relevant[judged] > 0)), len(unjudged))
+        sampled = (
+            rng.choice(unjudged, size=n_neg, replace=False)
+            if n_neg > 0
+            else np.empty(0, dtype=np.int64)
+        )
+        for j in np.concatenate([judged, sampled]):
+            rows.append(signals[j])
+            labels.append(float(relevant[j]))
+            features.append(cache[feature_key])
+
+    if not rows:
+        empty = np.empty((0, 2), dtype=np.float64)
+        return empty, np.empty(0, dtype=np.float64), np.empty((0, 0), dtype=np.float64)
+    return (
+        np.asarray(rows, dtype=np.float64),
+        np.asarray(labels, dtype=np.float64),
+        np.asarray(features, dtype=np.float64),
+    )
+
+
+def cross_validated_attention_run(
+    variant_name: str,
+    attn_cache: dict,
+    corpus_ids: list[str],
+    feature_key: str,
+    make_model,
+    *,
+    normalize: bool,
+    dense_key: str = "cand_dense_log_odds",
+    calibration: CalibrationAccumulator | None = None,
+    n_folds: int = 5,
+    learning_rate: float = 0.01,
+    max_iterations: int = 500,
     seed: int = 42,
-    exclude_qids: set | None = None,
-    n_signals: int = 2,
-    dense_probs_key: str | None = None,
-) -> tuple[list, list, list, list]:
-    """Collect (probs, labels, features, query_ids) for attention training.
+) -> dict[str, dict[str, float]] | None:
+    """Train a learned fusion on k-1 folds of queries, score the held-out fold.
 
-    When exclude_qids is set, those queries are skipped (for CV).
-    n_signals=3 includes BM25 probs without base rate as a third signal.
-    Returns query_ids so fit() can normalize logits per-query when normalize=True.
-    When dense_probs_key is set, uses pre-computed dense probabilities
-    (e.g. VPT-calibrated) from that cache key instead of cosine_to_probability.
+    Every query is scored by a model that never saw its relevance
+    labels.  The models are trained and scored on log-odds
+    (``from_log_odds=True``) and ranked on the fused log-odds.
+
+    Parameters
+    ----------
+    variant_name : str
+        Name used in log messages.
+    attn_cache : dict
+        Per-query candidate signals, labels and query features.
+    corpus_ids : list of str
+        Document ids, in corpus order.
+    feature_key : str
+        Which query feature vector of the cache to use.
+    make_model : callable
+        Zero-argument factory returning a fresh model with ``fit`` and
+        ``__call__`` (``AttentionLogOddsWeights`` or
+        ``MultiHeadAttentionLogOddsWeights``).
+    normalize : bool
+        Min-max normalize each signal over the query's candidate set
+        before it reaches the model.
+    dense_key : str
+        Cache key of the dense log-odds column.
+    calibration : CalibrationAccumulator or None
+        When given and ``normalize`` is False, accumulates the held-out
+        fused log-odds against the candidate labels.  Normalized inputs
+        do not yield a posterior, so they are not accumulated.
+
+    Returns
+    -------
+    dict or None
+        The run, or None when there are too few queries or a fold has
+        no usable training data.
     """
+    # Candidate judgments select training rows, never the held-out queries.
+    qids = list(attn_cache)
+    if len(qids) < 2 * n_folds:
+        print(f"  {variant_name} skipped (insufficient queries: {len(qids)})")
+        return None
+
     rng = np.random.default_rng(seed)
-    train_probs: list[list[float]] = []
-    train_labels: list[float] = []
-    train_features: list[np.ndarray] = []
-    train_query_ids: list[str] = []
-
-    for qid, cache in attn_cache.items():
-        if exclude_qids and qid in exclude_qids:
-            continue
-        qrel_map = qrels.get(qid)
-        if not qrel_map:
-            continue
-
-        ui = cache["union_idx"]
-        probs_no_br = cache.get("cand_probs") if n_signals == 3 else None
-        vpt_override = cache.get(dense_probs_key) if dense_probs_key else None
-        signals = _prepare_attn_probs(
-            cache["cand_probs_br"], cache["cand_dense"],
-            probs_no_br=probs_no_br,
-            dense_probs_override=vpt_override,
-        )
-        feats = cache[feature_key]
-
-        pos_count = 0
-        neg_indices: list[int] = []
-        for j in range(len(ui)):
-            doc_id = corpus_ids[ui[j]]
-            if doc_id in qrel_map:
-                train_probs.append([s[j] for s in signals])
-                train_labels.append(1.0 if qrel_map[doc_id] > 0 else 0.0)
-                train_features.append(feats)
-                train_query_ids.append(qid)
-                if qrel_map[doc_id] > 0:
-                    pos_count += 1
-            else:
-                neg_indices.append(j)
-
-        n_neg = min(pos_count, len(neg_indices))
-        if n_neg > 0:
-            sampled = rng.choice(neg_indices, size=n_neg, replace=False)
-            for j in sampled:
-                train_probs.append([s[j] for s in signals])
-                train_labels.append(0.0)
-                train_features.append(feats)
-                train_query_ids.append(qid)
-
-    return train_probs, train_labels, train_features, train_query_ids
-
-
-def _score_attn_variant(
-    model: AttentionLogOddsWeights,
-    attn_cache: dict,
-    corpus_ids: list,
-    feature_key: str,
-    only_qids: set | None = None,
-    n_signals: int = 2,
-    dense_probs_key: str | None = None,
-) -> dict[str, dict[str, float]]:
-    """Score queries with a trained attention model. Returns run dict."""
+    perm = rng.permutation(len(qids))
     run: dict[str, dict[str, float]] = {}
-    for qid, cache in attn_cache.items():
-        if only_qids is not None and qid not in only_qids:
-            continue
-        ui = cache["union_idx"]
-        probs_no_br = cache.get("cand_probs") if n_signals == 3 else None
-        vpt_override = cache.get(dense_probs_key) if dense_probs_key else None
-        signals = _prepare_attn_probs(
-            cache["cand_probs_br"], cache["cand_dense"],
-            probs_no_br=probs_no_br,
-            dense_probs_override=vpt_override,
-        )
-        feats = cache[feature_key]
-        probs_matrix = np.column_stack(signals)
+    total_train = 0
 
-        scores = model(probs_matrix, feats, use_averaged=True)
-        run[qid] = {
-            corpus_ids[ui[j]]: float(scores[j])
-            for j in range(len(ui))
-        }
+    for fold in range(n_folds):
+        test_qids = [qids[i] for i in perm[fold::n_folds]]
+        test_set = set(test_qids)
+        train_qids = [qid for qid in qids if qid not in test_set]
+
+        signals, labels, features = _collect_attention_training_data(
+            attn_cache, train_qids, feature_key, dense_key, normalize, rng,
+        )
+        if (
+            len(labels) < 10
+            or float(np.sum(labels)) == 0.0
+            or float(np.sum(1.0 - labels)) == 0.0
+        ):
+            print(f"  {variant_name} skipped (fold {fold} has insufficient data)")
+            return None
+
+        model = make_model()
+        model.fit(
+            signals, labels, features,
+            learning_rate=learning_rate,
+            max_iterations=max_iterations,
+            from_log_odds=True,
+        )
+        total_train += len(labels)
+
+        for qid in test_qids:
+            cache = attn_cache[qid]
+            fused = np.asarray(
+                model(
+                    _attention_signals(cache, dense_key, normalize),
+                    cache[feature_key],
+                    use_averaged=True,
+                    from_log_odds=True,
+                    return_log_odds=True,
+                ),
+                dtype=np.float64,
+            )
+            run[qid] = ranked_run(
+                [corpus_ids[i] for i in cache["union_idx"]], fused,
+            )
+            if calibration is not None and not normalize:
+                calibration.update(fused, cache["cand_labels"])
+
+    print(
+        f"  {variant_name} trained ({n_folds}-fold CV, {len(qids)} queries, "
+        f"{total_train} total train pairs)"
+    )
     return run
 
 
-def _train_and_score_attn(
-    variant_name: str,
+def cross_validated_platt_run(
     attn_cache: dict,
-    corpus_ids: list,
-    qrels: dict,
-    feature_key: str,
-    n_features: int,
-    normalize: bool,
-    methods: list[str],
-    runs: dict,
-    alpha: float = 0.5,
-    n_signals: int = 2,
-    lr: float = 0.01,
-    max_iter: int = 500,
-    dense_probs_key: str | None = None,
-) -> bool:
-    """Train one attention variant and populate its run. Returns success."""
-    tp, tl, tf, tq = _collect_attn_training_data(
-        attn_cache, corpus_ids, qrels, feature_key,
-        n_signals=n_signals,
-        dense_probs_key=dense_probs_key,
-    )
-    n_train = len(tp)
-    labels_arr = np.array(tl, dtype=np.float64)
-    has_both = (
-        n_train >= 10
-        and float(np.sum(labels_arr)) > 0
-        and float(np.sum(1.0 - labels_arr)) > 0
-    )
-
-    if not has_both:
-        if variant_name in methods:
-            methods.remove(variant_name)
-        runs.pop(variant_name, None)
-        print(f"  {variant_name} skipped (insufficient data: {n_train} pairs)")
-        return False
-
-    model = AttentionLogOddsWeights(
-        n_signals=n_signals, n_query_features=n_features, alpha=alpha,
-        normalize=normalize,
-    )
-    model.fit(
-        np.array(tp, dtype=np.float64),
-        labels_arr,
-        np.array(tf, dtype=np.float64),
-        learning_rate=lr,
-        max_iterations=max_iter,
-        query_ids=np.array(tq) if normalize else None,
-    )
-    runs[variant_name] = _score_attn_variant(
-        model, attn_cache, corpus_ids, feature_key,
-        n_signals=n_signals,
-        dense_probs_key=dense_probs_key,
-    )
-    print(f"  {variant_name} trained ({n_train} pairs)")
-    return True
-
-
-def _train_attn_cv(
-    attn_cache: dict,
-    corpus_ids: list,
-    qrels: dict,
-    feature_key: str,
-    n_features: int,
-    normalize: bool,
-    methods: list[str],
-    runs: dict,
+    corpus_ids: list[str],
+    *,
+    calibration: CalibrationAccumulator | None = None,
     n_folds: int = 5,
-    alpha: float = 0.5,
-    n_signals: int = 2,
-    lr: float = 0.01,
-    max_iter: int = 500,
-) -> bool:
-    """Train Attn-Norm-CV via k-fold cross-validation."""
-    variant_name = "Bayesian-Attn-Norm-CV"
-    cv_qids = [qid for qid in attn_cache if qrels.get(qid)]
-    n_cv = len(cv_qids)
+    seed: int = 42,
+) -> dict[str, dict[str, float]] | None:
+    """Platt scaling of the cosine similarity, cross-validated over queries.
 
-    if n_cv < 10:
-        if variant_name in methods:
-            methods.remove(variant_name)
-        runs.pop(variant_name, None)
-        print(f"  {variant_name} skipped (insufficient queries: {n_cv})")
-        return False
+    Each fold's calibrator is fitted on the dense result lists of the
+    other folds: a retrieved document is a positive when it is judged
+    relevant and a negative otherwise.  The fit uses the convergent
+    Newton solver.  Platt scaling is a monotone map of the similarity,
+    so its ranking is the dense ranking; what it changes is the
+    calibration of the output.
+    """
+    qids = list(attn_cache)
+    if len(qids) < 2 * n_folds:
+        print(f"  Dense-Platt skipped (insufficient queries: {len(qids)})")
+        return None
 
-    rng_cv = np.random.default_rng(42)
-    perm = rng_cv.permutation(n_cv)
-    fold_size = n_cv // n_folds
-    cv_run: dict[str, dict[str, float]] = {}
-    total_train = 0
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(qids))
+    run: dict[str, dict[str, float]] = {}
 
-    for fold_i in range(n_folds):
-        start = fold_i * fold_size
-        end = n_cv if fold_i == n_folds - 1 else start + fold_size
-        test_qids = {cv_qids[perm[j]] for j in range(start, end)}
-
-        tp, tl, tf, tq = _collect_attn_training_data(
-            attn_cache, corpus_ids, qrels,
-            feature_key, exclude_qids=test_qids,
-            n_signals=n_signals,
+    for fold in range(n_folds):
+        test_qids = [qids[i] for i in perm[fold::n_folds]]
+        test_set = set(test_qids)
+        train_scores = np.concatenate(
+            [attn_cache[q]["dense_list_scores"] for q in qids if q not in test_set]
         )
-        labels_arr = np.array(tl, dtype=np.float64)
-        has_both = (
-            len(tp) >= 10
-            and float(np.sum(labels_arr)) > 0
-            and float(np.sum(1.0 - labels_arr)) > 0
+        train_labels = np.concatenate(
+            [attn_cache[q]["dense_list_labels"] for q in qids if q not in test_set]
         )
-        if not has_both:
-            continue
+        if float(np.sum(train_labels)) == 0.0:
+            print(f"  Dense-Platt skipped (fold {fold} has no relevant document)")
+            return None
 
-        model = AttentionLogOddsWeights(
-            n_signals=n_signals, n_query_features=n_features, alpha=alpha,
-            normalize=normalize,
-        )
-        model.fit(
-            np.array(tp, dtype=np.float64),
-            labels_arr,
-            np.array(tf, dtype=np.float64),
-            learning_rate=lr,
-            max_iterations=max_iter,
-            query_ids=np.array(tq) if normalize else None,
-        )
-        fold_run = _score_attn_variant(
-            model, attn_cache, corpus_ids, feature_key,
-            only_qids=test_qids,
-            n_signals=n_signals,
-        )
-        cv_run.update(fold_run)
-        total_train += len(tp)
+        calibrator = PlattCalibrator()
+        calibrator.fit(train_scores, train_labels)
 
-    if cv_run:
-        runs[variant_name] = cv_run
-        print(
-            f"  {variant_name} trained ({n_folds}-fold CV, "
-            f"{n_cv} queries, {total_train} total train pairs)"
-        )
-        return True
+        for qid in test_qids:
+            cache = attn_cache[qid]
+            log_odds = np.asarray(
+                calibrator.log_odds(cache["cand_dense"]), dtype=np.float64,
+            )
+            run[qid] = ranked_run(
+                [corpus_ids[i] for i in cache["union_idx"]], log_odds,
+            )
+            if calibration is not None:
+                calibration.update(log_odds, cache["cand_labels"])
 
-    if variant_name in methods:
-        methods.remove(variant_name)
-    runs.pop(variant_name, None)
-    print(f"  {variant_name} skipped (all CV folds had insufficient data)")
-    return False
+    print(f"  Dense-Platt fitted ({n_folds}-fold CV, {len(qids)} queries)")
+    return run
 
 
 # ---------------------------------------------------------------------------
@@ -1455,7 +1459,7 @@ BASELINE_METHODS = [
     "Bayesian-Balanced-Mix", "Bayesian-Balanced-Elbow",
     "Bayesian-Gated-ReLU", "Bayesian-Gated-Swish", "Bayesian-Gated-GELU",
     "Bayesian-Gated-Swish-B2", "Bayesian-Gated-Softplus",
-    "Bayesian-Attention", "Bayesian-Attn-Norm", "Bayesian-Attn-Norm-CV",
+    "Bayesian-Attention", "Bayesian-Attn-Norm",
     "Bayesian-MultiHead", "Bayesian-MultiHead-Norm",
     "Bayesian-MultiField", "Bayesian-MultiField-Bal",
     "Bayesian-Vector-Balanced", "Bayesian-Vector-Softplus", "Bayesian-Vector-Attn",
@@ -1466,6 +1470,58 @@ BASELINE_METHODS = [
 TUNED_METHODS = [
     "Bayesian-Tuned", "Bayesian-Balanced-Tuned", "Bayesian-Hybrid-AND-Tuned",
 ]
+
+# Methods whose fused output is a posterior.  Their log-odds are checked
+# for calibration against the labels of the candidate pool.  Methods
+# that min-max normalize their inputs output a fusion score, not a
+# posterior, and are left out.
+POSTERIOR_METHODS = [
+    "Dense-Kappa", "Dense-Arctan", "Dense-Platt",
+    "Bayesian-OR",
+    "Bayesian-LogOdds", "Bayesian-LogOdds-Local", "Bayesian-LogOdds-BR",
+    "Bayesian-Gated-ReLU", "Bayesian-Gated-Swish", "Bayesian-Gated-GELU",
+    "Bayesian-Gated-Swish-B2", "Bayesian-Gated-Softplus",
+    "Bayesian-Attention", "Bayesian-MultiHead",
+    "Bayesian-MultiField",
+    "Bayesian-Vector-Balanced", "Bayesian-Vector-Softplus",
+    "VPT-DensityPrior", "VPT-BM25Weights",
+    "VPT-BW-0.2", "VPT-BW-0.5", "VPT-BW-1.0", "VPT-BW-2.0",
+]
+
+GATED_VARIANTS = [
+    ("Bayesian-Gated-ReLU", "relu", 1.0),
+    ("Bayesian-Gated-Swish", "swish", 1.0),
+    ("Bayesian-Gated-GELU", "gelu", 1.0),
+    ("Bayesian-Gated-Swish-B2", "swish", 2.0),
+    ("Bayesian-Gated-Softplus", "softplus", 1.0),
+]
+
+
+def _top_matched(raw_bm25: np.ndarray, k: int) -> np.ndarray:
+    """Indices of the k highest-scoring documents with a non-zero BM25 score.
+
+    A document that matches no query term is not part of the lexical
+    result list, however few documents match.
+    """
+    matched_idx = np.flatnonzero(raw_bm25 > 0.0)
+    order = np.argsort(-raw_bm25[matched_idx], kind="stable")[:k]
+    return matched_idx[order].astype(np.int32)
+
+
+def _labels_for(
+    doc_ids: list[str],
+    qrel_map: dict[str, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Binary relevance and judged flags of a list of documents."""
+    labels = np.fromiter(
+        (1.0 if qrel_map.get(doc_id, 0) > 0 else 0.0 for doc_id in doc_ids),
+        dtype=np.float64, count=len(doc_ids),
+    )
+    judged = np.fromiter(
+        (doc_id in qrel_map for doc_id in doc_ids),
+        dtype=bool, count=len(doc_ids),
+    )
+    return labels, judged
 
 
 def run_dataset(
@@ -1481,15 +1537,25 @@ def run_dataset(
     ivf_nprobe: int | None = None,
     ivf_iterations: int = 10,
     ivf_seed: int = 42,
+    ivf_background: str = "query",
     vpt_query_gating: bool = False,
-) -> dict[str, dict[str, float]]:
+    ignore_identical_ids: bool = True,
+    identity: str = "text",
+) -> tuple[
+    dict[str, dict[str, float]],
+    dict[str, dict[str, list[float]]],
+    dict[str, dict[str, float]],
+    dict[str, dict[str, float]],
+]:
     """Run all fusion methods on a single BEIR dataset.
 
     Follows retrieve-then-evaluate: retrieve top-R from each signal,
     fuse union candidates, evaluate top-k.
 
-    When tune=True, additionally runs auto-estimation, supervised learning
-    (if train qrels exist), grid search, and evaluates tuned configurations.
+    When tune=True and the dataset ships training qrels, additionally
+    runs auto-estimation, supervised learning and grid search on the
+    training queries, and evaluates the tuned configurations on the
+    test queries.
 
     Parameters
     ----------
@@ -1519,14 +1585,40 @@ def run_dataset(
         Lloyd iterations for the SimpleIVF k-means fit.
     ivf_seed : int
         RNG seed for the SimpleIVF build.
+    ivf_background : str
+        Source of the background density under the IVF backend.
+        ``"query"`` (default) estimates, for each query,
+        the mean and variance of its distance to the corpus from the
+        centroid similarities and two stored sums per cell
+        (``SimpleIVF.query_background``, Proposition 4.17). ``"residuals"``
+        uses corpus-wide intra-cell residuals for the misspecified
+        background ablation; these are a different random variable.
+    vpt_query_gating : bool
+        Blend the VPT-calibrated dense log-odds toward the plain cosine
+        log-odds by an unsupervised separability gate.
+    ignore_identical_ids : bool
+        Exclude, for each query, the document whose id equals the
+        query's id before retrieval, calibration and scoring.
+
+    Returns
+    -------
+    (results, per_query, calibration, diagnostics)
+        ``results[method][metric]`` is the mean over queries;
+        ``per_query[method][metric]`` lists the per-query values in the
+        order of the dataset's test queries; ``calibration[method]``
+        holds the calibration summary of each posterior-producing method
+        over the candidate pool; ``diagnostics["ivf_background"]``, under
+        the IVF backend, compares the residuals recorded at construction
+        with the distances of the queries to the corpus.
     """
     print(f"\n{'=' * 70}")
     print(f"  {dataset_name}")
     print(f"{'=' * 70}")
 
+    dataset_start = time.perf_counter()
     # 1. Load data
     t0 = time.time()
-    data = load_beir_dataset(dataset_dir)
+    data = load_beir_dataset(dataset_dir, identity=identity)
     corpus_ids = data["corpus_ids"]
     corpus_texts = data["corpus_texts"]
     corpus_titles = data["corpus_titles"]
@@ -1538,8 +1630,14 @@ def run_dataset(
     all_query_texts = data["all_query_texts"]
     n_docs = len(corpus_ids)
     n_queries = len(query_ids)
+    doc_position = {doc_id: i for i, doc_id in enumerate(corpus_ids)}
+    n_identical = (
+        sum(bool(data["excluded_doc_ids"][qid]) for qid in query_ids)
+        if ignore_identical_ids else 0
+    )
     print(f"  Loaded: {n_docs} docs, {n_queries} queries, "
-          f"{sum(len(v) for v in qrels.values())} qrels "
+          f"{sum(len(v) for v in qrels.values())} qrels, "
+          f"identical ids excluded for {n_identical} queries "
           f"({time.time() - t0:.1f}s)")
 
     # 2. Tokenize with stemmer
@@ -1599,14 +1697,16 @@ def run_dataset(
     cache_path: str | None = None
     if cache_dir is not None:
         safe_model = model_name.replace("/", "_")
-        cache_path = os.path.join(cache_dir, dataset_name, f"{safe_model}.npz")
+        cache_path = os.path.join(cache_dir, dataset_name, f"{safe_model}-{identity}.npz")
 
     t0 = time.time()
     corpus_emb = encode_dense(
         corpus_texts, model_name, cache_path, cache_key="corpus",
+        cache_context={"identity": identity, "identity_version": 1},
     )
     query_emb = encode_dense(
         query_texts, model_name, cache_path, cache_key="queries",
+        cache_context={"identity": identity, "identity_version": 1},
     )
     print(f"  Dense encoded: corpus {corpus_emb.shape}, queries {query_emb.shape} "
           f"({time.time() - t0:.1f}s)")
@@ -1631,7 +1731,12 @@ def run_dataset(
             f"nprobe={ivf_nprobe_eff}, avg_pop={dense_index.avg_population:.1f} "
             f"({time.time() - t0:.1f}s)"
         )
+    # Distances of each query to the corpus as the index estimates them,
+    # for comparison with the residuals recorded at construction.
+    query_background_means: list[float] = []
+    query_background_stds: list[float] = []
 
+    preparation_seconds = time.perf_counter() - dataset_start
     # 5. Retrieve-then-evaluate
     t0 = time.time()
     qrels_pytrec: dict[str, dict[str, int]] = {}
@@ -1645,6 +1750,10 @@ def run_dataset(
             if m not in ("Bayesian-MultiField", "Bayesian-MultiField-Bal")
         ]
     runs: dict[str, dict[str, dict[str, float]]] = {m: {} for m in methods}
+    calibration = {
+        m: CalibrationAccumulator(context=posterior_context(m))
+        for m in POSTERIOR_METHODS if m in methods
+    }
 
     # Pre-allocate rank arrays (reused per query, reset after each)
     bm25_rank_full = np.zeros(n_docs, dtype=np.float64)
@@ -1655,7 +1764,7 @@ def run_dataset(
     # Per-query cache for tuning
     tune_cache: dict[str, dict] = {}
 
-    # Per-query cache for attention model training
+    # Per-query cache for the learned fusion models
     attn_cache: dict[str, dict] = {}
     vpt_gate_values: list[float] = []
 
@@ -1667,45 +1776,38 @@ def run_dataset(
     bg_query_idx = rng.choice(n_queries, size=min(50, n_queries), replace=False)
     bg_distances_list: list[float] = []
     for qi in bg_query_idx:
-        sims = query_emb[qi] @ corpus_emb[bg_sample_idx].T
+        excluded_positions = (
+            [doc_position[doc_id] for doc_id in data["excluded_doc_ids"][query_ids[qi]]]
+            if ignore_identical_ids else []
+        )
+        sample = bg_sample_idx[~np.isin(bg_sample_idx, excluded_positions)]
+        sims = query_emb[qi] @ corpus_emb[sample].T
         bg_distances_list.extend((1.0 - sims).tolist())
     bg_distances = np.array(bg_distances_list, dtype=np.float64)
     global_kappa_beta = float(np.median(bg_distances))
     global_kappa_std = float(np.std(bg_distances))
     global_kappa = 1.0 / global_kappa_std if global_kappa_std > 1e-12 else 1.0
 
-    # Platt scaling: first pass to collect (similarity, label) pairs
-    platt_scores_list: list[float] = []
-    platt_labels_list: list[float] = []
-    for q_idx_p in range(n_queries):
-        qid_p = query_ids[q_idx_p]
-        qrel_map = qrels.get(qid_p)
-        if qrel_map is None:
-            continue
-        qvec = query_emb[q_idx_p]
-        top_idx = np.argsort(-(qvec @ corpus_emb.T))[:effective_R]
-        for idx in top_idx:
-            did = corpus_ids[idx]
-            if did in qrel_map:
-                sim = float(qvec @ corpus_emb[idx])
-                platt_scores_list.append(sim)
-                platt_labels_list.append(1.0 if qrel_map[did] > 0 else 0.0)
-
-    platt_scores_arr = np.array(platt_scores_list, dtype=np.float64)
-    platt_labels_arr = np.array(platt_labels_list, dtype=np.float64)
-    platt_calibrator = None
-    if len(platt_scores_arr) >= 10:
-        from bayesian_bm25.calibration import PlattCalibrator
-        platt_calibrator = PlattCalibrator()
-        platt_calibrator.fit(platt_scores_arr, platt_labels_arr)
-
     for q_idx in range(n_queries):
         qid = query_ids[q_idx]
         qtokens = query_tokens_list[q_idx]
         query_vec = query_emb[q_idx]
+        qrel_map = qrels.get(qid, {})
+        exclude_idx = (
+            np.array(
+                [doc_position[doc_id] for doc_id in data["excluded_doc_ids"][qid]], dtype=np.int64,
+            )
+            if ignore_identical_ids else None
+        )
 
         # -- BM25 full-array scores --
-        raw_bm25 = scorer._bm25.get_scores(qtokens)
+        if qtokens:
+            raw_bm25 = np.array(scorer._bm25.get_scores(qtokens), dtype=np.float64)
+        else:
+            raw_bm25 = np.zeros(n_docs, dtype=np.float64)
+        if exclude_idx is not None:
+            # The query's own document is not a candidate for any signal.
+            raw_bm25[exclude_idx] = 0.0
 
         # -- Dense retrieval via exact scan or IVF --
         dense_info = _retrieve_dense_candidates(
@@ -1715,6 +1817,7 @@ def run_dataset(
             dense_backend=dense_backend,
             dense_index=dense_index,
             ivf_nprobe=ivf_nprobe_eff,
+            exclude_idx=exclude_idx,
         )
         dense_topR = np.asarray(dense_info["top_idx"], dtype=np.int32)
         dense_top_scores_run = np.asarray(
@@ -1731,26 +1834,30 @@ def run_dataset(
         dense_search_result = dense_info["search_result"]
 
         # -- Retrieve top-R from each signal --
-        bm25_topR = np.argsort(-raw_bm25)[:effective_R]
+        bm25_topR = _top_matched(raw_bm25, effective_R)
 
-        # BM25 run: top-R BM25 results
-        runs["BM25"][qid] = {
-            corpus_ids[i]: float(raw_bm25[i]) for i in bm25_topR
-        }
-
-        # Dense run: top-R dense results
-        runs["Dense"][qid] = {
-            corpus_ids[i]: float(score)
-            for i, score in zip(dense_topR, dense_top_scores_run, strict=True)
-        }
+        runs["BM25"][qid] = ranked_run(
+            [corpus_ids[i] for i in bm25_topR], raw_bm25[bm25_topR],
+        )
+        dense_doc_ids = [corpus_ids[i] for i in dense_topR]
+        runs["Dense"][qid] = ranked_run(dense_doc_ids, dense_top_scores_run)
 
         # -- Union candidates for hybrid methods --
         union_set = set(bm25_topR.tolist()) | set(dense_topR.tolist())
         union_idx = np.array(sorted(union_set), dtype=np.int32)
+        cand_doc_ids = [corpus_ids[i] for i in union_idx]
+        cand_labels, cand_judged = _labels_for(cand_doc_ids, qrel_map)
 
-        cand_dense = np.asarray(
-            query_vec @ corpus_emb[union_idx].T, dtype=np.float64,
-        )
+        # Similarities of the candidates.  An exact scan has them
+        # already; recomputing them on the gathered rows can differ in
+        # the last place, which is enough to reorder near-ties.
+        dense_all_scores = dense_info["all_scores"]
+        if dense_all_scores is not None:
+            cand_dense = np.asarray(dense_all_scores[union_idx], dtype=np.float64)
+        else:
+            cand_dense = np.asarray(
+                query_vec @ corpus_emb[union_idx].T, dtype=np.float64,
+            )
         cand_bm25, active, cand_tfs, cand_doc_len_ratios = (
             _compute_bm25_features_for_docs(
                 scorer, raw_bm25, union_idx, qtokens,
@@ -1760,34 +1867,28 @@ def run_dataset(
         tfs = cand_tfs[active]
         doc_len_ratios = cand_doc_len_ratios[active]
 
-        cand_bayesian_probs = _apply_bm25_transform(
-            scorer._transform,
-            cand_bm25,
-            active,
-            cand_tfs,
-            cand_doc_len_ratios,
+        # Lexical posterior log-odds (-inf for a candidate with no match)
+        cand_log_odds = _apply_bm25_log_odds(
+            scorer._transform, cand_bm25, active, cand_tfs, cand_doc_len_ratios,
         )
-        cand_bayesian_probs_br = _apply_bm25_transform(
-            scorer_br._transform,
-            cand_bm25,
-            active,
-            cand_tfs,
-            cand_doc_len_ratios,
+        cand_log_odds_br = _with_unmatched_floor(
+            _apply_bm25_log_odds(
+                scorer_br._transform, cand_bm25, active, cand_tfs, cand_doc_len_ratios,
+            )
         )
-        cand_bayesian_probs_mix = _apply_bm25_transform(
-            scorer_br_mix._transform,
-            cand_bm25,
-            active,
-            cand_tfs,
-            cand_doc_len_ratios,
+        cand_log_odds_mix = _with_unmatched_floor(
+            _apply_bm25_log_odds(
+                scorer_br_mix._transform, cand_bm25, active, cand_tfs,
+                cand_doc_len_ratios,
+            )
         )
-        cand_bayesian_probs_elbow = _apply_bm25_transform(
-            scorer_br_elbow._transform,
-            cand_bm25,
-            active,
-            cand_tfs,
-            cand_doc_len_ratios,
+        cand_log_odds_elbow = _with_unmatched_floor(
+            _apply_bm25_log_odds(
+                scorer_br_elbow._transform, cand_bm25, active, cand_tfs,
+                cand_doc_len_ratios,
+            )
         )
+        cand_dense_log_odds = _dense_log_odds(cand_dense)
 
         # Cache for tuning
         if tune:
@@ -1813,12 +1914,11 @@ def run_dataset(
         dense_rank_full[dense_topR] = 0
 
         # Fusion
+        cand_dense_dist = 1.0 - cand_dense
         hybrid_scores = {
             "Convex": fusion_convex(cand_bm25, cand_dense),
             "RRF": fusion_rrf(cand_bm25_rank, cand_dense_rank),
-            "Bayesian-OR": fusion_bayesian_bm25_or(
-                cand_bayesian_probs, cand_dense,
-            ),
+            "Bayesian-OR": fusion_bayesian_bm25_or(cand_log_odds, cand_dense),
             "Bayesian-LogOdds": fusion_bayesian_bm25_logodds(
                 cand_bm25, scorer._transform.alpha, scorer._transform.beta,
                 cand_tfs, cand_doc_len_ratios,
@@ -1828,70 +1928,64 @@ def run_dataset(
                 cand_bm25, cand_dense,
                 bm25_median, bm25_alpha, dense_median, dense_alpha,
             ),
-            "Bayesian-LogOdds-BR": fusion_bayesian_bm25_logodds_br(
-                cand_bm25, scorer_br._transform.alpha,
-                scorer_br._transform.beta, scorer_br.base_rate,
+            "Bayesian-LogOdds-BR": fusion_bayesian_bm25_logodds(
+                cand_bm25, scorer_br._transform.alpha, scorer_br._transform.beta,
                 cand_tfs, cand_doc_len_ratios,
                 cand_dense, dense_median, dense_alpha,
+                base_rate=scorer_br.base_rate,
             ),
             "Bayesian-Balanced": balanced_log_odds_fusion(
-                cand_bayesian_probs_br, cand_dense,
+                cand_log_odds_br, cand_dense, from_log_odds=True,
             ),
             "Bayesian-Balanced-Mix": balanced_log_odds_fusion(
-                cand_bayesian_probs_mix, cand_dense,
+                cand_log_odds_mix, cand_dense, from_log_odds=True,
             ),
             "Bayesian-Balanced-Elbow": balanced_log_odds_fusion(
-                cand_bayesian_probs_elbow, cand_dense,
+                cand_log_odds_elbow, cand_dense, from_log_odds=True,
             ),
+            # Paper 3, Section 8.2/8.4: vector calibration baselines
+            "Dense-Kappa": _global_kappa_log_odds(
+                cand_dense_dist, kappa=global_kappa, beta=global_kappa_beta,
+            ),
+            "Dense-Arctan": _arctan_log_odds(cand_dense),
         }
 
-        # Paper 3, Section 8.2/8.4: vector calibration baselines
-        cand_dense_dist = 1.0 - cand_dense
-        hybrid_scores["Dense-Kappa"] = _global_kappa_calibrate(
-            cand_dense_dist, kappa=global_kappa, beta=global_kappa_beta,
-        )
-        hybrid_scores["Dense-Arctan"] = _arctan_normalize(cand_dense)
-        if platt_calibrator is not None:
-            hybrid_scores["Dense-Platt"] = np.asarray(
-                platt_calibrator.calibrate(cand_dense), dtype=np.float64,
+        # Gated log-odds conjunction: lexical + dense log-odds (Phase 5.3)
+        gated_input = np.column_stack([cand_log_odds_br, cand_dense_log_odds])
+        for name, gating, gating_beta in GATED_VARIANTS:
+            hybrid_scores[name] = log_odds_fusion(
+                gated_input, gating=gating, gating_beta=gating_beta,
             )
-        else:
-            hybrid_scores["Dense-Platt"] = np.asarray(
-                cosine_to_probability(cand_dense), dtype=np.float64,
-            )
-
-        # Gated log-odds conjunction: BM25 probs + dense probs (Phase 5.3)
-        # Stacks two probability signals and applies gating in logit space
-        dense_probs_cand = np.asarray(
-            cosine_to_probability(cand_dense), dtype=np.float64,
-        )
-        gated_input = np.column_stack([cand_bayesian_probs_br, dense_probs_cand])
-        hybrid_scores["Bayesian-Gated-ReLU"] = log_odds_conjunction(
-            gated_input, gating="relu",
-        )
-        hybrid_scores["Bayesian-Gated-Swish"] = log_odds_conjunction(
-            gated_input, gating="swish",
-        )
-        hybrid_scores["Bayesian-Gated-GELU"] = log_odds_conjunction(
-            gated_input, gating="gelu",
-        )
-        hybrid_scores["Bayesian-Gated-Swish-B2"] = log_odds_conjunction(
-            gated_input, gating="swish", gating_beta=2.0,
-        )
-        hybrid_scores["Bayesian-Gated-Softplus"] = log_odds_conjunction(
-            gated_input, gating="softplus",
-        )
 
         # VPT-calibrated dense fusion (Paper 3, Theorem 3.1.1)
-        # Exact backend uses query-corpus distances for f_G; IVF backend
-        # uses build-time intra-cell distances and probed-cell statistics.
+        # The exact backend fits the background f_G to the query's
+        # distances over the corpus.  The IVF backend takes it from index
+        # statistics: by default from query-to-centroid similarities
+        # and two sums per cell (Section 4.7). The residual background
+        # remains an explicitly named ablation.
         if dense_backend == "ivf" and dense_index is not None:
-            vpt = VectorProbabilityTransform.fit_background(
-                dense_index.background_distances,
+            assert isinstance(dense_search_result, IVFSearchResult)
+            query_mu_G, query_sigma_G = dense_index.query_background(
+                dense_search_result, query_vector=query_vec, excluded_indices=exclude_idx,
             )
+            query_background_means.append(query_mu_G)
+            query_background_stds.append(query_sigma_G)
+            if ivf_background == "residuals":
+                vpt = VectorProbabilityTransform.fit_background(
+                    dense_index.background_distances,
+                    background_model="gaussian", background_kind="nonrelevant",
+                )
+            elif ivf_background == "query":
+                vpt = VectorProbabilityTransform(mu_G=query_mu_G, sigma_G=query_sigma_G)
+            else:
+                raise ValueError(
+                    f"ivf_background must be 'residuals' or 'query', got {ivf_background!r}"
+                )
         else:
             assert dense_full_scores is not None
-            vpt = VectorProbabilityTransform.fit_background(1.0 - dense_full_scores)
+            vpt = VectorProbabilityTransform.fit_background(
+                1.0 - dense_full_scores, background_model="gaussian", background_kind="nonrelevant",
+            )
 
         sample_distances = 1.0 - dense_sample_scores
         sample_bm25_scores, sample_active, sample_tfs, sample_doc_len_ratios = (
@@ -1899,6 +1993,7 @@ def run_dataset(
                 scorer, raw_bm25, dense_sample_idx, qtokens,
             )
         )
+        # Importance weights are probabilities by definition.
         sample_bm25_probs_br = _apply_bm25_transform(
             scorer_br._transform,
             sample_bm25_scores,
@@ -1920,15 +2015,11 @@ def run_dataset(
             sample_active,
             sample_density_prior,
         )
-        raw_vpt_dense_probs = vpt.calibrate_with_sample(
-            cand_dense_dist,
-            sample_distances,
-            weights=sample_vpt_weights,
+        raw_vpt_dense_log_odds = reference_vector_log_odds(
+            vpt, cand_dense_dist, sample_distances, sample_vpt_weights,
         )
-        vpt_gate: float | None = None
-        vpt_dense_probs_balanced = raw_vpt_dense_probs
+        vpt_dense_balanced = raw_vpt_dense_log_odds
         if vpt_query_gating:
-            diagnostics = None
             if (
                 dense_backend == "ivf"
                 and dense_index is not None
@@ -1944,35 +2035,20 @@ def run_dataset(
                 diagnostics = build_exact_search_diagnostics(dense_top_scores_run)
             vpt_gate = separability_gate(diagnostics)
             vpt_gate_values.append(vpt_gate)
-            vpt_dense_probs_balanced = _blend_probability_signal(
-                np.asarray(cosine_to_probability(cand_dense), dtype=np.float64),
-                raw_vpt_dense_probs,
-                vpt_gate,
+            vpt_dense_balanced = _blend_log_odds_signal(
+                cand_dense_log_odds, raw_vpt_dense_log_odds, vpt_gate,
             )
 
-        vector_balanced_scores = fusion_vpt_balanced(
-            cand_bayesian_probs_br, vpt_dense_probs_balanced,
+        hybrid_scores["Bayesian-Vector-Balanced"] = fusion_vpt_balanced(
+            cand_log_odds_br, vpt_dense_balanced,
         )
-        if vpt_gate is not None:
-            safe_balanced_scores = np.asarray(
-                hybrid_scores["Bayesian-Balanced"], dtype=np.float64,
-            )
-            vector_balanced_scores = (
-                vpt_gate * vector_balanced_scores
-                + (1.0 - vpt_gate) * safe_balanced_scores
-            )
-        hybrid_scores["Bayesian-Vector-Balanced"] = vector_balanced_scores
-        vpt_gated_input = np.column_stack(
-            [cand_bayesian_probs_br, raw_vpt_dense_probs],
-        )
-        hybrid_scores["Bayesian-Vector-Softplus"] = log_odds_conjunction(
-            vpt_gated_input, gating="softplus", max_logit=10.0,
+        hybrid_scores["Bayesian-Vector-Softplus"] = log_odds_fusion(
+            np.column_stack([cand_log_odds_br, raw_vpt_dense_log_odds]),
+            gating="softplus",
         )
 
-        # Paper 3, Section 8.4 Stage 6: Conditional independence penalty.
-        # Compare density-prior-only (structurally independent of vector
-        # distance) vs BM25-weights-only (approximately independent) to
-        # quantify the CI violation cost against information gain.
+        # Section 6.5: compare sources of importance weights. Neither
+        # source is established to satisfy conditional independence.
         #
         # VPT-DensityPrior: uses IVF cell density (Strategy 4.6.2) when
         # available, otherwise gap detection (Strategy 4.6.1) or
@@ -1988,13 +2064,14 @@ def run_dataset(
                 density_prior_w = VectorProbabilityTransform._distance_density_weights(
                     sample_distances,
                 )
-        vpt_density_only = vpt.calibrate_with_sample(
-            cand_dense_dist, sample_distances,
-            weights=density_prior_w,
-            method="gmm",
-        )
         hybrid_scores["VPT-DensityPrior"] = fusion_vpt_balanced(
-            cand_bayesian_probs_br, vpt_density_only,
+            cand_log_odds_br,
+            vpt.calibrate_with_sample(
+                cand_dense_dist, sample_distances,
+                weights=density_prior_w,
+                method="gmm",
+                return_log_odds=True,
+            ),
         )
 
         # VPT-BM25Weights: uses BM25 probabilities as importance weights
@@ -2004,13 +2081,14 @@ def run_dataset(
         if np.any(sample_active):
             bm25_only_weights[sample_active] = sample_bm25_probs_br[sample_active]
         sharpened_bm25 = VectorProbabilityTransform._sharpen_weights(bm25_only_weights)
-        vpt_bm25_only = vpt.calibrate_with_sample(
-            cand_dense_dist, sample_distances,
-            weights=sharpened_bm25,
-            method="kde",
-        )
         hybrid_scores["VPT-BM25Weights"] = fusion_vpt_balanced(
-            cand_bayesian_probs_br, vpt_bm25_only,
+            cand_log_odds_br,
+            vpt.calibrate_with_sample(
+                cand_dense_dist, sample_distances,
+                weights=sharpened_bm25,
+                method="kde",
+                return_log_odds=True,
+            ),
         )
 
         # Paper 3, Section 8.4 Stage 7: Bandwidth ablation.
@@ -2022,45 +2100,58 @@ def run_dataset(
             (1.0, "VPT-BW-1.0"),
             (2.0, "VPT-BW-2.0"),
         ]:
-            vpt_bw_probs = vpt.calibrate_with_sample(
-                cand_dense_dist, sample_distances,
-                weights=sample_vpt_weights,
-                method="kde",
-                bandwidth_factor=bw_factor,
-            )
             hybrid_scores[label] = fusion_vpt_balanced(
-                cand_bayesian_probs_br, vpt_bw_probs,
+                cand_log_odds_br,
+                vpt.calibrate_with_sample(
+                    cand_dense_dist, sample_distances,
+                    weights=sample_vpt_weights,
+                    method="kde",
+                    bandwidth_factor=bw_factor,
+                    return_log_odds=True,
+                ),
             )
 
         for method_name, scores in hybrid_scores.items():
-            runs[method_name][qid] = {
-                corpus_ids[union_idx[j]]: float(scores[j])
-                for j in range(len(union_idx))
-            }
+            scores = np.asarray(scores, dtype=np.float64)
+            runs[method_name][qid] = ranked_run(cand_doc_ids, scores)
+            if method_name in calibration:
+                calibration[method_name].update(scores, cand_labels)
 
-        # MultiField: dense probabilities over all docs, take top-R
+        # MultiField: fused log-odds over all docs, take top-R
         if mf_scorer is not None:
-            mf_probs_full = mf_scorer.get_probabilities(qtokens)
-            mf_topR = np.argsort(-mf_probs_full)[:effective_R]
-            runs["Bayesian-MultiField"][qid] = {
-                corpus_ids[i]: float(mf_probs_full[i]) for i in mf_topR
-            }
+            mf_log_odds_full = mf_scorer.get_log_odds(qtokens)
+            if exclude_idx is not None:
+                mf_log_odds_full[exclude_idx] = -np.inf
+            mf_topR = np.argsort(-mf_log_odds_full)[:effective_R]
+            if exclude_idx is not None:
+                mf_topR = mf_topR[~np.isin(mf_topR, exclude_idx)]
+            mf_doc_ids = [corpus_ids[i] for i in mf_topR]
+            runs["Bayesian-MultiField"][qid] = ranked_run(
+                mf_doc_ids, mf_log_odds_full[mf_topR],
+            )
+            calibration["Bayesian-MultiField"].update(
+                mf_log_odds_full[mf_topR], _labels_for(mf_doc_ids, qrel_map)[0],
+            )
 
-            # MultiField-Bal: MultiField probs + dense via balanced_log_odds_fusion
+            # MultiField-Bal: MultiField log-odds + dense via balanced_log_odds_fusion
             # Union of MultiField top-R and Dense top-R
             mf_union_set = set(mf_topR.tolist()) | set(dense_topR.tolist())
             mf_union_idx = np.array(sorted(mf_union_set), dtype=np.int32)
-            mf_cand_probs = mf_probs_full[mf_union_idx]
             mf_cand_dense = np.asarray(
                 query_vec @ corpus_emb[mf_union_idx].T, dtype=np.float64,
             )
-            mf_balanced_scores = balanced_log_odds_fusion(mf_cand_probs, mf_cand_dense)
-            runs["Bayesian-MultiField-Bal"][qid] = {
-                corpus_ids[mf_union_idx[j]]: float(mf_balanced_scores[j])
-                for j in range(len(mf_union_idx))
-            }
+            runs["Bayesian-MultiField-Bal"][qid] = ranked_run(
+                [corpus_ids[i] for i in mf_union_idx],
+                np.asarray(
+                    balanced_log_odds_fusion(
+                        mf_log_odds_full[mf_union_idx], mf_cand_dense,
+                        from_log_odds=True,
+                    ),
+                    dtype=np.float64,
+                ),
+            )
 
-        # Cache for attention model: query features + candidate signals
+        # Cache for the learned fusion models: query features + candidate signals
         qlen = len(qtokens)
         bm25_hit_ratio = float(np.count_nonzero(raw_bm25)) / n_docs
         max_bm25_log = float(np.log1p(np.max(raw_bm25))) if np.any(raw_bm25 > 0) else 0.0
@@ -2078,17 +2169,21 @@ def run_dataset(
 
         # Cross-signal feature: top-100 retrieval overlap (Jaccard)
         top100_k = min(100, n_docs)
-        bm25_top100 = set(np.argsort(-raw_bm25)[:top100_k].tolist())
+        bm25_top100 = set(bm25_topR[:top100_k].tolist())
         dense_top100 = set(dense_topR[:top100_k].tolist())
         union_sz = len(bm25_top100 | dense_top100)
         overlap_ratio = float(len(bm25_top100 & dense_top100)) / union_sz if union_sz > 0 else 0.0
 
         attn_cache[qid] = {
             "union_idx": union_idx,
-            "cand_probs": cand_bayesian_probs.copy(),
-            "cand_probs_br": cand_bayesian_probs_br.copy(),
-            "cand_dense": cand_dense.copy(),
-            "vpt_dense_probs": raw_vpt_dense_probs.copy(),
+            "cand_log_odds_br": cand_log_odds_br,
+            "cand_dense": cand_dense,
+            "cand_dense_log_odds": cand_dense_log_odds,
+            "vpt_dense_log_odds": raw_vpt_dense_log_odds,
+            "cand_labels": cand_labels,
+            "cand_judged": cand_judged,
+            "dense_list_scores": dense_top_scores_run,
+            "dense_list_labels": _labels_for(dense_doc_ids, qrel_map)[0],
             "features": np.array(
                 [np.log1p(qlen), bm25_hit_ratio, max_bm25_log],
                 dtype=np.float64,
@@ -2101,6 +2196,7 @@ def run_dataset(
             ),
         }
 
+    scoring_seconds = time.time() - t0
     print(f"  Scored {n_queries} queries x {len(methods)} methods, "
           f"R={effective_R} ({time.time() - t0:.1f}s)")
     if vpt_query_gating and vpt_gate_values:
@@ -2113,230 +2209,100 @@ def run_dataset(
             f"p90={np.percentile(gate_arr, 90):.3f}"
         )
 
-    # 5b. Train and score AttentionLogOddsWeights (Paper 2, Section 8)
-    # Collect (probability_pair, label, query_features) from qrels.
-    # BEIR qrels typically only list relevant documents, so we also sample
-    # negative candidates (unjudged docs from the retrieval union set) to
-    # provide the model with both classes.
-    t0 = time.time()
-    attn_train_probs: list[list[float]] = []
-    attn_train_labels: list[float] = []
-    attn_train_features: list[np.ndarray] = []
-    attn_rng = np.random.default_rng(42)
-
-    for qid, cache in attn_cache.items():
-        qrel_map = qrels.get(qid)
-        if not qrel_map:
-            continue
-        ui = cache["union_idx"]
-        probs_br = cache["cand_probs_br"]
-        dense_probs_arr = np.asarray(
-            cosine_to_probability(cache["cand_dense"]), dtype=np.float64,
-        )
-        feats = cache["features"]
-
-        # Positive examples: judged relevant documents in the candidate set
-        pos_count = 0
-        neg_indices: list[int] = []
-        for j in range(len(ui)):
-            doc_id = corpus_ids[ui[j]]
-            if doc_id in qrel_map:
-                attn_train_probs.append([probs_br[j], dense_probs_arr[j]])
-                attn_train_labels.append(1.0 if qrel_map[doc_id] > 0 else 0.0)
-                attn_train_features.append(feats)
-                if qrel_map[doc_id] > 0:
-                    pos_count += 1
-            else:
-                neg_indices.append(j)
-
-        # Negative sampling: sample up to pos_count unjudged candidates
-        n_neg = min(pos_count, len(neg_indices))
-        if n_neg > 0:
-            sampled = attn_rng.choice(neg_indices, size=n_neg, replace=False)
-            for j in sampled:
-                attn_train_probs.append([probs_br[j], dense_probs_arr[j]])
-                attn_train_labels.append(0.0)
-                attn_train_features.append(feats)
-
-    n_attn_train = len(attn_train_probs)
-    attn_labels_arr = np.array(attn_train_labels, dtype=np.float64)
-    has_both_classes = (
-        n_attn_train >= 10
-        and float(np.sum(attn_labels_arr)) > 0
-        and float(np.sum(1.0 - attn_labels_arr)) > 0
-    )
-
-    if has_both_classes:
-        attn_model = AttentionLogOddsWeights(
-            n_signals=2, n_query_features=3, alpha=0.5,
-        )
-        attn_model.fit(
-            np.array(attn_train_probs, dtype=np.float64),
-            attn_labels_arr,
-            np.array(attn_train_features, dtype=np.float64),
-            learning_rate=0.01,
-            max_iterations=500,
-        )
-
-        for qid, cache in attn_cache.items():
-            ui = cache["union_idx"]
-            probs_br = cache["cand_probs_br"]
-            dense_probs_arr = np.asarray(
-                cosine_to_probability(cache["cand_dense"]), dtype=np.float64,
-            )
-            probs_matrix = np.column_stack([probs_br, dense_probs_arr])
-            feats = cache["features"]
-
-            # Compute query-dependent attention weights
-            w = attn_model._compute_weights(
-                feats.reshape(1, -1), use_averaged=True,
-            ).squeeze(0)
-            attn_scores = log_odds_conjunction(
-                probs_matrix, alpha=attn_model.alpha, weights=w,
-            )
-            runs["Bayesian-Attention"][qid] = {
-                corpus_ids[ui[j]]: float(attn_scores[j])
-                for j in range(len(ui))
-            }
-
-        print(f"  Attention trained on {n_attn_train} judged pairs ({time.time() - t0:.1f}s)")
-    else:
-        # Not enough training data -- remove Attention from methods
-        methods = [m for m in methods if m != "Bayesian-Attention"]
-        if "Bayesian-Attention" in runs:
-            del runs["Bayesian-Attention"]
-        print(f"  Attention skipped (insufficient training data: {n_attn_train} pairs)")
-
-    # 5c. Improved attention: normalization + richer features
+    # 5b. Methods fitted to relevance labels, cross-validated over queries.
     #
-    #   Attn-Norm    : logit-space min-max normalization + 7 features
-    #                (3 BM25 + 3 dense + 1 cross-signal overlap)
-    #   Attn-Norm-CV : 5-fold cross-validation of Attn-Norm
-    #
-    # normalize=True on AttentionLogOddsWeights applies per-signal
-    # column min-max normalization in logit space (same scaling as
-    # balanced_log_odds_fusion).  Rich features add dense-side
-    # statistics (top-10 mean/std, max) and retrieval overlap.
+    #   Dense-Platt          : Platt scaling of the cosine similarity
+    #   Bayesian-Attention   : query-dependent weights from 3 lexical features
+    #   Bayesian-Attn-Norm   : + per-signal min-max normalization + 7 features
+    #                          (3 BM25 + 3 dense + 1 cross-signal overlap)
+    #   Bayesian-Vector-Attn : Attn-Norm with VPT-calibrated dense log-odds
+    #   Bayesian-MultiHead   : 4 attention heads, averaged in log-odds
+    #   Bayesian-MultiHead-Norm : MultiHead + normalization + 7 features
     t0 = time.time()
-    _train_and_score_attn(
-        "Bayesian-Attn-Norm", attn_cache, corpus_ids, qrels,
-        "features_rich", 7, True, methods, runs,
-    )
-    _train_attn_cv(
-        attn_cache, corpus_ids, qrels,
-        "features_rich", 7, True, methods, runs,
-    )
-    # Vector-Attn: attention with VPT-calibrated dense probabilities
-    _train_and_score_attn(
-        "Bayesian-Vector-Attn", attn_cache, corpus_ids, qrels,
-        "features_rich", 7, True, methods, runs,
-        dense_probs_key="vpt_dense_probs",
-    )
-    print(f"  Attention variants done ({time.time() - t0:.1f}s)")
-
-    # 5d. Multi-head attention fusion (Paper 2, Remark 8.6)
-    t0 = time.time()
-
-    # MultiHead: basic features, 4 heads
-    mh_tp, mh_tl, mh_tf, mh_tq = _collect_attn_training_data(
-        attn_cache, corpus_ids, qrels, "features",
-        n_signals=2,
-    )
-    mh_n_train = len(mh_tp)
-    mh_labels = np.array(mh_tl, dtype=np.float64)
-    mh_has_both = (
-        mh_n_train >= 10
-        and float(np.sum(mh_labels)) > 0
-        and float(np.sum(1.0 - mh_labels)) > 0
-    )
-
-    if mh_has_both:
-        mh_model = MultiHeadAttentionLogOddsWeights(
-            n_heads=4, n_signals=2, n_query_features=3, alpha=0.5,
+    learned_runs: dict[str, dict[str, dict[str, float]] | None] = {
+        "Dense-Platt": cross_validated_platt_run(
+            attn_cache, corpus_ids, calibration=calibration.get("Dense-Platt"),
+        ),
+    }
+    learned_variants = [
+        ("Bayesian-Attention", "features", False, "cand_dense_log_odds",
+         lambda: AttentionLogOddsWeights(n_signals=2, n_query_features=3, alpha=0.5)),
+        ("Bayesian-Attn-Norm", "features_rich", True, "cand_dense_log_odds",
+         lambda: AttentionLogOddsWeights(n_signals=2, n_query_features=7, alpha=0.5)),
+        ("Bayesian-Vector-Attn", "features_rich", True, "vpt_dense_log_odds",
+         lambda: AttentionLogOddsWeights(n_signals=2, n_query_features=7, alpha=0.5)),
+        ("Bayesian-MultiHead", "features", False, "cand_dense_log_odds",
+         lambda: MultiHeadAttentionLogOddsWeights(
+             n_heads=4, n_signals=2, n_query_features=3, alpha=0.5,
+         )),
+        ("Bayesian-MultiHead-Norm", "features_rich", True, "cand_dense_log_odds",
+         lambda: MultiHeadAttentionLogOddsWeights(
+             n_heads=4, n_signals=2, n_query_features=7, alpha=0.5,
+         )),
+    ]
+    for name, feature_key, normalize, dense_key, make_model in learned_variants:
+        learned_runs[name] = cross_validated_attention_run(
+            name, attn_cache, corpus_ids, feature_key, make_model,
+            normalize=normalize, dense_key=dense_key,
+            calibration=calibration.get(name),
         )
-        mh_model.fit(
-            np.array(mh_tp, dtype=np.float64),
-            mh_labels,
-            np.array(mh_tf, dtype=np.float64),
-            learning_rate=0.01,
-            max_iterations=500,
-        )
-
-        for qid, cache in attn_cache.items():
-            ui = cache["union_idx"]
-            signals = _prepare_attn_probs(cache["cand_probs_br"], cache["cand_dense"])
-            probs_matrix = np.column_stack(signals)
-            feats = cache["features"]
-            scores = mh_model(probs_matrix, feats, use_averaged=True)
-            runs["Bayesian-MultiHead"][qid] = {
-                corpus_ids[ui[j]]: float(scores[j])
-                for j in range(len(ui))
-            }
-        print(f"  MultiHead trained ({mh_n_train} pairs, 4 heads)")
-    else:
-        methods = [m for m in methods if m != "Bayesian-MultiHead"]
-        if "Bayesian-MultiHead" in runs:
-            del runs["Bayesian-MultiHead"]
-        print(f"  MultiHead skipped (insufficient data: {mh_n_train} pairs)")
-
-    # MultiHead-Norm: rich features + normalize, 4 heads
-    mh_nr_tp, mh_nr_tl, mh_nr_tf, mh_nr_tq = _collect_attn_training_data(
-        attn_cache, corpus_ids, qrels, "features_rich",
-        n_signals=2,
-    )
-    mh_nr_n_train = len(mh_nr_tp)
-    mh_nr_labels = np.array(mh_nr_tl, dtype=np.float64)
-    mh_nr_has_both = (
-        mh_nr_n_train >= 10
-        and float(np.sum(mh_nr_labels)) > 0
-        and float(np.sum(1.0 - mh_nr_labels)) > 0
-    )
-
-    if mh_nr_has_both:
-        mh_nr_model = MultiHeadAttentionLogOddsWeights(
-            n_heads=4, n_signals=2, n_query_features=7, alpha=0.5,
-            normalize=True,
-        )
-        mh_nr_model.fit(
-            np.array(mh_nr_tp, dtype=np.float64),
-            mh_nr_labels,
-            np.array(mh_nr_tf, dtype=np.float64),
-            learning_rate=0.01,
-            max_iterations=500,
-            query_ids=np.array(mh_nr_tq),
-        )
-
-        for qid, cache in attn_cache.items():
-            ui = cache["union_idx"]
-            signals = _prepare_attn_probs(cache["cand_probs_br"], cache["cand_dense"])
-            probs_matrix = np.column_stack(signals)
-            feats = cache["features_rich"]
-            scores = mh_nr_model(probs_matrix, feats, use_averaged=True)
-            runs["Bayesian-MultiHead-Norm"][qid] = {
-                corpus_ids[ui[j]]: float(scores[j])
-                for j in range(len(ui))
-            }
-        print(f"  MultiHead-Norm trained ({mh_nr_n_train} pairs, 4 heads, normalize)")
-    else:
-        methods = [m for m in methods if m != "Bayesian-MultiHead-Norm"]
-        if "Bayesian-MultiHead-Norm" in runs:
-            del runs["Bayesian-MultiHead-Norm"]
-        print(f"  MultiHead-Norm skipped (insufficient data: {mh_nr_n_train} pairs)")
-
-    print(f"  Multi-head variants done ({time.time() - t0:.1f}s)")
+    for name, run in learned_runs.items():
+        if run is None:
+            methods = [m for m in methods if m != name]
+            runs.pop(name, None)
+            calibration.pop(name, None)
+        else:
+            runs[name] = run
+    learned_seconds = time.time() - t0
+    print(f"  Learned variants done ({time.time() - t0:.1f}s)")
 
     # 6. Evaluate baselines
     results: dict[str, dict[str, float]] = {}
-    for method_name in methods:
-        results[method_name] = evaluate_pytrec(qrels_pytrec, runs[method_name], k=k)
+    per_query: dict[str, dict[str, list[float]]] = {}
 
-    # 6b. Calibration diagnostics for probability-producing methods
-    calib_methods = [m for m in CALIBRATION_METHODS if m in runs]
-    if calib_methods:
-        print_calibration_section(runs, qrels, calib_methods)
+    def record(method_name: str, run: dict[str, dict[str, float]]) -> None:
+        values = evaluate_run(qrels_pytrec, run, k=k)
+        results[method_name] = mean_metrics(values)
+        per_query[method_name] = {
+            metric: [by_query[qid] for qid in query_ids]
+            for metric, by_query in values.items()
+        }
+
+    for method_name in methods:
+        record(method_name, runs[method_name])
+
+    # 6b. Calibration diagnostics for posterior-producing methods
+    calibration_summaries = {
+        method: accumulator.summary()
+        for method, accumulator in calibration.items()
+        if accumulator.count > 0
+    }
+    if calibration_summaries:
+        print_calibration_section(calibration_summaries)
 
     # 7. Tuning (if enabled)
-    if tune:
+    train_qrels_path = os.path.join(dataset_dir, "qrels", "train.tsv")
+    train_qrels = (
+        training_qrels_for_dataset(data, load_qrels_from_tsv(train_qrels_path))
+        if tune and os.path.exists(train_qrels_path) else {}
+    )
+    tuning_diagnostics = {
+        "enabled": tune,
+        "status": "not_requested",
+        "training_split": "qrels/train.tsv",
+        "train_query_ids": sorted(train_qrels),
+        "test_query_ids": query_ids,
+    }
+    if set(train_qrels).intersection(query_ids):
+        raise ValueError("tuning training queries overlap evaluated queries")
+    if tune and not train_qrels:
+        tuning_diagnostics.update(
+            status="unavailable", reason="no_disjoint_official_training_queries",
+        )
+        # Tuning on the test queries and then reporting test performance
+        # would evaluate the parameters on the labels they were fitted to.
+        print("\n  --- Auto-tuning skipped: no disjoint canonical train queries ---")
+    elif tune:
         print("\n  --- Auto-tuning ---")
 
         # Step 1: Auto-estimate alpha, beta
@@ -2351,100 +2317,87 @@ def run_dataset(
         auto_base_rate = scorer._estimate_base_rate(per_query_scores, n_docs)
         print(f"    auto base_rate={auto_base_rate:.6f}")
 
-        # Step 3: Supervised learning (if train qrels exist)
-        tuned_alpha = auto_alpha
-        tuned_beta = auto_beta
-        learned = False
+        # Step 3: Supervised learning on the train qrels
+        print(f"  [Tune] Step 3: Supervised learning from {train_qrels_path}...")
+        print(f"    {len(train_qrels)} train queries loaded")
+        tuned_alpha, tuned_beta = learn_parameters_from_qrels(
+            scorer, corpus_ids,
+            all_query_ids, all_query_texts,
+            train_qrels,
+        )
+        print(f"    learned alpha={tuned_alpha:.4f}, beta={tuned_beta:.4f}")
 
-        train_qrels_path = os.path.join(dataset_dir, "qrels", "train.tsv")
-        train_qrels: dict[str, dict[str, int]] | None = None
-        if os.path.exists(train_qrels_path):
-            print(f"  [Tune] Step 3: Supervised learning from {train_qrels_path}...")
-            train_qrels = load_qrels_from_tsv(train_qrels_path)
-            print(f"    {len(train_qrels)} train queries loaded")
-            tuned_alpha, tuned_beta = learn_parameters_from_qrels(
-                scorer, corpus_ids,
-                all_query_ids, all_query_texts,
-                train_qrels,
-            )
-            learned = True
-            print(f"    learned alpha={tuned_alpha:.4f}, beta={tuned_beta:.4f}")
-        else:
-            print("  [Tune] Step 3: Skipped (no train qrels)")
-
-        # Step 4: Grid search
+        # Step 4: Grid search on the train queries
         print(f"  [Tune] Step 4: Grid search (optimizing NDCG@{k})...")
+        train_qid_set = set(train_qrels.keys())
+        train_indices = [
+            i for i, qid in enumerate(all_query_ids) if qid in train_qid_set
+        ]
+        train_texts = [all_query_texts[i] for i in train_indices]
+        train_qids = [all_query_ids[i] for i in train_indices]
+        train_tokens = tokenize_texts(train_texts)
+        train_emb = encode_dense(
+            train_texts, model_name,
+            cache_path=cache_path,
+            cache_key="train_queries",
+            batch_size=128,
+            cache_context={"identity": identity, "identity_version": 1, "split": "train"},
+        )
 
-        # Use train qrels for grid search if available, otherwise test qrels
-        if train_qrels is not None:
-            # Build tune_cache for train queries
-            train_qid_set = set(train_qrels.keys())
-            train_indices = [
-                i for i, qid in enumerate(all_query_ids) if qid in train_qid_set
-            ]
-            train_texts = [all_query_texts[i] for i in train_indices]
-            train_qids = [all_query_ids[i] for i in train_indices]
-            train_tokens = tokenize_texts(train_texts)
-            train_emb = encode_dense(
-                train_texts, model_name,
-                cache_path=cache_path,
-                cache_key="train_queries",
-                batch_size=128,
+        train_tune_cache: dict[str, dict] = {}
+        for tq_idx, (tqid, tqtokens) in enumerate(zip(train_qids, train_tokens, strict=True)):
+            if not tqtokens:
+                continue
+            canonical_query = data["query_alias_to_id"].get(tqid, tqid)
+            train_exclude = (
+                np.array([
+                    doc_position[doc_id]
+                    for doc_id in data["excluded_doc_ids"].get(canonical_query, [])
+                ], dtype=np.int64) if ignore_identical_ids else None
             )
-
-            train_tune_cache: dict[str, dict] = {}
-            for tq_idx, (tqid, tqtokens) in enumerate(zip(train_qids, train_tokens, strict=True)):
-                if not tqtokens:
-                    continue
-                raw_bm25 = scorer._bm25.get_scores(tqtokens)
-                query_vec = train_emb[tq_idx]
-                dense_info = _retrieve_dense_candidates(
-                    query_vec,
-                    corpus_emb,
-                    effective_R,
-                    dense_backend=dense_backend,
-                    dense_index=dense_index,
-                    ivf_nprobe=ivf_nprobe_eff,
+            raw_bm25 = np.array(scorer._bm25.get_scores(tqtokens), dtype=np.float64)
+            if train_exclude is not None:
+                raw_bm25[train_exclude] = 0.0
+            query_vec = train_emb[tq_idx]
+            dense_info = _retrieve_dense_candidates(
+                query_vec,
+                corpus_emb,
+                effective_R,
+                dense_backend=dense_backend,
+                dense_index=dense_index,
+                ivf_nprobe=ivf_nprobe_eff,
+                exclude_idx=train_exclude,
+            )
+            bm25_topR = _top_matched(raw_bm25, effective_R)
+            dense_topR = np.asarray(dense_info["top_idx"], dtype=np.int32)
+            union_set = set(bm25_topR.tolist()) | set(dense_topR.tolist())
+            union_idx = np.array(sorted(union_set), dtype=np.int32)
+            cand_dense = np.asarray(
+                query_vec @ corpus_emb[union_idx].T, dtype=np.float64,
+            )
+            cand_bm25, active, cand_tfs, cand_doc_len_ratios = (
+                _compute_bm25_features_for_docs(
+                    scorer, raw_bm25, union_idx, tqtokens,
                 )
-                bm25_topR = np.argsort(-raw_bm25)[:effective_R]
-                dense_topR = np.asarray(dense_info["top_idx"], dtype=np.int32)
-                union_set = set(bm25_topR.tolist()) | set(dense_topR.tolist())
-                union_idx = np.array(sorted(union_set), dtype=np.int32)
-                cand_dense = np.asarray(
-                    query_vec @ corpus_emb[union_idx].T, dtype=np.float64,
-                )
-                cand_bm25, active, cand_tfs, cand_doc_len_ratios = (
-                    _compute_bm25_features_for_docs(
-                        scorer, raw_bm25, union_idx, tqtokens,
-                    )
-                )
-                a_scores = cand_bm25[active]
-                a_tfs = cand_tfs[active]
-                a_dlr = cand_doc_len_ratios[active]
-                train_tune_cache[tqid] = {
-                    "union_idx": union_idx,
-                    "cand_dense": cand_dense,
-                    "active": active.copy(),
-                    "active_scores": a_scores.copy(),
-                    "tfs": a_tfs.copy(),
-                    "doc_len_ratios": a_dlr.copy(),
-                }
-
-            grid_qrels = train_qrels
-            grid_cache = train_tune_cache
-        else:
-            grid_qrels = qrels
-            grid_cache = tune_cache
+            )
+            train_tune_cache[tqid] = {
+                "union_idx": union_idx,
+                "cand_dense": cand_dense,
+                "active": active.copy(),
+                "active_scores": cand_bm25[active].copy(),
+                "tfs": cand_tfs[active].copy(),
+                "doc_len_ratios": cand_doc_len_ratios[active].copy(),
+            }
 
         tuned = grid_search_tuned(
-            scorer, corpus_ids, grid_cache, grid_qrels,
+            scorer, corpus_ids, train_tune_cache, train_qrels,
             tuned_alpha, tuned_beta, auto_base_rate, k,
         )
 
         # Step 5: Print summary
-        has_dense = True  # hybrid_beir always has dense
         print_tuned_summary(
-            tuned, auto_alpha, auto_beta, auto_base_rate, learned, has_dense,
+            tuned, auto_alpha, auto_beta, auto_base_rate,
+            learned=True, has_dense=True,
         )
 
         # Step 6: Evaluate tuned configurations on test qrels
@@ -2456,92 +2409,111 @@ def run_dataset(
         )
 
         # Bayesian-Tuned
-        run_tuned = _compute_bayesian_run_from_cache(
+        runs["Bayesian-Tuned"] = _compute_bayesian_run_from_cache(
             tune_cache, corpus_ids, tuned_transform,
         )
-        runs["Bayesian-Tuned"] = run_tuned
-        results["Bayesian-Tuned"] = evaluate_pytrec(qrels_pytrec, run_tuned, k=k)
+        record("Bayesian-Tuned", runs["Bayesian-Tuned"])
 
         # Balanced-Tuned
         if tuned["fusion_weight"] is not None:
-            run_balanced = _compute_balanced_run_from_cache(
+            runs["Bayesian-Balanced-Tuned"] = _compute_balanced_run_from_cache(
                 tune_cache, corpus_ids, tuned_transform, tuned["fusion_weight"],
             )
-            runs["Bayesian-Balanced-Tuned"] = run_balanced
-            results["Bayesian-Balanced-Tuned"] = evaluate_pytrec(qrels_pytrec, run_balanced, k=k)
+            record("Bayesian-Balanced-Tuned", runs["Bayesian-Balanced-Tuned"])
 
         # Hybrid-AND-Tuned
         if tuned["hybrid_alpha"] is not None:
-            run_hybrid = _compute_hybrid_and_run_from_cache(
+            runs["Bayesian-Hybrid-AND-Tuned"] = _compute_hybrid_and_run_from_cache(
                 tune_cache, corpus_ids, tuned_transform, tuned["hybrid_alpha"],
             )
-            runs["Bayesian-Hybrid-AND-Tuned"] = run_hybrid
-            results["Bayesian-Hybrid-AND-Tuned"] = evaluate_pytrec(qrels_pytrec, run_hybrid, k=k)
+            record("Bayesian-Hybrid-AND-Tuned", runs["Bayesian-Hybrid-AND-Tuned"])
 
-    return results
+        tuning_diagnostics.update(status="complete", parameters=tuned)
+
+    diagnostics: dict = {
+        "tuning": tuning_diagnostics,
+        "identity": identity, "identity_version": data["identity_version"],
+        "dataset_fingerprint": data["dataset_fingerprint"],
+        "source_document_count": data["source_document_count"],
+        "source_query_count": data["source_query_count"],
+        "canonical_document_count": n_docs, "canonical_query_count": n_queries,
+        "reference_population": "query_excluded_corpus",
+        "relevance_target": "judged_relevance",
+        "reference_vector_configuration": {
+            "scope": "Table 1 automatic reference configuration",
+            "weights": "gap_then_explicitly_sharpened_external_guidance",
+            "bandwidth_factor": 2.0,
+            "background_kind": "nonrelevant",
+        },
+        "timing": {
+            "preparation_seconds": preparation_seconds,
+            "all_label_free_variants_seconds": scoring_seconds,
+            "all_learned_variants_seconds": learned_seconds,
+            "label_free_variants_per_query_ms": 1000.0 * scoring_seconds / n_queries,
+            "total_seconds": time.perf_counter() - dataset_start,
+            "scope": "whole_benchmark_with_embedding_cache_state_recorded_by_logs",
+        },
+    }
+    if dense_index is not None and query_background_means:
+        residuals = np.asarray(dense_index.background_distances, dtype=np.float64)
+        diagnostics["ivf_background"] = {
+            # Document-to-centroid distances recorded at construction.
+            "residual_mean": float(np.mean(residuals)),
+            "residual_std": float(np.std(residuals)),
+            # Query-to-document distances over the corpus, per query.
+            "query_distance_mean": float(np.mean(query_background_means)),
+            "query_distance_std": float(np.mean(query_background_stds)),
+        }
+        print(
+            "  IVF background -- residuals: "
+            f"mean={diagnostics['ivf_background']['residual_mean']:.3f}, "
+            f"std={diagnostics['ivf_background']['residual_std']:.3f}; "
+            "query-to-document distances: "
+            f"mean={diagnostics['ivf_background']['query_distance_mean']:.3f}, "
+            f"std={diagnostics['ivf_background']['query_distance_std']:.3f}"
+        )
+
+    return results, per_query, calibration_summaries, diagnostics
 
 
 # ---------------------------------------------------------------------------
 # Calibration diagnostics
 # ---------------------------------------------------------------------------
 
-CALIBRATION_METHODS = [
-    "Dense-Kappa", "Dense-Arctan", "Dense-Platt",
-    "Bayesian-OR",
-    "Bayesian-LogOdds", "Bayesian-LogOdds-Local", "Bayesian-LogOdds-BR",
-    "Bayesian-Balanced",
-    "Bayesian-Balanced-Mix", "Bayesian-Balanced-Elbow",
-    "Bayesian-Gated-ReLU", "Bayesian-Gated-Swish", "Bayesian-Gated-GELU",
-    "Bayesian-Gated-Swish-B2", "Bayesian-Gated-Softplus",
-    "Bayesian-Attention", "Bayesian-Attn-Norm", "Bayesian-Attn-Norm-CV",
-    "Bayesian-MultiHead", "Bayesian-MultiHead-Norm",
-    "Bayesian-MultiField", "Bayesian-MultiField-Bal",
-    "Bayesian-Vector-Balanced", "Bayesian-Vector-Softplus",
-    "Bayesian-Vector-Attn",
-    "VPT-DensityPrior", "VPT-BM25Weights",
-    "VPT-BW-0.2", "VPT-BW-0.5", "VPT-BW-1.0", "VPT-BW-2.0",
-]
-
-
 def print_calibration_section(
-    runs: dict[str, dict[str, dict[str, float]]],
-    qrels: dict[str, dict[str, int]],
-    methods: list[str],
+    calibration: dict[str, dict[str, float]],
 ) -> None:
-    """Print calibration diagnostics for probability-producing methods."""
-    print("\n  --- Calibration Diagnostics ---")
-    print(f"  {'Method':<22}  {'ECE':>10}  {'Brier':>10}  {'LogLoss':>10}  {'Samples':>8}")
-    print(f"  {'-' * 22}  {'-' * 10}  {'-' * 10}  {'-' * 10}  {'-' * 8}")
+    """Print calibration diagnostics for posterior-producing methods.
 
-    for method in methods:
-        if method not in runs:
-            continue
-        method_run = runs[method]
+    Each method's fused log-odds are compared with the relevance labels
+    of the whole candidate pool, where an unjudged document counts as
+    not relevant.  Restricting the comparison to judged documents, as
+    the first version did, leaves a pool that is almost entirely
+    relevant for datasets whose qrels list only relevant documents; on
+    such a pool any predictor that outputs values near 1 looks
+    calibrated.
 
-        probs_list: list[float] = []
-        labels_list: list[float] = []
+    Besides ECE and the Brier score, the table reports log loss, the
+    skill of log loss relative to the constant-prevalence predictor
+    (negative: worse than knowing the base rate), and the ratio of
+    expected to observed relevant documents (1 is calibration in the
+    large).
+    """
+    print("\n  --- Calibration Diagnostics (candidate pool, unjudged = not relevant) ---")
+    print(
+        f"  {'Method':<26}  {'ECE':>8}  {'Brier':>8}  {'LogLoss':>9}"
+        f"  {'LL skill':>9}  {'Exp/Obs':>10}  {'Samples':>9}"
+    )
+    print(
+        f"  {'-' * 26}  {'-' * 8}  {'-' * 8}  {'-' * 9}"
+        f"  {'-' * 9}  {'-' * 10}  {'-' * 9}"
+    )
 
-        for qid, doc_scores in method_run.items():
-            qrel_map = qrels.get(qid)
-            if qrel_map is None:
-                continue
-            # Only include doc_ids that appear in qrels for this query
-            # to avoid negative bias from unjudged documents
-            for doc_id, score in doc_scores.items():
-                if doc_id in qrel_map:
-                    probs_list.append(score)
-                    labels_list.append(1.0 if qrel_map[doc_id] > 0 else 0.0)
-
-        if len(probs_list) < 2:
-            print(f"  {method:<22}  {'n/a':>10}  {'n/a':>10}  {'n/a':>10}  {len(probs_list):>8}")
-            continue
-
-        probs_arr = np.array(probs_list, dtype=np.float64)
-        labels_arr = np.array(labels_list, dtype=np.float64)
-        report = calibration_report(probs_arr, labels_arr)
+    for method, summary in calibration.items():
         print(
-            f"  {method:<22}  {report.ece:>10.6f}  {report.brier:>10.6f}"
-            f"  {report.logloss:>10.6f}  {report.n_samples:>8}"
+            f"  {method:<26}  {summary['ece']:>8.4f}  {summary['brier']:>8.4f}"
+            f"  {summary['log_loss']:>9.4f}  {summary['log_loss_skill']:>9.3f}"
+            f"  {summary['expected_over_observed']:>10.3g}  {int(summary['n']):>9}"
         )
 
 
@@ -2595,11 +2567,12 @@ def print_results_table(
         print("-" * line_w)
         row = f"{'Average':<14}"
         for method in all_methods:
-            if averages[method]:
+            if len(averages[method]) == len(datasets):
                 avg = float(np.mean(averages[method]))
                 row += f"  {avg:>{col_w - 1}.2f}%"
             else:
-                row += f"  {'n/a':>{col_w}}"
+                coverage = f"n/a ({len(averages[method])}/{len(datasets)})"
+                row += f"  {coverage:>{col_w}}"
         print(row)
 
     print(f"\nDelta vs BM25 (NDCG@{k}):")
@@ -2614,27 +2587,30 @@ def print_results_table(
             bm25_val = all_results[ds_name]["BM25"][bm25_metric]
             method_val = all_results[ds_name][method][bm25_metric]
             deltas.append((method_val - bm25_val) * 100)
-        if deltas:
+        if len(deltas) == len(datasets):
             avg_delta = float(np.mean(deltas))
             sign = "+" if avg_delta >= 0 else ""
             print(f"  {method:<20}  avg: {sign}{avg_delta:.2f}")
+        else:
+            print(f"  {method:<20}  n/a ({len(deltas)}/{len(datasets)} datasets)")
 
 
-def main() -> None:
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="BEIR hybrid search benchmark for Bayesian BM25"
+        description="Two-signal BEIR benchmark: BM25 plus one dense encoder"
     )
+    parser.add_argument("--identity", choices=["id", "text"], default="text")
     parser.add_argument(
-        "-d", "--beir-dir", required=True,
+        "-d", "--beir-dir", default=str(DEFAULT_BEIR_DIR),
         help="Path to BEIR data directory",
     )
     parser.add_argument(
         "--datasets", nargs="+",
-        default=["arguana", "fiqa", "nfcorpus", "scidocs", "scifact"],
+        default=list(DEFAULT_DATASETS),
         help="BEIR datasets to benchmark (default: all 5)",
     )
     parser.add_argument(
-        "--model", default="all-MiniLM-L6-v2",
+        "--model", default=DEFAULT_DENSE_MODEL,
         help="Sentence-transformers model (default: all-MiniLM-L6-v2)",
     )
     parser.add_argument(
@@ -2658,6 +2634,14 @@ def main() -> None:
     parser.add_argument(
         "--ivf-seed", type=int, default=42,
         help="Random seed for SimpleIVF build (default: 42)",
+    )
+    parser.add_argument(
+        "--ivf-background", choices=["residuals", "query"], default="query",
+        help=(
+            "Background density under the IVF backend: 'query' (per-query "
+            "estimate from centroid similarities; default) or 'residuals' "
+            "(intra-cell residuals, a misspecified-background ablation)"
+        ),
     )
     parser.add_argument(
         "--vpt-query-gating", action="store_true",
@@ -2684,6 +2668,13 @@ def main() -> None:
         help="Download missing BEIR datasets automatically from the official CDN",
     )
     parser.add_argument(
+        "--keep-identical-ids", action="store_true",
+        help=(
+            "Keep the document whose id equals the query's id as a candidate. "
+            "By default it is excluded before retrieval, calibration and scoring."
+        ),
+    )
+    parser.add_argument(
         "--cache-dir", default=None,
         help=(
             "Directory for embedding cache.  Defaults to {beir-dir}/.cache/embeddings. "
@@ -2694,7 +2685,13 @@ def main() -> None:
         "--no-cache", action="store_true",
         help="Disable embedding cache (always re-encode)",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_argument_parser().parse_args(argv)
+    if args.top_k < 1 or args.retrieve_k < 1:
+        raise ValueError("evaluation and retrieval depths must be positive")
 
     # Resolve cache directory
     if args.no_cache:
@@ -2717,10 +2714,15 @@ def main() -> None:
         ivf_nprobe_label = "auto" if args.ivf_nprobe is None else str(args.ivf_nprobe)
         print(
             f"  IVF: cells={ivf_cells_label}, nprobe={ivf_nprobe_label}, "
-            f"iters={args.ivf_iterations}, seed={args.ivf_seed}"
+            f"iters={args.ivf_iterations}, seed={args.ivf_seed}, "
+            f"background={args.ivf_background}"
         )
     if args.vpt_query_gating:
         print("  VPT query gating: enabled")
+    print(
+        "  Identical ids: "
+        + ("kept as candidates" if args.keep_identical_ids else "excluded")
+    )
     print(f"  Cache: {cache_label}")
     if args.download:
         print("  Download: enabled")
@@ -2732,15 +2734,19 @@ def main() -> None:
         for ds_name in args.datasets:
             download_beir_dataset(ds_name, args.beir_dir)
 
+    validate_dataset_inputs(args.beir_dir, args.datasets)
+
     all_results: dict[str, dict[str, dict[str, float]]] = {}
+    all_per_query: dict[str, dict[str, dict[str, list[float]]]] = {}
+    all_calibration: dict[str, dict[str, dict[str, float]]] = {}
+    all_diagnostics: dict[str, dict[str, dict[str, float]]] = {}
 
     for ds_name in args.datasets:
         ds_dir = os.path.join(args.beir_dir, ds_name)
-        if not os.path.isdir(ds_dir):
-            print(f"\nWARNING: Dataset directory not found: {ds_dir}, skipping")
-            print("  Hint: use --download to fetch missing datasets automatically")
-            continue
-        all_results[ds_name] = run_dataset(
+        (
+            all_results[ds_name], all_per_query[ds_name],
+            all_calibration[ds_name], all_diagnostics[ds_name],
+        ) = run_dataset(
             ds_dir, ds_name, args.model,
             k=args.top_k, retrieve_k=args.retrieve_k,
             tune=args.tune,
@@ -2750,14 +2756,53 @@ def main() -> None:
             ivf_nprobe=args.ivf_nprobe,
             ivf_iterations=args.ivf_iterations,
             ivf_seed=args.ivf_seed,
+            ivf_background=args.ivf_background,
             vpt_query_gating=args.vpt_query_gating,
+            ignore_identical_ids=not args.keep_identical_ids,
+            identity=args.identity,
         )
+
+        if args.output:
+            # Written after every dataset so that a long run can be inspected
+            # (and is not lost) before it finishes.
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "protocol": {
+                            "signal_count": 2,
+                            "signals": ["BM25", args.model],
+                            "model": args.model,
+                            "datasets_requested": args.datasets,
+                            "datasets_completed": list(all_results),
+                            "status": (
+                                "complete" if len(all_results) == len(args.datasets) else "running"
+                            ),
+                            "identity": args.identity,
+                            "identity_version": 1,
+                            "reference_population": "query_excluded_corpus",
+                            "relevance_target": "judged_relevance",
+                            "dense_backend": args.dense_backend,
+                            "ivf_background": (
+                                args.ivf_background if args.dense_backend == "ivf" else None
+                            ),
+                            "k": args.top_k,
+                            "retrieve_k": args.retrieve_k,
+                            "identical_ids_excluded": not args.keep_identical_ids,
+                            "ranking": "log-odds, double precision",
+                            "learned_weights": "5-fold cross-validation over queries",
+                            "tuning_enabled": args.tune,
+                        },
+                        "results": all_results,
+                        "per_query": all_per_query,
+                        "calibration": all_calibration,
+                        "diagnostics": all_diagnostics,
+                    },
+                    f,
+                )
 
     print_results_table(all_results, k=args.top_k)
 
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(all_results, f, indent=2)
         print(f"\nResults saved to {args.output}")
 
 

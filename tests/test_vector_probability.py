@@ -83,6 +83,28 @@ class TestSilvermanBandwidth:
         h_concentrated = _silverman_bandwidth(distances, concentrated_w)
         assert h_concentrated < h_uniform
 
+    def test_definition_4_8(self):
+        # h = (4 / (3 n)) ** (1/5) * sigma_w, with n the number of distances
+        # and sigma_w their weighted standard deviation.
+        rng = np.random.default_rng(7)
+        distances = rng.normal(0.4, 0.1, size=250)
+        weights = rng.uniform(0.0, 1.0, size=250)
+        mean = np.sum(weights * distances) / np.sum(weights)
+        sigma_w = np.sqrt(np.sum(weights * (distances - mean) ** 2) / np.sum(weights))
+        expected = (4.0 / (3.0 * 250)) ** 0.2 * sigma_w
+        assert _silverman_bandwidth(distances, weights) == pytest.approx(expected, rel=1e-12)
+
+    def test_depends_on_the_number_of_distances_not_on_the_weight_scale(self):
+        rng = np.random.default_rng(8)
+        distances = rng.normal(0.4, 0.1, size=300)
+        weights = rng.uniform(0.0, 1.0, size=300)
+        h = _silverman_bandwidth(distances, weights)
+        assert _silverman_bandwidth(distances, 5.0 * weights) == pytest.approx(h, rel=1e-12)
+        # A tenfold sample shrinks the bandwidth by 10 ** (-1/5).
+        tiled = np.tile(distances, 10)
+        h_tiled = _silverman_bandwidth(tiled, np.tile(weights, 10))
+        assert h_tiled == pytest.approx(h * 10.0 ** -0.2, rel=1e-9)
+
 
 class TestKernelDensity:
     def test_integrates_approximately_to_one(self):
@@ -381,6 +403,69 @@ class TestLogDensityRatio:
 
 
 class TestAutoRouting:
+    def test_external_weights_override_a_duplicate_gap(self):
+        distances = np.concatenate([[0.0], np.linspace(0.6, 0.8, 99)])
+        weights = np.concatenate([[0.0], np.ones(99)])
+        vct = VectorProbabilityTransform(mu_G=0.8, sigma_G=0.2)
+        assert vct._gap_weights(distances) is not None
+        actual = vct.calibrate(
+            distances, weights=weights, method="auto", return_log_odds=True,
+        )
+        expected = vct.calibrate(
+            distances, weights=weights, method="kde", return_log_odds=True,
+        )
+        np.testing.assert_allclose(actual, expected)
+        changed = vct.calibrate(
+            distances, weights=np.ones(100), method="auto", return_log_odds=True,
+        )
+        assert not np.allclose(actual, changed)
+
+    def test_density_prior_overrides_gap_detection(self):
+        distances = np.array([0.0, 0.6, 0.65, 0.7, 0.8])
+        prior = np.array([0.0, 0.2, 0.4, 0.6, 0.8])
+        vct = VectorProbabilityTransform(mu_G=0.8, sigma_G=0.2)
+        actual = vct.calibrate(
+            distances, density_prior=prior, return_log_odds=True,
+        )
+        expected = vct.calibrate(
+            distances, density_prior=prior, method="gmm", return_log_odds=True,
+        )
+        np.testing.assert_allclose(actual, expected)
+
+    def test_sharpening_requires_an_explicit_temperature(self):
+        sample = np.linspace(0.2, 0.9, 80)
+        weights = np.linspace(0.1, 0.9, 80)
+        evaluation = np.array([0.25, 0.5, 0.8])
+        vct = VectorProbabilityTransform(mu_G=0.8, sigma_G=0.2)
+        raw = vct.calibrate_with_sample(
+            evaluation, sample, weights=weights, return_log_odds=True,
+        )
+        sharp = vct.calibrate_with_sample(
+            evaluation, sample, weights=weights, weight_temperature=0.05,
+            return_log_odds=True,
+        )
+        expected = vct.calibrate_with_sample(
+            evaluation, sample,
+            weights=vct._sharpen_weights(weights, temperature=0.05),
+            method="kde", return_log_odds=True,
+        )
+        assert not np.allclose(raw, sharp)
+        np.testing.assert_allclose(sharp, expected)
+
+    @pytest.mark.parametrize("temperature", [0.0, -1.0, np.nan, np.inf])
+    def test_invalid_sharpening_temperature(self, temperature):
+        vct = VectorProbabilityTransform(mu_G=0.8, sigma_G=0.2)
+        with pytest.raises(ValueError, match="weight_temperature"):
+            vct.calibrate(
+                np.array([0.2, 0.4]), weights=np.ones(2),
+                weight_temperature=temperature,
+            )
+
+    def test_sharpening_requires_weights(self):
+        vct = VectorProbabilityTransform(mu_G=0.8, sigma_G=0.2)
+        with pytest.raises(ValueError, match="requires external weights"):
+            vct.calibrate(np.array([0.2, 0.4]), weight_temperature=0.05)
+
     def test_gap_large_k_uses_kde(self):
         rng = np.random.default_rng(42)
         # Clear gap: 40 relevant near 0.2, 60 background near 0.8
@@ -587,33 +672,55 @@ class TestIVFDensityPrior:
 
 
 class TestKNNDensityPrior:
-    def test_sparse_neighborhood_gets_high_prior(self):
-        # Large kth_distance = sparse region = more informative match
-        result = knn_density_prior(2.0, 1.0)
-        assert result > 0.5
+    """The Section 4.7 prior increases with neighborhood sparsity."""
 
-    def test_dense_neighborhood_gets_low_prior(self):
-        # Small kth_distance = dense region = less discriminative
+    def test_formula(self):
+        assert knn_density_prior(0.5, 0.8, gamma=1.5) == pytest.approx(
+            1.0 / (1.0 + np.exp(-1.5 * (0.5 / 0.8 - 1.0))), rel=1e-12,
+        )
+
+    def test_distance_below_the_median_gets_low_prior(self):
         result = knn_density_prior(0.5, 1.0)
         assert result < 0.5
+
+    def test_distance_above_the_median_gets_high_prior(self):
+        result = knn_density_prior(2.0, 1.0)
+        assert result > 0.5
 
     def test_median_distance_near_half(self):
         result = knn_density_prior(1.0, 1.0)
         assert result == pytest.approx(0.5, abs=0.01)
 
     def test_gamma_effect(self):
-        sparse_low_gamma = knn_density_prior(2.0, 1.0, gamma=0.5)
-        sparse_high_gamma = knn_density_prior(2.0, 1.0, gamma=2.0)
-        # Higher gamma pushes sparse neighborhoods further above 0.5
-        assert sparse_high_gamma > sparse_low_gamma
+        low_gamma = knn_density_prior(0.5, 1.0, gamma=0.5)
+        high_gamma = knn_density_prior(0.5, 1.0, gamma=2.0)
+        # Higher gamma pushes a dense neighborhood further below 0.5.
+        assert high_gamma < low_gamma
 
     def test_array_input(self):
         distances = np.array([0.3, 0.5, 1.0, 2.0, 5.0])
         result = knn_density_prior(distances, 1.0)
         assert isinstance(result, np.ndarray)
         assert result.shape == (5,)
-        # Monotonically increasing: sparser (larger distance) = higher weight
         assert np.all(np.diff(result) > 0)
+
+    def test_zero_distance_is_finite(self):
+        assert knn_density_prior(0.0, 1.0) == pytest.approx(1.0 / (1.0 + np.e))
+
+    @pytest.mark.parametrize("distance", [-1.0, np.nan, np.inf])
+    def test_invalid_distance(self, distance):
+        with pytest.raises(ValueError, match="kth_distance"):
+            knn_density_prior(distance, 1.0)
+
+    @pytest.mark.parametrize("median", [0.0, -1.0, np.nan, np.inf])
+    def test_invalid_median(self, median):
+        with pytest.raises(ValueError, match="global_median_kth"):
+            knn_density_prior(0.5, median)
+
+    @pytest.mark.parametrize("gamma", [0.0, -1.0, np.nan, np.inf])
+    def test_invalid_gamma(self, gamma):
+        with pytest.raises(ValueError, match="gamma"):
+            knn_density_prior(0.5, 1.0, gamma=gamma)
 
     def test_scalar_returns_float(self):
         result = knn_density_prior(1.0, 1.0)

@@ -53,7 +53,10 @@ for step in range(1, 201):
     errors.append(total_err)
 
     if step <= 10 or step % 50 == 0:
-        print(f"  {step:>3}   {score:5.2f}   {label:4.0f}   {transform.alpha:7.3f}  {transform.beta:7.3f}  {total_err:7.3f}")
+        print(
+            f"  {step:>3}   {score:5.2f}   {label:4.0f}   "
+            f"{transform.alpha:7.3f}  {transform.beta:7.3f}  {total_err:7.3f}"
+        )
 
 print(f"\nFinal parameters:  alpha={transform.alpha:.3f}, beta={transform.beta:.3f}")
 print(f"Target parameters: alpha={TRUE_ALPHA:.3f}, beta={TRUE_BETA:.3f}")
@@ -92,7 +95,7 @@ transform3.fit(
 print(f"  After batch fit (100 samples): alpha={transform3.alpha:.3f}, beta={transform3.beta:.3f}")
 
 # Step 2: Online refinement from live feedback
-for step in range(1, 101):
+for _ in range(100):
     score = rng.uniform(0.0, 3.5)
     label = simulate_user_click(score)
     transform3.update(score, label, learning_rate=0.01, momentum=0.95)
