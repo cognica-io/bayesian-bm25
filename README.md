@@ -606,6 +606,8 @@ transform.fit(scores, labels, mode="prior_free")
 
 Evaluated on the same 5 [BEIR](https://github.com/beir-cellar/beir) datasets using two signals: BM25 and all-MiniLM-L6-v2. Each signal retrieves top-1000 documents; fusion uses their union and pytrec_eval. BM25 uses k1=1.2, b=0.75, the Lucene variant, Snowball English stemming, and English stop-word removal. Exact-text identity merges duplicate texts and excludes query copies before scoring; all 3,569 canonical test queries are evaluated. Rankings retain unsaturated log-odds. Averages use unrounded scores and give each collection equal weight. The reproduction commands below regenerate these measurements; `-o <path>` writes raw results, per-query metrics, and training provenance to a local JSON file.
 
+The `Additive-` rows report all seven variants of Equation (5.2) in Table 17 of *From Scores to Evidence*. They are measured by [reevaluation.py](benchmarks/reevaluation.py) alongside BM25, dense retrieval, RRF, convex combination, and the earlier range-normalized `Bayesian-Balanced` method. The latter is a ranking baseline, not the new posterior.
+
 #### NDCG@10
 
 | Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | Average |
@@ -636,6 +638,17 @@ Evaluated on the same 5 [BEIR](https://github.com/beir-cellar/beir) datasets usi
 | Bayesian-Vector-Balanced | 53.45 | 34.48 | 35.59 | 19.17 | 72.66 | 43.07 |
 | Bayesian-Vector-Softplus | 55.81 | 34.79 | 32.21 | 18.82 | 69.32 | 42.19 |
 | Bayesian-Vector-Attn | 51.99 | 27.02 | 33.93 | 16.37 | 69.13 | 39.69 |
+| Additive-Corpus-DensityRatio | 54.20 | 39.40 | 35.84 | 20.91 | 72.96 | 44.66 |
+| Additive-Query-DensityRatio | 57.27 | 40.09 | 35.61 | 21.10 | 72.56 | 45.33 |
+| Additive-QueryFit-DensityRatio | 57.23 | 40.04 | 35.76 | 21.51 | 73.08 | 45.52 |
+| Additive-Query-DensityRatio-Marginal | 54.89 | 33.98 | 34.65 | 18.77 | 71.94 | 42.85 |
+| Additive-Query | 55.81 | 35.48 | 35.46 | 19.05 | 73.07 | 43.77 |
+| Additive-Query-Tail | 56.39 | 39.10 | 35.73 | 20.24 | 73.65 | 45.02 |
+| Additive-Query-Fit | 55.97 | 40.63 | 35.60 | 21.83 | 73.32 | 45.47 |
+
+The label-free Gaussian density ratio gained 1.40 NDCG@10 points over RRF (95% paired query bootstrap interval [+0.93, +1.86]). Fitting its lexical parameters gained another 0.20 points [+0.07, +0.34]. Against the earlier `Bayesian-Balanced`, the differences were -0.35 [-0.72, +0.01] without labels and -0.15 [-0.51, +0.20] with fitting. Neither comparison establishes an improvement over `Bayesian-Balanced`. Intervals use 10,000 paired resamples within collections and give each collection equal weight.
+
+The marginal-background rerun differs from the printed Table 17 on one query: NFCorpus is 34.65 rather than 34.76 (five-collection average 42.85 rather than 42.87). Query `PLAIN-1098` has no BM25 matches and ties at the head of the rerun; a direct kernel-density calculation gives the same NDCG@10 of zero for that query.
 
 #### MAP@10
 
@@ -667,6 +680,13 @@ Evaluated on the same 5 [BEIR](https://github.com/beir-cellar/beir) datasets usi
 | Bayesian-Vector-Balanced | 44.50 | 26.64 | 13.56 | 11.40 | 68.00 | 32.82 |
 | Bayesian-Vector-Softplus | 47.19 | 28.09 | 11.36 | 11.41 | 64.75 | 32.56 |
 | Bayesian-Vector-Attn | 43.30 | 20.47 | 12.71 | 9.59 | 64.32 | 30.08 |
+| Additive-Corpus-DensityRatio | 45.53 | 31.58 | 13.72 | 12.65 | 68.44 | 34.38 |
+| Additive-Query-DensityRatio | 48.60 | 32.18 | 13.55 | 12.71 | 68.44 | 35.09 |
+| Additive-QueryFit-DensityRatio | 48.52 | 32.18 | 13.66 | 12.97 | 68.85 | 35.24 |
+| Additive-Query-DensityRatio-Marginal | 45.91 | 26.58 | 13.08 | 11.10 | 67.61 | 32.86 |
+| Additive-Query | 46.90 | 27.73 | 13.45 | 11.35 | 68.49 | 33.58 |
+| Additive-Query-Tail | 47.52 | 31.07 | 13.52 | 12.10 | 69.39 | 34.72 |
+| Additive-Query-Fit | 47.25 | 32.78 | 13.51 | 13.10 | 68.88 | 35.11 |
 
 #### Recall@10
 
@@ -698,10 +718,17 @@ Evaluated on the same 5 [BEIR](https://github.com/beir-cellar/beir) datasets usi
 | Bayesian-Vector-Balanced | 82.05 | 43.12 | 17.11 | 20.24 | 85.36 | 49.58 |
 | Bayesian-Vector-Softplus | 83.17 | 39.19 | 15.38 | 18.56 | 81.96 | 47.65 |
 | Bayesian-Vector-Attn | 79.78 | 33.96 | 16.41 | 16.93 | 82.45 | 45.91 |
+| Additive-Corpus-DensityRatio | 81.90 | 47.07 | 17.16 | 21.81 | 85.66 | 50.72 |
+| Additive-Query-DensityRatio | 84.75 | 47.71 | 16.86 | 22.19 | 83.83 | 51.07 |
+| Additive-QueryFit-DensityRatio | 84.82 | 47.48 | 17.35 | 22.73 | 84.83 | 51.44 |
+| Additive-Query-DensityRatio-Marginal | 83.40 | 41.86 | 15.99 | 20.00 | 83.67 | 48.98 |
+| Additive-Query | 84.24 | 43.65 | 17.03 | 20.12 | 85.56 | 50.12 |
+| Additive-Query-Tail | 84.63 | 47.20 | 17.46 | 21.30 | 85.22 | 51.16 |
+| Additive-Query-Fit | 83.59 | 47.42 | 17.45 | 23.37 | 85.83 | 51.53 |
 
 \*Bayesian-MultiField/Bayesian-MultiField-Bal average over 4 datasets (FiQA corpus lacks title field).
 
-Attention, normalized-attention, multi-head, and vector-attention methods use five-fold query cross-validation; they are not zero-shot. The historical Bayesian-Attn-Norm-CV row is retained as an alias of the same normalized-attention CV result. Other rows require no relevance labels. With `--tune`, the following methods fit only the disjoint official training split. ArguAna and SciDocs do not supply that split, so their tuned cells and five-collection averages are `--`; these collections remain in all default and cross-validated evaluations:
+Attention, normalized-attention, multi-head, vector-attention, `Additive-QueryFit-DensityRatio`, and `Additive-Query-Fit` use five-fold query cross-validation; each prediction is made with parameters fitted on other queries. The historical Bayesian-Attn-Norm-CV row is retained as an alias of the same normalized-attention CV result. Other ranking rows above require no relevance labels. Separately, `--tune` fits the following methods only on the disjoint official training split. ArguAna and SciDocs do not supply that split, so their tuned cells and five-collection averages are `--`; these collections remain in all default and cross-validated evaluations:
 
 | Method | ArguAna | FiQA | NFCorpus | SciDocs | SciFact | NDCG@10 Avg |
 |---|---|---|---|---|---|---|
@@ -732,20 +759,35 @@ Attention, normalized-attention, multi-head, and vector-attention methods use fi
 | Bayesian-Gated-Swish-B2 | zero-shot | +1.23 |
 | Bayesian-Gated-GELU | zero-shot | +1.13 |
 | Bayesian-Gated-Swish | zero-shot | +0.51 |
+| Additive-Corpus-DensityRatio | zero-shot | +6.27 |
+| Additive-Query-DensityRatio | zero-shot | +6.93 |
+| Additive-QueryFit-DensityRatio | 5-fold CV | +7.13 |
+| Additive-Query-DensityRatio-Marginal | zero-shot | +4.45 |
+| Additive-Query | zero-shot | +5.38 |
+| Additive-Query-Tail | zero-shot | +6.62 |
+| Additive-Query-Fit | 5-fold CV | +7.08 |
 
 \*Bayesian-MultiField-Bal delta computed over 4 datasets (FiQA corpus lacks title field).
 
 #### Vector Calibration Experiments ([Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568))
 
-The following experiments evaluate the vector calibration framework from [Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568) ("Vector Scores as Likelihood Ratios"). All methods use `VectorProbabilityTransform` with additive log-odds fusion (Theorem 7.1.1).
+The dense-only baselines, weighting-source comparison, and bandwidth ablation evaluate the framework from [Jeong, 2026c](https://doi.org/10.5281/zenodo.19181568) ("Vector Scores as Likelihood Ratios"). The fused calibration rows also evaluate *From Scores to Evidence*.
 
-**Calibration baselines** (Section 8.2) -- monotone transforms preserve ranking but differ in probability calibration. ECE below is measured on the shared BM25/dense candidate pool, with unjudged documents labeled non-relevant. Platt scaling uses held-out predictions from five-fold CV. Brier and LogLoss are also retained in the result JSON; lower is better:
+**Calibration baselines** -- ECE uses ten equal-width probability bins over the union of the BM25 and dense lists, with unjudged documents labeled non-relevant. Lower is better; 0.000 is rounded to three decimals. The first three rows predict relevance from the dense signal alone (Section 8.2); Platt scaling uses held-out predictions from five-fold CV. The `Additive-` rows score the same candidates with both signals. The two `Pooled-tail` rows use the training folds' mean relevant count and differ only in whether the ceiling and slope are fixed at one or fitted on those folds (Section 6.8). They give the same ranking. RRF does not predict a probability, so it has no ECE or Brier score. The runners also report Brier and log loss.
 
 | Method | ArguAna ECE | FiQA ECE | NFCorpus ECE | SciDocs ECE | SciFact ECE |
 |---|---|---|---|---|---|
 | Dense-Kappa (global sigmoid) | 0.734 | 0.840 | 0.693 | 0.824 | 0.678 |
 | Dense-Arctan | 0.536 | 0.576 | 0.397 | 0.507 | 0.447 |
 | Dense-Platt (supervised) | 0.000 | 0.000 | 0.002 | 0.000 | 0.000 |
+| Additive-Corpus-DensityRatio | 0.819 | 0.528 | 0.033 | 0.349 | 0.131 |
+| Additive-Query-DensityRatio | 0.013 | 0.033 | 0.018 | 0.024 | 0.004 |
+| Additive-QueryFit-DensityRatio | 0.013 | 0.049 | 0.023 | 0.048 | 0.004 |
+| Additive-Query-DensityRatio-Marginal | 0.005 | 0.007 | 0.016 | 0.006 | 0.002 |
+| Pooled-tail (fixed ceiling and slope) | 0.000 | 0.000 | 0.009 | 0.002 | 0.000 |
+| Pooled-tail (fitted ceiling and slope) | 0.000 | 0.000 | 0.003 | 0.000 | 0.000 |
+
+On the candidate pool, the five-collection mean Brier score was 0.3297 for the corpus-level Gaussian model, 0.0144 with label-free query parameters, and 0.0203 with fitted lexical parameters (lower is better). Fitting improved ranking but not this probability score. In the separate pooled-tail model, fitting the ceiling and slope reduced mean top-ten Brier from 0.1471 to 0.0921 without changing document order. NFCorpus showed the largest reduction, from 0.3680 to 0.1676.
 
 **Conditional independence penalty** (Section 8.4, Stage 6) -- compares density-prior/gap weights with cross-modal BM25 weights. The historical CI-compliant/CI-violating row names are retained; the weighting source alone does not establish conditional independence:
 
@@ -806,6 +848,13 @@ The bandwidth rows use the same queries and candidate populations. The corrected
 | Bayesian-Balanced-Tuned | Bayesian-Balanced + supervised `BayesianProbabilityTransform.fit()` + grid search over base_rate and fusion_weight |
 | Bayesian-Hybrid-AND-Tuned | `log_odds_conjunction` of Bayesian BM25 and dense probs with tuned alpha |
 | Bayesian-Tuned | Sparse-only Bayesian BM25 with tuned alpha, beta, and base_rate (no dense signal) |
+| Additive-Corpus-DensityRatio | Equation (5.2) control: corpus-level lexical calibration plus a dense distance-density ratio with a Gaussian background. |
+| Additive-Query-DensityRatio | Same fusion with a query-specific BM25 scale and intercept; fixes the lexical slope in standardized units and the expected relevant count at one. |
+| Additive-QueryFit-DensityRatio | Same Gaussian density-ratio model, with lexical slope and mean relevant count estimated on the training folds. |
+| Additive-Query-DensityRatio-Marginal | Replaces the Gaussian background with a kernel estimate of the marginal distance density, keeping the same additive formula. |
+| Additive-Query | Adds log-linear lexical and dense evidence in units of the query's matching BM25 score dispersion and full-corpus similarity dispersion. |
+| Additive-Query-Tail | Same lexical term, with the dense unit set to the mean similarity excess above the 100th retrieved document. |
+| Additive-Query-Fit | Log-linear evidence with both signal slopes fitted jointly on the training folds in bulk dispersion units. |
 
 **Why include underperforming methods?** The tables above deliberately include methods that underperform BM25. Each failure mode is informative:
 
@@ -815,14 +864,20 @@ The bandwidth rows use the same queries and candidate populations. The corrected
 
 Reproduce:
 ```bash
-# Label-free methods and five-fold cross-validated learned methods
-python benchmarks/hybrid_beir.py -d <beir-data-dir>
+# Original methods, including five-fold cross-validated learned weights
+python -m benchmarks.hybrid_beir -d <beir-data-dir>
 
 # With tuning (auto-estimation + supervised learning + grid search)
-python benchmarks/hybrid_beir.py -d <beir-data-dir> --tune
+python -m benchmarks.hybrid_beir -d <beir-data-dir> --tune
+
+# From Scores to Evidence: Table 17 ranking, held-out fits, and candidate-pool calibration
+python -m benchmarks.reevaluation -d <beir-data-dir> --model all-MiniLM-L6-v2 --identity text --folds 5 -o <output-dir>/reevaluation.json
+
+# Section 6.8: held-out probability ceilings and slopes
+python -m benchmarks.ceiling_slope -d <beir-data-dir> --model all-MiniLM-L6-v2 --identity text --folds 5 -o <output-dir>/ceiling_slope.json
 
 # Download BEIR datasets automatically
-python benchmarks/hybrid_beir.py -d <beir-data-dir> --download
+python -m benchmarks.hybrid_beir -d <beir-data-dir> --download
 ```
 
 Requires `pip install bayesian-bm25[scorer] sentence-transformers pytrec-eval-terrier PyStemmer scipy`.
